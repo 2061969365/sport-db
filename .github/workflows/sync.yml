@@ -8,9 +8,10 @@
 #   1. GPX/TCX/KML：scripts/parse_track.py 统一解析为 workouts schema，
 #      去重键 start_time+type+distance（旧行被覆盖修正），原文件归档到
 #      tracks/{gpx,tcx,kml}/YYYY/MM/，解析行追加进 data/workouts/<年>.csv。
-#   2. 图片：Vision 模型三件套（Settings → Secrets and variables → Actions）：
-#      Secret LLM_API_KEY + Variable VISION_ENDPOINT(…/chat/completions)
-#      + Variable VISION_MODEL(多模态模型名)，三者齐了才调模型；
+#   2. 图片：Vision 模型配置（Settings → Secrets and variables → Actions）：
+#      Variable VISION_ENDPOINT(…/chat/completions，必填)
+#      + Variable VISION_MODEL(多模态模型名，必填)
+#      + Secret LLM_API_KEY(免 Key 网关可不配；需 Key 的网关必填)；
 #      scripts/ai_image.py --vision 得 JSON → --route 按 confidence 路由：
 #        >= 0.8 直接写 data/workouts/<年>.csv + 原图归档 images/YYYY/MM/；
 #        < 0.8  进 review/needs-review-*.json（原图一起移过去），PWA 标黄人工确认，build_db 会忽略 review。
@@ -119,9 +120,9 @@ jobs:
 
       # ---------- 2. inbox 消费：图片截图（Vision → workouts） ----------
       # 模型三件套（仓库 Settings → Secrets and variables → Actions 里配）：
-      #   Secret   LLM_API_KEY     ← 模型的 API Key（只存 Secret，不进 git）
-      #   Variable VISION_ENDPOINT ← OpenAI-compatible 地址，如 …/v1/chat/completions
-      #   Variable VISION_MODEL     ← 模型名，必须是多模态(vision)模型，见 docs/模型配置
+      #   Variable VISION_ENDPOINT ← OpenAI-compatible 地址，如 …/v1/chat/completions（必填）
+      #   Variable VISION_MODEL     ← 模型名，chat/completions 能收 image_url 的多模态模型（必填）
+      #   Secret   LLM_API_KEY     ← 需 Key 的网关才配；免 Key 网关（如当前）不用配
       - name: 消费 inbox 图片 (vision → workouts)
         env:
           PREFIX: ${{ steps.layout.outputs.prefix }}
@@ -133,8 +134,9 @@ jobs:
           shopt -s nullglob
           imgs=("$INBOX"/*.jpg "$INBOX"/*.jpeg "$INBOX"/*.png "$INBOX"/*.webp "$INBOX"/*.JPG "$INBOX"/*.PNG "$INBOX"/*.WEBP)
           if [ ${#imgs[@]} -eq 0 ]; then echo "inbox 无图片，跳过"; exit 0; fi
-          if [ -z "$VISION_API_KEY" ] || [ -z "$VISION_ENDPOINT" ]; then
-            echo "::warning::VISION_ENDPOINT / LLM_API_KEY 未配全，${#imgs[@]} 张图片保留在 inbox，配好后自动消费（见本文件头注释）"
+          # 免 Key 网关(如当前 VISION_ENDPOINT)允许空 Key: 只要求地址, Key 有则带、无则不带。
+          if [ -z "$VISION_ENDPOINT" ]; then
+            echo "::warning::VISION_ENDPOINT 未配置，${#imgs[@]} 张图片保留在 inbox，配好后自动消费（见本文件头注释）"
             exit 0
           fi
           for f in "${imgs[@]}"; do

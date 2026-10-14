@@ -113,8 +113,14 @@ def call_vision(image_bytes: bytes, mime: str = "image/jpeg",
     endpoint = endpoint or os.environ.get("VISION_ENDPOINT", "")
     api_key = api_key or os.environ.get("VISION_API_KEY", "")
     model = model or os.environ.get("VISION_MODEL", "gpt-4o-mini")
-    if not endpoint or not api_key:
-        raise SystemExit("缺少 VISION_ENDPOINT / VISION_API_KEY 环境变量")
+    if not endpoint:
+        raise SystemExit("缺少 VISION_ENDPOINT 环境变量")
+    # 注: 免 Key 网关允许 api_key 为空, 此时不带 Authorization 头。
+    # User-Agent 必须显式设置: 某些网关前有 Cloudflare, 会拦截 urllib 默认 UA (1010)。
+    headers = {"Content-Type": "application/json",
+               "User-Agent": "sport-db/1.0 (compatible; +https://github.com)"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     b64 = base64.b64encode(image_bytes).decode()
     body = json.dumps({
         "model": model,
@@ -124,10 +130,7 @@ def call_vision(image_bytes: bytes, mime: str = "image/jpeg",
              "image_url": {"url": f"data:{mime};base64,{b64}"}}]}],
         "max_tokens": 500, "temperature": 0,
     }).encode()
-    req = urllib.request.Request(
-        endpoint, data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {api_key}"})
+    req = urllib.request.Request(endpoint, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_s) as r:
         resp = json.load(r)
     text = resp["choices"][0]["message"]["content"]
