@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="theme-color" content="#fc4c02" />
+<meta name="description" content="运动库 SportDB — 运动健康问答：近30天摘要 + 模型直调" />
+<title>聊天 · 运动库 SportDB</title>
+<link rel="stylesheet" href="./style.css" />
+<link rel="stylesheet" href="./chat.css" />
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">💬</span>
+    <div>
+      <h1>运动聊天 <span class="en">SportDB Bot</span></h1>
+      <p class="subtitle">近30天摘要 → 模型直调（免 Key 网关）</p>
+    </div>
+  </div>
+  <a class="back" href="./index.html">← 返回首页</a>
+</header>
+
+<main class="chat-main">
+  <details class="card settings">
+    <summary>⚙️ 网关设置（VISION_ENDPOINT / 模型，点击展开）</summary>
+    <label>Endpoint（/v1/chat/completions，免 Key）
+      <input id="cfg-endpoint" type="url" placeholder="https://你的网关/v1/chat/completions" autocomplete="off" />
+    </label>
+    <label>模型（默认常量可改）
+      <input id="cfg-model" type="text" autocomplete="off" />
+    </label>
+    <div class="row">
+      <button id="btn-save-cfg" type="button">保存设置</button>
+      <button id="btn-clear" type="button" class="ghost">清空聊天记录</button>
+    </div>
+    <p class="hint" id="cfg-hint"></p>
+  </details>
+
+  <div class="card summary-card">
+    <h2>📊 近30天摘要 <small class="tag">发送时自动拼接</small></h2>
+    <pre id="chat-summary" class="summary">正在汇总本地数据…</pre>
+  </div>
+
+  <div class="card chat-card">
+    <div id="chat-log" class="chat-log" aria-live="polite"></div>
+    <form id="chat-form" class="chat-form">
+      <input id="chat-input" type="text" placeholder="问问你的训练情况…（如：我最近跑量怎么样？）" autocomplete="off" maxlength="500" />
+      <button id="btn-send" type="submit">发送</button>
+    </form>
+    <p class="hint">记录仅存本机 localStorage；图片/轨迹不上传，摘要只含距离·次数·配速·心率等数字。</p>
+  </div>
+</main>
+
+<script src="./chat.js"></script>
+</body>
+</html>

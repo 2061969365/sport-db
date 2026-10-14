@@ -27,6 +27,7 @@
   <button class="tab" data-view="calendar" role="tab">🗓️ 日历</button>
   <button class="tab" data-view="trends" role="tab">📈 趋势</button>
   <button class="tab" data-view="annual" role="tab">📊 年报</button>
+  <a class="tab" href="./chat.html">💬 聊天</a>
 </nav>
 
 <main>
@@ -58,6 +59,13 @@
         </label>
         <div id="image-preview" class="preview-grid"></div>
       </div>
+    </div>
+
+    <!-- ============ 今日日报（task-8：sync.yml nightly 步骤生成 reports/daily/YYYY-MM-DD.md） ============ -->
+    <div class="card" id="report-card">
+      <h2>📝 今日日报 <span class="date" id="report-date"></span></h2>
+      <p class="hint">每晚自动生成：近 7 / 30 天跑量 · 次数 · 均配速 · 均心率 · 睡眠均值 + AI 点评。取不到今日则显示昨日，再取不到显示占位。</p>
+      <div id="report-body" class="hint" style="white-space:pre-wrap;line-height:1.7;">日报加载中…</div>
     </div>
 
     <div class="card">
@@ -134,5 +142,6 @@ queryToday()   // 今天页聚合 + 日历/热力图/年报刷新</pre>
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.8.0/dist/sql-wasm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sql.js-httpvfs@0.9.0/dist/sqlite-httpvfs.js"></script>
 <script src="./app.js"></script>
+<script src="./report.js"></script>
 </body>
 </html>

@@ -35,6 +35,7 @@ on:
       - 'scripts/**'
       - 'inbox/**'
       - 'review/**'
+      - 'reports/**'
       - '.github/workflows/sync.yml'
       # …以及 sport-db 作为子目录被 checkout 时的路径（双写，命中任一即跑）
       - 'sport-db/frontend/**'
@@ -42,6 +43,7 @@ on:
       - 'sport-db/scripts/**'
       - 'sport-db/inbox/**'
       - 'sport-db/review/**'
+      - 'sport-db/reports/**'
       - 'sport-db/.github/workflows/sync.yml'
   schedule:
     # 每天 06:30 北京时间跑一次：即使无 push，也生成日报占位检查 + 保证 Pages 数据新鲜
@@ -175,21 +177,48 @@ jobs:
           size=$(stat -c%s "$PREFIX/data.db")
           if [ "$size" -gt 104857600 ]; then echo "::error::data.db 超 100MB ($size bytes)"; exit 1; fi
 
-      # ---------- 4. 回写：data.db + 归档 + 清空的 inbox ----------
+      # ---------- 4. nightly 日报 (task-8)：build_report.py，失败只 warning 不阻塞 ----------
+      # 模型配置复用图片消费三件套：Variable VISION_ENDPOINT（必填）+ Variable VISION_MODEL（必填）
+      # + Secret LLM_API_KEY（免 Key 网关可不配）。脚本缺失/模型未配/生成失败一律 warning 跳过，
+      # 不阻塞后续回写与 Pages 发布；占位报告由脚本自己写（保证今日.md 永远有东西可展示）。
+      - name: 生成 nightly 日报 (build_report)
+        continue-on-error: true
+        env:
+          PREFIX: ${{ steps.layout.outputs.prefix }}
+          VISION_ENDPOINT: ${{ vars.VISION_ENDPOINT }}
+          VISION_MODEL: ${{ vars.VISION_MODEL }}
+          VISION_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ ! -f "$PREFIX/scripts/build_report.py" ]; then
+            echo "::warning::scripts/build_report.py 尚不存在（task-7 未合入），跳过日报生成"
+            exit 0
+          fi
+          if [ -z "$VISION_ENDPOINT" ]; then
+            echo "::warning::VISION_ENDPOINT 未配置，日报脚本将写占位报告（见脚本内占位逻辑）"
+          fi
+          # 以 $PREFIX 为 cwd 跑：脚本内 data/ 与 reports/ 相对路径在两种 checkout 布局下都正确
+          cd "$PREFIX"
+          python3 scripts/build_report.py || {
+            echo "::warning::日报生成失败（build_report.py 非零退出），不阻塞后续回写与发布"
+            exit 0
+          }
+          ls -lh reports/daily/ 2>/dev/null || echo "reports/daily 尚无文件（脚本可能只写了占位）"
+
+      # ---------- 5. 回写：data.db + 归档 + 日报 + 清空的 inbox ----------
       - name: 回写数据变化
         env:
           PREFIX: ${{ steps.layout.outputs.prefix }}
         run: |
           git config user.name "sportdb-bot"
           git config user.email "sportdb-bot@users.noreply.github.com"
-          git add "$PREFIX/data.db" "$PREFIX/data" "$PREFIX/tracks" "$PREFIX/images" "$PREFIX/review" 2>/dev/null || true
+          git add "$PREFIX/data.db" "$PREFIX/data" "$PREFIX/tracks" "$PREFIX/images" "$PREFIX/review" "$PREFIX/reports" 2>/dev/null || true
           # inbox 里被消费（已移走）的文件也要提交删除态
           git add -u "$PREFIX/inbox" 2>/dev/null || true
           if git diff --cached --quiet; then echo "无数据变化，无需回写"; exit 0; fi
-          git commit -m "sync: inbox消费 + data.db 重编 ($(date -u +%F))"
+          git commit -m "sync: inbox消费 + data.db 重编 + 日报 ($(date -u +%F))"
           git push
 
-      # ---------- 5. 给 Pages 准备前端产物（含离线数据） ----------
+      # ---------- 6. 给 Pages 准备前端产物（含离线数据 + 日报） ----------
       - name: 组装 Pages 产物
         env:
           PREFIX: ${{ steps.layout.outputs.prefix }}
@@ -198,6 +227,14 @@ jobs:
           mkdir -p "$PREFIX/frontend/data/workouts"
           cp "$PREFIX/data.db" "$PREFIX/frontend/data.db"
           cp "$PREFIX/data/workouts/"*.csv "$PREFIX/frontend/data/workouts/" 2>/dev/null || echo "workouts CSV 尚无，跳过"
+          # 日报拷贝进前端产物：满足 report.js 首选候选 ../reports（本地布局）与 ./reports（Pages 布局）
+          if [ -d "$PREFIX/reports/daily" ]; then
+            mkdir -p "$PREFIX/frontend/reports"
+            cp -r "$PREFIX/reports/daily" "$PREFIX/frontend/reports/daily"
+            echo "pages-include+=reports/daily（$(ls "$PREFIX/frontend/reports/daily" | wc -l) 个日报）"
+          else
+            echo "reports/daily 尚无，Pages 日报区将显示占位"
+          fi
           ls -lh "$PREFIX/frontend/data.db"
           echo "pages-include=data.db + data/workouts/*.csv（CSV 供 httpvfs 失败时降级）"
           # 运行期不需要的目录不进 Pages（省配额）：raw 大分区/tracks 原轨迹/inbox 暂存一律排除

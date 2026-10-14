@@ -21,6 +21,7 @@ body { margin: 0; background: var(--bg); color: var(--ink);
 .tab { border: 1px solid var(--line); background: #f2f4f7; border-radius: 999px;
   padding: 8px 18px; font-size: 14px; cursor: pointer; }
 .tab.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+a.tab { text-decoration: none; color: inherit; }
 main { max-width: 960px; margin: 0 auto; padding: 18px 16px 60px; }
 .view { display: none; }
 .view.active { display: block; }
