@@ -34,12 +34,13 @@ jobs:
             echo "::warning::TG_BOT_TOKEN 未配置, 去 Settings → Secrets 配好再跑"
             exit 0
           fi
+          pip install -q pillow # 收图切片用
           python3 scripts/tg_poll.py
-      - name: 回写 offset
+      - name: 回写 offset/入库图片/历史
         run: |
           git config user.name "sportdb-bot"
           git config user.email "sportdb-bot@users.noreply.github.com"
-          git add bot_state/ 2>/dev/null || true
+          git add bot_state/ data/workouts/ images/ review/ 2>/dev/null || true
           if git diff --cached --quiet; then echo "offset 无变化"; exit 0; fi
           git commit -m "bot: tg offset 前进 ($(date -u +%FT%TZ))"
           # cron 与手动触发可能撞车: 先 rebase 再推, 3 次都推不上才认输

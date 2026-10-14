@@ -24,6 +24,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+try:
+    from ai_image import (append_workout, call_vision, route_result,
+                          tile_image, to_workout_row)
+    HAVE_VISION = True
+except ImportError:
+    HAVE_VISION = False
 BJ = timezone(timedelta(hours=8))
 API = "https://api.telegram.org"
 GATEWAY_UA = "sport-db/1.0 (compatible; +https://github.com)"
@@ -337,6 +344,87 @@ def send_long(token: str, chat_id: int, text: str, reply_to: int) -> None:
                                   "reply_to_message_id": reply_to})
 
 
+def pick_image_file_id(msg: dict) -> str:
+    """照片取最大尺寸; 文件形式的图片按 document 收 (mime image/*)。"""
+    photos = msg.get("photo") or []
+    if photos:
+        return photos[-1].get("file_id", "")
+    doc = msg.get("document") or {}
+    if (doc.get("mime_type") or "").startswith("image/"):
+        return doc.get("file_id", "")
+    return ""
+
+
+def download_tg_file(token: str, file_id: str) -> bytes:
+    info = tg("getFile", token, {"file_id": file_id})
+    path = (info.get("result") or {}).get("file_path", "")
+    if not path:
+        raise ValueError("getFile 无 file_path")
+    req = urllib.request.Request(
+        f"{API}/file/bot{token}/{path}",
+        headers={"User-Agent": GATEWAY_UA})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        return r.read()
+
+
+def handle_photo(token: str, chat_id: int, mid: int, file_id: str,
+                 caption: str, profile: str, endpoint: str,
+                 model: str, hist: list) -> str:
+    """收图 -> 切片识别 -> 路由入库/待审, 附言一并理解。返回回复文本。"""
+    if not HAVE_VISION:
+        return "收图模块缺 Pillow, 已记 quarantine, 修好依赖后重发一次。"
+    raw = download_tg_file(token, file_id)
+    print(f"图片 {len(raw) // 1024}KB")
+    tmp = REPO_ROOT / "bot_state" / f"tg-{chat_id}-{mid}.jpg"
+    tmp.write_bytes(raw)
+    try:
+        tiles = tile_image(tmp)
+        print("tiles=" + ",".join(f"{len(b) // 1024}KB" for b, _ in tiles))
+        (first_b, first_m), rest = tiles[0], tiles[1:]
+        rec = call_vision(first_b, first_m, endpoint=endpoint,
+                          model=model, timeout_s=300, more=rest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    decision, reason = route_result(rec)
+    date = ""
+    try:
+        date = datetime.fromisoformat(
+            rec.get("start_time") or "").astimezone(BJ).strftime("%Y-%m-%d")
+    except ValueError:
+        date = ""
+    if not date:
+        date = datetime.now(BJ).strftime("%Y-%m-%d")
+    y, m, d = date.split("-")
+    if decision == "direct":
+        img_rel = f"images/{y}/{m}/{d}-tg{mid}.jpg"
+        (REPO_ROOT / img_rel).parent.mkdir(parents=True, exist_ok=True)
+        (REPO_ROOT / img_rel).write_bytes(raw)
+        row = to_workout_row(rec, img_rel)
+        append_workout(REPO_ROOT / "data" / "workouts", row)
+        line = (f"已入库: {row['date']} {rec.get('type')} "
+                f"{rec.get('distance_km')}km/{rec.get('duration_s')}s "
+                f"(confidence {rec.get('confidence', 0):.2f})")
+    else:
+        ts = datetime.now(BJ).strftime("%Y%m%d-%H%M%S")
+        rp = REPO_ROOT / "review"
+        rp.mkdir(parents=True, exist_ok=True)
+        (rp / f"needs-review-tg{mid}-{ts}.json").write_text(
+            json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+        (rp / f"tg{mid}-{ts}.jpg").write_bytes(raw)
+        line = f"这张没看清 ({reason}), 已进 review 等你确认, 先别删原图。"
+    if caption:
+        try:
+            follow = run_agent(
+                f"[用户发了一张运动截图并附言: {caption}]\n"
+                f"[截图识别结果: {json.dumps(rec, ensure_ascii=False)}]\n"
+                f"[入库情况: {line}]\n请先报入库情况, 再回答附言。",
+                profile, endpoint, model, history=hist)
+            return follow
+        except Exception as e:  # noqa: BLE001
+            return line + f" (附言理解失败 {type(e).__name__}, 图已处理)。"
+    return line
+
+
 def main() -> int:
     token = os.environ.get("TG_BOT_TOKEN", "")
     endpoint = os.environ.get("VISION_ENDPOINT", "")
@@ -361,17 +449,37 @@ def main() -> int:
         newest = max(newest, int(u.get("update_id", 0)) + 1)
         msg = u.get("message") or u.get("edited_message") or {}
         text = (msg.get("text") or "").strip()
-        if not text:
+        chat_id = msg.get("chat", {}).get("id")
+        if not chat_id:
             continue
-        chat_id = msg["chat"]["id"]
         mid = msg["message_id"]
         who = msg.get("from", {}).get("username", "?")
+        file_id = pick_image_file_id(msg)
+        if file_id:
+            caption = (msg.get("caption") or "").strip()
+            print(f"收到 @{who} 图片 {file_id[:16]}.. 附言: {caption[:60]}")
+            try:
+                hist = load_history(chat_id)
+                answer = handle_photo(token, chat_id, mid, file_id,
+                                      caption, profile, endpoint, model, hist)
+            except Exception as e:  # noqa: BLE001
+                answer = f"这张图处理失败 ({type(e).__name__}), 已跳过, 换张清晰的再发一次。"
+            send_long(token, chat_id, answer, mid)
+            hist = load_history(chat_id)
+            hist += [{"role": "user",
+                      "content": f"[发了一张运动截图]{(' 附言: ' + caption) if caption else ''}"[:500]},
+                     {"role": "assistant", "content": answer[:2000]}]
+            save_history(chat_id, hist)
+            print(f"已回图 {chat_id}: {answer[:80]}")
+            continue
+        if not text:
+            continue
         print(f"收到 @{who}: {text[:80]}")
         if text.startswith("/start"):
             send_long(token, chat_id,
                       "SportDB 教练+管理员上线!问训练按近30天数据答, "
-                      "数据错了直接跟我说改, 如: 把昨天那条配速改成300。"
-                      "试试: 这周跑量能加点吗", mid)
+                      "运动截图直接发图自动识别入库, 数据错了跟我说改, "
+                      "如: 把昨天那条配速改成300。试试: 这周跑量能加点吗", mid)
             continue
         try:
             hist = load_history(chat_id)
