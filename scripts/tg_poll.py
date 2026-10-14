@@ -44,7 +44,7 @@ def tg(method: str, token: str, payload: dict | None = None,
         return json.load(r)
 
 
-def summarize_30d(data_dir: Path) -> str:
+def summarize_30d(data_dir: Path, days: int = 30) -> str:
     """近 30 天一句话画像 (data/workouts/YYYY.csv, 与 build_report 口径对齐)。"""
     rows = []
     for fp in sorted((data_dir / "workouts").glob("*.csv")):
@@ -53,7 +53,7 @@ def summarize_30d(data_dir: Path) -> str:
     if not rows:
         return "库里还没有运动记录。"
     today = datetime.now(BJ).date()
-    cutoff = today - timedelta(days=30)
+    cutoff = today - timedelta(days=days)
     recent = [r for r in rows if r.get("date", "") >= cutoff.isoformat()]
     if not recent:
         return f"近 30 天无运动 (库共 {len(rows)} 条, 最新 {max(r['date'] for r in rows)}), 今天 {today}。"
@@ -83,8 +83,8 @@ def summarize_30d(data_dir: Path) -> str:
     by_grp: dict[str, list] = {}
     for r in recent:
         by_grp.setdefault(grp(r), []).append(r)
-    days = {r["date"] for r in recent if r.get("date")}
-    out = [f"近30天共运动{len(recent)}次, 活跃{len(days)}天 (今天{today})。"]
+    act_days = {r["date"] for r in recent if r.get("date")}
+    out = [f"近{days}天共运动{len(recent)}次, 活跃{len(act_days)}天 (今天{today})。"]
     runs = by_grp.get("跑步", [])
     if runs:
         pd = sum(num(r["distance_m"]) for r in runs)
@@ -139,6 +139,163 @@ def ask_gateway(question: str, profile: str, endpoint: str,
     return (resp["choices"][0]["message"].get("content") or "").strip()
 
 
+EDITABLE_FIELDS = ("distance_m", "duration_s", "avg_pace_s", "avg_hr",
+                   "max_hr", "min_hr", "calories", "steps", "cadence", "type")
+
+AGENT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_summary",
+        "description": "查近N天分项画像(跑步/骑行分开)。画像里已有30天摘要, 要其它天数才调。",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "近N天, 1-90"}}}}},
+    {"type": "function", "function": {
+        "name": "query_workouts",
+        "description": "按条件查原始记录明细(含id)。改数据前必须先查到id。",
+        "parameters": {"type": "object", "properties": {
+            "type": {"type": "string", "description": "如 outdoor_running, 不限填空"},
+            "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+            "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+            "limit": {"type": "integer", "description": "默认10, 最多30"}}}}},
+    {"type": "function", "function": {
+        "name": "update_workout",
+        "description": "按id改一条记录。只能改用户明确说的字段, 先query确认。",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "string", "description": "query_workouts 给的id"},
+            "fields": {"type": "object",
+                       "description": "字段名->新值, 允许: 距离米distance_m/秒duration_s/配速avg_pace_s/心率avg_hr,max_hr,min_hr/卡路里calories/步数steps/步频cadence/类型type"}}}}},
+]
+
+AGENT_SYS = (
+    "你是一名懂数据的跑步教练, 也是这个运动库的管理员, 简短口语中文回答 (200字内)。"
+    "规则: 只用数据说话, 跑步是跑步、骑行是骑行, 配速只谈跑步; "
+    "先给一句话结论, 再给1-2条带数字的具体建议; 没有的就说不知道, 不编数据; 只谈训练恢复。"
+    "改库规则: 用户说改数时, 必须先调 query_workouts 找到那条的 id 再调 update_workout, "
+    "一次只改用户明确说的字段, 改完用中文报出改了哪条、旧值->新值; 不确定的先问。"
+    "用户画像(近30天摘要): ")
+
+
+def read_all_rows(data_dir: Path) -> list[dict]:
+    rows = []
+    for fp in sorted((data_dir / "workouts").glob("*.csv")):
+        with open(fp, encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                r["_file"] = str(fp)
+                rows.append(r)
+    return rows
+
+
+def tool_get_summary(args: dict) -> str:
+    try:
+        d = min(90, max(1, int(args.get("days") or 30)))
+    except (TypeError, ValueError):
+        d = 30
+    return summarize_30d(REPO_ROOT / "data", days=d)
+
+
+def tool_query_workouts(args: dict) -> str:
+    try:
+        lim = min(30, max(1, int(args.get("limit") or 10)))
+    except (TypeError, ValueError):
+        lim = 10
+    out = []
+    for r in read_all_rows(REPO_ROOT / "data"):
+        if args.get("type") and r.get("type") != args["type"]:
+            continue
+        if args.get("date_from") and (r.get("date") or "") < args["date_from"]:
+            continue
+        if args.get("date_to") and (r.get("date") or "") > args["date_to"]:
+            continue
+        out.append({k: r.get(k, "") for k in (
+            "id", "date", "type", "distance_m", "duration_s",
+            "avg_pace_s", "avg_hr", "max_hr", "steps", "source")})
+    out.sort(key=lambda r: (r.get("date", ""), r.get("id", "")))
+    return json.dumps(out[-lim:], ensure_ascii=False)
+
+
+def tool_update_workout(args: dict) -> str:
+    wid = (args.get("id") or "").strip()
+    fields = args.get("fields") or {}
+    if not wid or not isinstance(fields, dict) or not fields:
+        return "失败: 缺 id 或 fields 为空。"
+    bad = [k for k in fields if k not in EDITABLE_FIELDS]
+    if bad:
+        return f"失败: 不允许改 {bad}, 只能改 {list(EDITABLE_FIELDS)}。"
+    for fp in sorted((REPO_ROOT / "data" / "workouts").glob("*.csv")):
+        with open(fp, encoding="utf-8-sig", newline="") as f:
+            rd = csv.DictReader(f)
+            rows = list(rd)
+            cols = rd.fieldnames or []
+        for r in rows:
+            if r.get("id") != wid:
+                continue
+            old = {k: r.get(k, "") for k in fields}
+            for k, v in fields.items():
+                r[k] = "" if v is None else str(v)
+            if "type" in fields:
+                r["category"] = fields["type"]
+            with open(fp, "w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=cols)
+                w.writeheader()
+                w.writerows(rows)
+            return (f"已改 {wid} ({r.get('date')} {r.get('type')}): "
+                    + "; ".join(f"{k} {old[k]}->{r[k]}" for k in fields))
+    return f"失败: 找不到 id={wid}, 先调 query_workouts 确认。"
+
+
+def chat_call(endpoint: str, model: str, messages: list,
+              tools: list | None = None) -> dict:
+    body: dict = {"model": model, "messages": messages}
+    if tools:
+        body["tools"] = tools
+    cap = (os.environ.get("VISION_MAX_TOKENS") or "").strip()
+    if cap:
+        try:
+            body["max_tokens"] = int(cap)
+        except ValueError:
+            pass
+    req = urllib.request.Request(
+        endpoint, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": GATEWAY_UA})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.load(r)["choices"][0]["message"]
+
+
+def run_agent(question: str, profile: str, endpoint: str,
+              model: str, max_steps: int = 4) -> str:
+    """问答 + 工具循环: 查数、改数都能干, 最多 max_steps 轮工具调用。"""
+    messages: list = [
+        {"role": "system", "content": AGENT_SYS + profile},
+        {"role": "user", "content": question},
+    ]
+    fns = {"get_summary": tool_get_summary,
+           "query_workouts": tool_query_workouts,
+           "update_workout": tool_update_workout}
+    for _ in range(max_steps):
+        msg = chat_call(endpoint, model, messages, AGENT_TOOLS)
+        calls = msg.get("tool_calls") or []
+        text = (msg.get("content") or "").strip()
+        if not calls:
+            return text or "刚没想出来, 换个问法再试一次?"
+        messages.append({"role": "assistant", "content": text,
+                         "tool_calls": calls})
+        for c in calls:
+            fn = (c.get("function") or {}).get("name", "")
+            try:
+                argv = json.loads((c.get("function") or {}).get("arguments") or "{}")
+            except ValueError:
+                argv = {}
+            try:
+                result = fns[fn](argv) if fn in fns else f"未知工具 {fn}"
+            except Exception as e:  # noqa: BLE001 - 工具失败回给模型继续
+                result = f"工具 {fn} 出错: {type(e).__name__}: {e}"
+            messages.append({"role": "tool", "tool_call_id": c.get("id", ""),
+                             "content": str(result)[:4000]})
+    tail = chat_call(endpoint, model, messages + [
+        {"role": "user", "content": "按上面工具结果直接给用户最终答复。"}])
+    return (tail.get("content") or "").strip() or "查到了, 但组织回答时卡住了, 再问我一次?"
+
+
 def send_long(token: str, chat_id: int, text: str, reply_to: int) -> None:
     text = text or "刚没想出来, 换个问法再试一次?"
     for i in range(0, len(text), 3500):
@@ -179,11 +336,12 @@ def main() -> int:
         print(f"收到 @{who}: {text[:80]}")
         if text.startswith("/start"):
             send_long(token, chat_id,
-                      "SportDB 教练上线!直接问训练问题, 我按你库里近30天数据回答。"
-                      "如: 这周跑量能加点吗 / 心率偏高怎么办", mid)
+                      "SportDB 教练+管理员上线!问训练按近30天数据答, "
+                      "数据错了直接跟我说改, 如: 把昨天那条配速改成300。"
+                      "试试: 这周跑量能加点吗", mid)
             continue
         try:
-            answer = ask_gateway(text, profile, endpoint, model)
+            answer = run_agent(text, profile, endpoint, model)
         except Exception as e:  # noqa: BLE001 - 单条失败不阻塞其它
             answer = f"网关开小差了 ({type(e).__name__}), 稍后重发一次试试。"
         send_long(token, chat_id, answer, mid)
