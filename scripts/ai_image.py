@@ -223,17 +223,18 @@ def call_vision(image_bytes: bytes, mime: str = "image/jpeg",
         content.append({"type": "image_url", "image_url": {
             "url": f"data:{m};base64,{base64.b64encode(b).decode()}"}})
     # 注: 推理类模型先烧 token 再作答, max_tokens 太小会 finish=length 且内容为空。
-    # 实测 muse-spark-1.3 在 800 下回空、4000 正常; 可用 VISION_MAX_TOKENS 覆盖。
+    # 实测 muse-spark-1.3 在 800 下回空; 默认不限 (不发 max_tokens 字段, 走网关默认上限),
+    # 想封顶设 VISION_MAX_TOKENS (如 8000)。
     # temperature 不显式传 (网关默认): temperature=0 在该模型上易空回。
-    try:
-        max_tokens = int(os.environ.get("VISION_MAX_TOKENS", "4000"))
-    except ValueError:
-        max_tokens = 4000
-    body = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": max_tokens,
-    }).encode()
+    body_req: dict = {"model": model,
+                      "messages": [{"role": "user", "content": content}]}
+    _cap = (os.environ.get("VISION_MAX_TOKENS") or "").strip()
+    if _cap:
+        try:
+            body_req["max_tokens"] = int(_cap)
+        except ValueError:
+            pass
+    body = json.dumps(body_req).encode()
     req = urllib.request.Request(endpoint, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_s) as r:
         resp = json.load(r)
