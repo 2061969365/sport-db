@@ -1,15 +1,17 @@
-# SportDB Pages 预览发布（占位）：把 sport-db/frontend 静态发布到 GitHub Pages
-# 生效条件：仓库 Settings → Pages → Source 选择 "GitHub Actions"。
-# data.db 接入后：在 upload-pages-artifact 前加一步把 data/data.db 拷贝进 frontend/data/。
+# SportDB Pages 预览发布：把 frontend/ 静态发布到 GitHub Pages。
+# 仓库根就是 sport-db（checkout 根 = 本仓根），以下路径均为相对仓根。
+# 数据捆绑：发布前把 data.db + data/workouts/*.csv 拷贝进 frontend/，
+# 对应 app.js 的候选地址 ./data.db 与 ./data/workouts/<年>.csv（CSV 降级用）。
 name: pages-preview
 
 on:
   push:
     branches: [main]
     paths:
-      - 'sport-db/frontend/**'
+      - 'frontend/**'
+      - 'data.db'
+      - 'data/workouts/**'
       - '.github/workflows/pages.yml'
-      - 'sport-db/.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -26,16 +28,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # TODO(data.db): 取消注释，把 SQLite 沿 httpvfs 需要的文件一起发布
-      # - name: 附带 data.db
-      #   run: |
-      #     mkdir -p sport-db/frontend/data
-      #     cp sport-db/data/data.db sport-db/frontend/data/ 2>/dev/null || echo "data.db 尚不存在，跳过"
+      - name: 捆绑 data.db 与 workouts CSV
+        run: |
+          cp data.db frontend/data.db
+          mkdir -p frontend/data/workouts
+          cp data/workouts/*.csv frontend/data/workouts/
+          ls -lh frontend/data.db frontend/data/workouts/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: sport-db/frontend
-          # 若仓库根就是 sport-db，则改为：path: frontend
+          path: frontend
   deploy:
     needs: build
     runs-on: ubuntu-latest
