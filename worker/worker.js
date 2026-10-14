@@ -128,8 +128,25 @@ async function buildSummary(env) {
   return lines.join(String.fromCharCode(10)); // 上面数组已直接拼成 lines"\n");
 }
 
+// 会话历史：读公开仓 bot_state/tg_history/<key>.json（轮询桥回写）。
+// Worker 无写权限（要回写需配 GitHub PAT，见 README），读不到按无历史处理。
+async function fetchHistory(env, key) {
+  try {
+    const r = await fetch(`https://raw.githubusercontent.com/${env.REPO}/main/bot_state/tg_history/${key}.json`);
+    if (!r.ok) return [];
+    const arr = await r.json();
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+      .slice(-6)
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
+  } catch {
+    return [];
+  }
+}
+
 // ----------------------------------------------------------------- LLM
-async function askModel(env, summary, question) {
+async function askModel(env, summary, question, history) {
   const r = await fetch(env.VISION_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -142,6 +159,7 @@ async function askModel(env, summary, question) {
           role: "system",
           content: "你是一名懂数据的跑步教练，用简短口语中文回答（200字内）。规则：只用摘要数据说话，跑步是跑步、骑行是骑行，配速只谈跑步；先给一句话结论，再给1-2条带数字的具体建议；摘要里没有的就说不知道，不编数据；只谈训练恢复。以下是该用户近30天运动摘要：\n" + summary,
         },
+        ...(history || []),
         { role: "user", content: question || "总结一下我最近的运动情况" },
       ],
     }),
@@ -216,7 +234,8 @@ export default {
       if (!chatId) return new Response("no chat", { status: 200 });
       if (!text) { await tgSend(env, chatId, "发我一句话吧，比如：总结一下我最近的运动情况"); return new Response("ok"); }
       try {
-        const reply = await askModel(env, await buildSummary(env), text);
+        const hist = await fetchHistory(env, `tg-${chatId}`);
+        const reply = await askModel(env, await buildSummary(env), text, hist);
         await tgSend(env, chatId, reply);
       } catch (e) {
         await tgSend(env, chatId, `抱歉，刚才处理失败（${e.message}），请稍后重试。`);
@@ -237,7 +256,8 @@ export default {
         const chatId = body.event?.message?.chat_id;
         if (chatId && text && !text.startsWith("[") /* 跳过卡片/系统回声 */) {
           try {
-            const reply = await askModel(env, await buildSummary(env), text);
+            const hist = await fetchHistory(env, `fs-${chatId}`);
+            const reply = await askModel(env, await buildSummary(env), text, hist);
             await feishuSend(env, chatId, reply);
           } catch (e) {
             await feishuSend(env, chatId, `抱歉，刚才处理失败（${e.message}），请稍后重试。`).catch(() => {});

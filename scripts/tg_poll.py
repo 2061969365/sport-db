@@ -30,6 +30,35 @@ GATEWAY_UA = "sport-db/1.0 (compatible; +https://github.com)"
 DEFAULT_MODEL = "muse-spark-1.3-contributor-free"
 RUN_TYPES = ("outdoor_running", "indoor_running", "outdoor_run_class")
 STATE_FILE = REPO_ROOT / "bot_state" / "tg_offset.txt"
+HIST_DIR = REPO_ROOT / "bot_state" / "tg_history"
+HISTORY_KEEP = 12
+HISTORY_SEND = 8
+HISTORY_CHARS = 6000
+
+
+def load_history(chat_id: int) -> list:
+    """读某会话历史。公开仓注意: 内容会进 git, 介意配 TG_HISTORY=off。"""
+    if (os.environ.get("TG_HISTORY") or "").strip().lower() == "off":
+        return []
+    try:
+        arr = json.loads((HIST_DIR / f"{chat_id}.json").read_text(encoding="utf-8"))
+        return [m for m in arr if isinstance(m, dict)
+                and m.get("role") in ("user", "assistant")
+                and isinstance(m.get("content"), str)][-HISTORY_KEEP:]
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(chat_id: int, hist: list) -> None:
+    if (os.environ.get("TG_HISTORY") or "").strip().lower() == "off":
+        return
+    hist = hist[-HISTORY_KEEP:]
+    total = sum(len(m.get("content", "")) for m in hist)
+    while len(hist) > 2 and total > HISTORY_CHARS:
+        total -= len(hist.pop(0).get("content", ""))
+    HIST_DIR.mkdir(parents=True, exist_ok=True)
+    (HIST_DIR / f"{chat_id}.json").write_text(
+        json.dumps(hist, ensure_ascii=False), encoding="utf-8")
 
 
 def tg(method: str, token: str, payload: dict | None = None,
@@ -262,12 +291,16 @@ def chat_call(endpoint: str, model: str, messages: list,
 
 
 def run_agent(question: str, profile: str, endpoint: str,
-              model: str, max_steps: int = 4) -> str:
-    """问答 + 工具循环: 查数、改数都能干, 最多 max_steps 轮工具调用。"""
+              model: str, max_steps: int = 4,
+              history: list | None = None) -> str:
+    """问答 + 工具循环: 查数、改数都能干, 最多 max_steps 轮工具调用。
+    history: 该会话此前 user/assistant 轮次(只取 role/content), 起承转合靠它。"""
     messages: list = [
         {"role": "system", "content": AGENT_SYS + profile},
-        {"role": "user", "content": question},
     ]
+    for m in (history or [])[-HISTORY_SEND:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": question})
     fns = {"get_summary": tool_get_summary,
            "query_workouts": tool_query_workouts,
            "update_workout": tool_update_workout}
@@ -341,10 +374,15 @@ def main() -> int:
                       "试试: 这周跑量能加点吗", mid)
             continue
         try:
-            answer = run_agent(text, profile, endpoint, model)
+            hist = load_history(chat_id)
+            answer = run_agent(text, profile, endpoint, model, history=hist)
         except Exception as e:  # noqa: BLE001 - 单条失败不阻塞其它
             answer = f"网关开小差了 ({type(e).__name__}), 稍后重发一次试试。"
         send_long(token, chat_id, answer, mid)
+        hist = load_history(chat_id)
+        hist += [{"role": "user", "content": text[:2000]},
+                 {"role": "assistant", "content": answer[:2000]}]
+        save_history(chat_id, hist)
         print(f"已回 {chat_id}: {answer[:80]}")
     STATE_FILE.write_text(str(newest), encoding="utf-8")
     print(f"offset {offset} -> {newest}")
