@@ -344,15 +344,17 @@ def send_long(token: str, chat_id: int, text: str, reply_to: int) -> None:
                                   "reply_to_message_id": reply_to})
 
 
-def pick_image_file_id(msg: dict) -> str:
-    """照片取最大尺寸; 文件形式的图片按 document 收 (mime image/*)。"""
+def pick_image_file_id(msg: dict) -> tuple:
+    """照片取最大尺寸; 文件形式的图片按 document 收 (mime image/*)。
+    返回 (file_id, 是否原图)。TG 会把直接发的照片压到最长边1280,
+    长截图压完字就糊, review 时要劝用户用文件方式重发。"""
     photos = msg.get("photo") or []
     if photos:
-        return photos[-1].get("file_id", "")
+        return photos[-1].get("file_id", ""), False
     doc = msg.get("document") or {}
     if (doc.get("mime_type") or "").startswith("image/"):
-        return doc.get("file_id", "")
-    return ""
+        return doc.get("file_id", ""), True
+    return "", False
 
 
 def download_tg_file(token: str, file_id: str) -> bytes:
@@ -369,7 +371,7 @@ def download_tg_file(token: str, file_id: str) -> bytes:
 
 def handle_photo(token: str, chat_id: int, mid: int, file_id: str,
                  caption: str, profile: str, endpoint: str,
-                 model: str, hist: list) -> str:
+                 model: str, hist: list, is_orig: bool = False) -> str:
     """收图 -> 切片识别 -> 路由入库/待审, 附言一并理解。返回回复文本。"""
     if not HAVE_VISION:
         return "收图模块缺 Pillow, 已记 quarantine, 修好依赖后重发一次。"
@@ -412,6 +414,9 @@ def handle_photo(token: str, chat_id: int, mid: int, file_id: str,
             json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
         (rp / f"tg{mid}-{ts}.jpg").write_bytes(raw)
         line = f"这张没看清 ({reason}), 已进 review 等你确认, 先别删原图。"
+        if not is_orig:
+            line += ("另外你是直接拍照发的: TG 会把长截图压到最长边1280, "
+                     "字糊了才看不清。重发时点回形针选“文件”方式发原图。")
     if caption:
         try:
             follow = run_agent(
@@ -454,14 +459,15 @@ def main() -> int:
             continue
         mid = msg["message_id"]
         who = msg.get("from", {}).get("username", "?")
-        file_id = pick_image_file_id(msg)
+        file_id, is_orig = pick_image_file_id(msg)
         if file_id:
             caption = (msg.get("caption") or "").strip()
-            print(f"收到 @{who} 图片 {file_id[:16]}.. 附言: {caption[:60]}")
+            print(f"收到 @{who} 图片 {file_id[:16]}.. 原图={is_orig} 附言: {caption[:60]}")
             try:
                 hist = load_history(chat_id)
                 answer = handle_photo(token, chat_id, mid, file_id,
-                                      caption, profile, endpoint, model, hist)
+                                      caption, profile, endpoint, model, hist,
+                                      is_orig=is_orig)
             except Exception as e:  # noqa: BLE001
                 answer = f"这张图处理失败 ({type(e).__name__}), 已跳过, 换张清晰的再发一次。"
             send_long(token, chat_id, answer, mid)
