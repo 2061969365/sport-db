@@ -1,0 +1,44 @@
+# Telegram 轮询桥: 每 5 分钟拉一次新消息, 同网关同数据回教练建议。
+# 零基建 (不要 Cloudflare), 与 Worker-webhook 互斥: 上了 webhook 先调 deleteWebhook。
+name: bot-poll
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write # 回写 bot_state/tg_offset.txt
+
+concurrency:
+  group: sportdb-bot-poll
+  cancel-in-progress: false # 排队不抢跑, 靠 offset 防重回
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 拉消息并回复
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          VISION_ENDPOINT: ${{ vars.VISION_ENDPOINT }}
+          VISION_MODEL: ${{ vars.VISION_MODEL }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ]; then
+            echo "::warning::TG_BOT_TOKEN 未配置, 去 Settings → Secrets 配好再跑"
+            exit 0
+          fi
+          python3 scripts/tg_poll.py
+      - name: 回写 offset
+        run: |
+          git config user.name "sportdb-bot"
+          git config user.email "sportdb-bot@users.noreply.github.com"
+          git add bot_state/ 2>/dev/null || true
+          if git diff --cached --quiet; then echo "offset 无变化"; exit 0; fi
+          git commit -m "bot: tg offset 前进 ($(date -u +%FT%TZ))" && git push
