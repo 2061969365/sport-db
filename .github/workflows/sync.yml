@@ -139,6 +139,8 @@ jobs:
             echo "::warning::VISION_ENDPOINT 未配置，${#imgs[@]} 张图片保留在 inbox，配好后自动消费（见本文件头注释）"
             exit 0
           fi
+          # 长截图切片需 Pillow (tile_image), 装一次即可
+          pip install -q pillow
           for f in "${imgs[@]}"; do
             base="$(basename "$f")"; stem="${base%.*}"
             # 调模型得 JSON（单图跑失败 → quarantine，不阻塞其它图）
