@@ -8,11 +8,13 @@
 #   1. GPX/TCX/KML：scripts/parse_track.py 统一解析为 workouts schema，
 #      去重键 start_time+type+distance（旧行被覆盖修正），原文件归档到
 #      tracks/{gpx,tcx,kml}/YYYY/MM/，解析行追加进 data/workouts/<年>.csv。
-#   2. 图片：需要 Vision 模型（Secret: LLM_API_KEY）。有 Key 时调模型得 JSON，
-#      scripts/ai_image.py --route 按 confidence 路由：
+#   2. 图片：Vision 模型三件套（Settings → Secrets and variables → Actions）：
+#      Secret LLM_API_KEY + Variable VISION_ENDPOINT(…/chat/completions)
+#      + Variable VISION_MODEL(多模态模型名)，三者齐了才调模型；
+#      scripts/ai_image.py --vision 得 JSON → --route 按 confidence 路由：
 #        >= 0.8 直接写 data/workouts/<年>.csv + 原图归档 images/YYYY/MM/；
-#        < 0.8  进 review/needs-review-*.json，PWA 标黄人工确认，build_db 会忽略 review。
-#      无 Key（fork/本地跑）时图片留在 inbox 不动，并在 Summary 里提示。
+#        < 0.8  进 review/needs-review-*.json（原图一起移过去），PWA 标黄人工确认，build_db 会忽略 review。
+#      缺任一件则图片留在 inbox 不动，并在 Summary 里提示缺什么。
 #   3. 消费完的文件移走（归档），inbox 只留未处理项；data/ 变化触发 build_db 重编。
 # 真相源 = git 里的 CSV + tracks + images；data.db 是构建产物（也进仓，方便直接下载查）。
 #
@@ -115,26 +117,47 @@ jobs:
             echo "归档 -> $dest/$base"
           done
 
-      # ---------- 2. inbox 消费：图片截图（需 LLM_API_KEY，无则保留） ----------
+      # ---------- 2. inbox 消费：图片截图（Vision → workouts） ----------
+      # 模型三件套（仓库 Settings → Secrets and variables → Actions 里配）：
+      #   Secret   LLM_API_KEY     ← 模型的 API Key（只存 Secret，不进 git）
+      #   Variable VISION_ENDPOINT ← OpenAI-compatible 地址，如 …/v1/chat/completions
+      #   Variable VISION_MODEL     ← 模型名，必须是多模态(vision)模型，见 docs/模型配置
       - name: 消费 inbox 图片 (vision → workouts)
         env:
           PREFIX: ${{ steps.layout.outputs.prefix }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          VISION_ENDPOINT: ${{ vars.VISION_ENDPOINT }}
+          VISION_API_KEY: ${{ secrets.LLM_API_KEY }}
+          VISION_MODEL: ${{ vars.VISION_MODEL }}
         run: |
           INBOX="$PREFIX/inbox/uploads"
           shopt -s nullglob
           imgs=("$INBOX"/*.jpg "$INBOX"/*.jpeg "$INBOX"/*.png "$INBOX"/*.webp "$INBOX"/*.JPG "$INBOX"/*.PNG "$INBOX"/*.WEBP)
           if [ ${#imgs[@]} -eq 0 ]; then echo "inbox 无图片，跳过"; exit 0; fi
-          if [ -z "$LLM_API_KEY" ]; then
-            echo "::warning::LLM_API_KEY 未配置，${#imgs[@]} 张图片保留在 inbox，待配置后自动消费"
+          if [ -z "$VISION_API_KEY" ] || [ -z "$VISION_ENDPOINT" ]; then
+            echo "::warning::VISION_ENDPOINT / LLM_API_KEY 未配全，${#imgs[@]} 张图片保留在 inbox，配好后自动消费（见本文件头注释）"
             exit 0
           fi
           for f in "${imgs[@]}"; do
             base="$(basename "$f")"; stem="${base%.*}"
-            # Vision 调用由仓库自备脚本/模型网关完成，结果 JSON 落盘后统一走 --route
-            # （Prompt 与字段契约见 scripts/ai_image.py VISION_PROMPT，confidence<0.8 进 review）
-            echo "TODO-vision: $base → 调模型得 /tmp/vision-$stem.json（网关示例见仓库 docs）"
-            echo "::warning::$base 暂留 inbox：Vision 网关接入后由 ai_image.py --route 自动路由"
+            # 调模型得 JSON（单图跑失败 → quarantine，不阻塞其它图）
+            if ! python3 "$PREFIX/scripts/ai_image.py" --vision "$f" --out "/tmp/vision-$stem.json" > "/tmp/vision-log-$stem.txt" 2>&1; then
+              echo "VISION FAIL: $base，移入 quarantine"; cat "/tmp/vision-log-$stem.txt"
+              mv "$f" "$PREFIX/quarantine/$base"; continue
+            fi
+            cat "/tmp/vision-log-$stem.txt"
+            # 按 confidence 路由：direct 入库 / review 人工确认
+            route_out="$(python3 "$PREFIX/scripts/ai_image.py" --route "/tmp/vision-$stem.json" --workouts "$PREFIX/data/workouts" --review "$PREFIX/review" --images "$f")"
+            echo "$route_out"
+            # 原图归档：direct → images/YYYY/MM/，review → review/（图随 JSON 一起等人看）
+            d="$(grep -oE '^20[0-9]{6}' <<< "$stem" | head -1)"
+            if grep -q '^direct:' <<< "$route_out"; then
+              y="${d:0:4}"; m="${d:4:2}"; [ -z "$y" ] && y="$(date +%Y)"; [ -z "$m" ] && m="$(date +%m)"
+              dest="$PREFIX/images/$y/$m"; mkdir -p "$dest"; mv "$f" "$dest/$base"
+              echo "归档 -> $dest/$base"
+            else
+              mv "$f" "$PREFIX/review/$base" 2>/dev/null || mv "$f" "$PREFIX/quarantine/$base"
+              echo "$base -> review 待人工确认"
+            fi
           done
 
       # ---------- 3. build data.db ----------

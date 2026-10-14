@@ -237,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--compress", nargs=2, metavar=("SRC", "DST"),
                     help="Pillow 复刻前端压图 (1280px/WebP q80)")
     ap.add_argument("--route", default="", help="Vision 结果 JSON 文件, 按 confidence 路由")
+    ap.add_argument("--vision", default="", help="单张图片: 直接调 Vision 模型得 JSON (需 VISION_ENDPOINT/VISION_API_KEY/VISION_MODEL)")
+    ap.add_argument("--out", default="", help="--vision 结果 JSON 落盘路径 (可选)")
     ap.add_argument("--workouts", default="data/workouts", help="direct 入库目录")
     ap.add_argument("--review", default="review", help="<0.8 人工确认目录")
     ap.add_argument("--images", default="", help="原图归档路径 (可选, 一并记录)")
@@ -260,6 +262,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{decision}: {reason} -> id={row['id']} "
                   f"distance={row['distance_m']}m duration={row['duration_s']}s")
         print(f"spec={COMPRESS_SPEC} threshold={REVIEW_THRESHOLD}")
+        return 0
+
+    if args.vision:
+        src = Path(args.vision)
+        mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp"}.get(
+                    src.suffix.lower(), "image/jpeg")
+        rec = call_vision(src.read_bytes(), mime)
+        print(json.dumps(rec, ensure_ascii=False))
+        if args.out:
+            Path(args.out).write_text(
+                json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+            print(f"vision -> {args.out}")
         return 0
 
     if args.route:
