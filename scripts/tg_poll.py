@@ -28,6 +28,7 @@ BJ = timezone(timedelta(hours=8))
 API = "https://api.telegram.org"
 GATEWAY_UA = "sport-db/1.0 (compatible; +https://github.com)"
 DEFAULT_MODEL = "muse-spark-1.3-contributor-free"
+RUN_TYPES = ("outdoor_running", "indoor_running", "outdoor_run_class")
 STATE_FILE = REPO_ROOT / "bot_state" / "tg_offset.txt"
 
 
@@ -56,26 +57,57 @@ def summarize_30d(data_dir: Path) -> str:
     recent = [r for r in rows if r.get("date", "") >= cutoff.isoformat()]
     if not recent:
         return f"近 30 天无运动 (库共 {len(rows)} 条, 最新 {max(r['date'] for r in rows)}), 今天 {today}。"
-    runs = [r for r in recent if "run" in (r.get("type") or "")]
-    dist = sum(int(float(r["distance_m"] or 0)) for r in recent) / 1000.0
-    paces = [int(float(r["avg_pace_s"])) for r in recent if r.get("avg_pace_s")]
-    hrs = [int(float(r["avg_hr"])) for r in recent if r.get("avg_hr")]
-    steps = sum(int(float(r["steps"] or 0)) for r in recent if r.get("steps"))
+    def num(v) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def grp(r) -> str:
+        t = r.get("type") or ""
+        if t in RUN_TYPES:
+            return "跑步"
+        if "riding" in t:
+            return "骑行"
+        if "walk" in t:
+            return "步行"
+        if "swim" in t:
+            return "游泳"
+        if "skip" in t:
+            return "跳绳"
+        return "综合训练"
 
     def fmt_pace(s: float) -> str:
-        return f"{int(s // 60)}'{int(s % 60):02d}\"/km"
+        return "%d'%02d\"/km" % (int(s // 60), int(s % 60))
 
-    parts = [f"近30天运动{len(recent)}次(跑步{len(runs)}次)、跑量{dist:.1f}km"]
-    if paces:
-        parts.append(f"均配速{fmt_pace(sum(paces) / len(paces))}")
-    if hrs:
-        parts.append(f"运动均心率{sum(hrs) / len(hrs):.0f}")
+    by_grp: dict[str, list] = {}
+    for r in recent:
+        by_grp.setdefault(grp(r), []).append(r)
+    days = {r["date"] for r in recent if r.get("date")}
+    out = [f"近30天共运动{len(recent)}次, 活跃{len(days)}天 (今天{today})。"]
+    runs = by_grp.get("跑步", [])
+    if runs:
+        pd = sum(num(r["distance_m"]) for r in runs)
+        pt = sum(num(r["duration_s"]) for r in runs)
+        hrs = [num(r["avg_hr"]) for r in runs if num(r["avg_hr"])]
+        seg = f"跑步{len(runs)}次共{pd / 1000.0:.1f}km"
+        if pd > 0 and pt > 0:
+            seg += f", 均配速{fmt_pace(pt / (pd / 1000.0))}"
+        if hrs:
+            seg += f", 均心率{sum(hrs) / len(hrs):.0f}bpm"
+        out.append(seg + "。")
+    for name in ("骑行", "步行", "游泳", "跳绳", "综合训练"):
+        rs = by_grp.get(name, [])
+        if rs:
+            out.append(f"{name}{len(rs)}次共{sum(num(r['distance_m']) for r in rs) / 1000.0:.1f}km。")
+    steps = sum(int(num(r["steps"])) for r in recent)
     if steps:
-        parts.append(f"累计步数{steps}")
-    last = max(recent, key=lambda r: r.get("date", ""))
-    parts.append(f"最近一次{last.get('date')}{last.get('type')}"
-                 f"{float(last.get('distance_m') or 0) / 1000:.2f}km")
-    return "；".join(parts) + "。"
+        out.append(f"累计步数{steps}。")
+    last = max(recent, key=lambda r: (r.get("date", ""), r.get("start_utc", "0")))
+    out.append(f"最近一次: {last.get('date')} {grp(last)}"
+               f"{num(last.get('distance_m')) / 1000:.2f}km"
+               f"用时{num(last.get('duration_s')) / 60:.0f}分钟。")
+    return "\n".join(out)
 
 
 def ask_gateway(question: str, profile: str, endpoint: str,
@@ -84,8 +116,11 @@ def ask_gateway(question: str, profile: str, endpoint: str,
         "model": model,
         "messages": [
             {"role": "system", "content": (
-                "你是用户的跑步教练, 简短口语中文回答 (200字内), 只谈训练, "
-                "不确定的数据说不知道。用户画像: " + profile)},
+                "你是一名懂数据的跑步教练, 简短口语中文回答 (200字内)。"
+                "规则: 只用画像数据说话, 跑步是跑步、骑行是骑行, "
+                "配速只谈跑步; 先给一句话结论, 再给1-2条带数字的具体建议; "
+                "画像里没有的就说不知道, 不编数据; 只谈训练恢复。"
+                "用户画像: " + profile)},
             {"role": "user", "content": question},
         ],
     }

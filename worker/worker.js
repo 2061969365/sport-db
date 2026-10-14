@@ -85,33 +85,47 @@ async function buildSummary(env) {
   }
   const recent = workouts.filter((w) => Number(w.start_utc || 0) * 1000 >= cutoff);
   const kmByType = {};
-  let meters = 0, secs = 0, hrSum = 0, hrN = 0, paceSum = 0, paceN = 0;
+  const RUN_TYPES = ['outdoor_running', 'indoor_running', 'outdoor_run_class'];
+  let secs = 0; const byGrp = {};
   const days = new Set();
   let last = null;
+  const grpOf = (t) => {
+    t = t || '';
+    if (RUN_TYPES.includes(t)) return '跑步';
+    if (t.includes('riding')) return '骑行';
+    if (t.includes('walk')) return '步行';
+    if (t.includes('swim')) return '游泳';
+    if (t.includes('skip')) return '跳绳';
+    return '综合训练';
+  };
   for (const w of recent) {
-    const m = num(w.distance_m), s = num(w.duration_s);
-    meters += m; secs += s;
-    kmByType[w.type || "unknown"] = (kmByType[w.type || "unknown"] || 0) + m;
-    if (w.avg_hr) { hrSum += num(w.avg_hr); hrN++; }
-    if (w.avg_pace_s) { paceSum += num(w.avg_pace_s); paceN++; }
+    const g = grpOf(w.type);
+    (byGrp[g] = byGrp[g] || []).push(w);
+    secs += num(w.duration_s);
     if (w.date) days.add(w.date);
     if (!last || Number(w.start_utc) > Number(last.start_utc)) last = w;
   }
-  const byType = Object.entries(kmByType)
-    .sort((a, b) => b[1] - a[1])
-    .map(([t, m]) => `${t} ${(m / 1000).toFixed(1)}km`).join("、") || "无";
-  const dailyDays = new Set(
-    daily.filter((d) => Date.parse(d.time_beijing || d.date || "") >= cutoff)
-      .map((d) => (d.time_beijing || d.date || "").slice(0, 10)),
-  );
-  const fmtPace = paceN ? `${Math.floor(paceSum / paceN / 60)}'${String(Math.round(paceSum / paceN % 60)).padStart(2, "0")}"` : "—";
-  return [
-    `近30天：训练 ${recent.length} 次，累计 ${(meters / 1000).toFixed(1)}km，累计时长 ${(secs / 3600).toFixed(1)}h，活跃 ${days.size} 天`,
-    `分项：${byType}`,
-    `平均配速 ${fmtPace}/km，平均心率 ${hrN ? Math.round(hrSum / hrN) + "bpm" : "—"}`,
-    last ? `最近一次：${last.date} ${last.type} ${(num(last.distance_m) / 1000).toFixed(2)}km 用时 ${Math.round(num(last.duration_s) / 60)}min` : "最近一次：无",
-    `每日健康数据覆盖 ${dailyDays.size} 天`,
-  ].join("\n");
+  const todayBj = new Date(Date.now() + 8 * 36e5).toISOString().slice(0, 10);
+  const fmtPace = (s) => `${Math.floor(s / 60)}'${String(Math.round(s % 60)).padStart(2, '0')}` + '”/km';
+  const lines = [`近30天共运动${recent.length}次，活跃${days.size}天（今天${todayBj}）。`];
+  const runs = byGrp['跑步'] || [];
+  if (runs.length) {
+    const pd = runs.reduce((a, w) => a + num(w.distance_m), 0);
+    const pt = runs.reduce((a, w) => a + num(w.duration_s), 0);
+    const hrs = runs.map((w) => num(w.avg_hr)).filter((x) => x);
+    let seg = `跑步${runs.length}次共${(pd / 1000).toFixed(1)}km`;
+    if (pd > 0 && pt > 0) seg += `，均配速${fmtPace(pt / (pd / 1000))}`;
+    if (hrs.length) seg += `，均心率${Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length)}bpm`;
+    lines.push(seg + '。');
+  }
+  for (const name of ['骑行', '步行', '游泳', '跳绳', '综合训练']) {
+    const rs = byGrp[name] || [];
+    if (rs.length) lines.push(`${name}${rs.length}次共${(rs.reduce((a, w) => a + num(w.distance_m), 0) / 1000).toFixed(1)}km。`);
+  }
+  if (last) lines.push(`最近一次：${last.date} ${grpOf(last.type)} ${(num(last.distance_m) / 1000).toFixed(2)}km 用时 ${Math.round(num(last.duration_s) / 60)}min。`);
+  const dailyDays = new Set(daily.filter((d) => Date.parse(d.time_beijing || d.date || '') >= cutoff).map((d) => (d.time_beijing || d.date || '').slice(0, 10)));
+  lines.push(`每日健康数据覆盖 ${dailyDays.size} 天`);
+  return lines.join(String.fromCharCode(10)); // 上面数组已直接拼成 lines"\n");
 }
 
 // ----------------------------------------------------------------- LLM
@@ -126,7 +140,7 @@ async function askModel(env, summary, question) {
       messages: [
         {
           role: "system",
-          content: "你是用户的运动健康助手 sport-db Bot。用中文简洁回答（200字内），必要时给具体数字和建议。以下是该用户近30天运动摘要：\n" + summary,
+          content: "你是一名懂数据的跑步教练，用简短口语中文回答（200字内）。规则：只用摘要数据说话，跑步是跑步、骑行是骑行，配速只谈跑步；先给一句话结论，再给1-2条带数字的具体建议；摘要里没有的就说不知道，不编数据；只谈训练恢复。以下是该用户近30天运动摘要：\n" + summary,
         },
         { role: "user", content: question || "总结一下我最近的运动情况" },
       ],
