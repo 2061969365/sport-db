@@ -334,7 +334,12 @@ def build(data_dir: Path, out: Path) -> dict:
                         list(meta_rows.items()))
         file_rows = []
         for fp in w_files + d_files:
-            rel = fp.relative_to(REPO_ROOT).as_posix()
+            try:
+                rel = fp.relative_to(REPO_ROOT).as_posix()
+            except ValueError:
+                # Custom --data outside the repo: store a stable basename instead
+                # of crashing the whole build.
+                rel = fp.name
             file_rows.append((rel, sha256_of(fp), fp.stat().st_size, imported_at))
         con.executemany("INSERT OR REPLACE INTO files(path, sha256, bytes, imported_at)"
                         " VALUES (?,?,?,?)", file_rows)
@@ -371,7 +376,9 @@ def main(argv=None) -> int:
     ap.add_argument("--data", default=str(DEFAULT_DATA))
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     a = ap.parse_args(argv)
-    data_dir, out = Path(a.data), Path(a.out)
+    # Resolve against CWD so CI calls like `--data ./data` (relative) still
+    # produce absolute paths comparable with REPO_ROOT in build().
+    data_dir, out = Path(a.data).resolve(), Path(a.out).resolve()
     res = build(data_dir, out)
     c = res["counts"]
     mb = res["bytes"] / (1024 * 1024)
