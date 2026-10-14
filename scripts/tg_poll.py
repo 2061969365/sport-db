@@ -107,8 +107,9 @@ def ask_gateway(question: str, profile: str, endpoint: str,
 def send_long(token: str, chat_id: int, text: str, reply_to: int) -> None:
     text = text or "刚没想出来, 换个问法再试一次?"
     for i in range(0, len(text), 3500):
-        tg(token, {"chat_id": chat_id, "text": text[i:i + 3500],
-                   "reply_to_message_id": reply_to})
+        tg("sendMessage", token, {"chat_id": chat_id,
+                                  "text": text[i:i + 3500],
+                                  "reply_to_message_id": reply_to})
 
 
 def main() -> int:
