@@ -41,4 +41,13 @@ jobs:
           git config user.email "sportdb-bot@users.noreply.github.com"
           git add bot_state/ 2>/dev/null || true
           if git diff --cached --quiet; then echo "offset 无变化"; exit 0; fi
-          git commit -m "bot: tg offset 前进 ($(date -u +%FT%TZ))" && git push
+          git commit -m "bot: tg offset 前进 ($(date -u +%FT%TZ))"
+          # cron 与手动触发可能撞车: 先 rebase 再推, 3 次都推不上才认输
+          # (offset 没写回去顶多下次重回一次, 不丢消息)
+          for i in 1 2 3; do
+            git push && break
+            echo "push 撞车, rebase 重试 ($i/3)"
+            git pull --rebase origin main || { git rebase --abort; sleep 10; continue; }
+            sleep 5
+          done
+          git status -sb | head -3

@@ -216,7 +216,13 @@ jobs:
           git add -u "$PREFIX/inbox" 2>/dev/null || true
           if git diff --cached --quiet; then echo "无数据变化，无需回写"; exit 0; fi
           git commit -m "sync: inbox消费 + data.db 重编 + 日报 ($(date -u +%F))"
-          git push
+          # bot-poll 可能同时回写 offset: 先 rebase 再推, 3 次都推不上才认输。
+          for i in 1 2 3; do
+            git push && break
+            echo "push 撞车, rebase 重试 ($i/3)"
+            git pull --rebase origin main || { git rebase --abort; sleep 10; continue; }
+            sleep 5
+          done
 
       # ---------- 6. 给 Pages 准备前端产物（含离线数据 + 日报） ----------
       - name: 组装 Pages 产物
