@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="theme-color" content="#fc4c02" />
+<meta name="description" content="运动库 SportDB — 个人运动数据存档：今天 / 日历 / 趋势 / 年报" />
+<title>运动库 SportDB</title>
+<link rel="stylesheet" href="./style.css" />
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🏃</span>
+    <div>
+      <h1>运动库 <span class="en">SportDB</span></h1>
+      <p class="subtitle">跑步 · 骑行 · 健走 — 本地 SQLite + GitHub Pages 存档</p>
+    </div>
+  </div>
+  <div class="db-status" id="db-status" title="sql.js-httpvfs 查询 data.db 状态">data.db: 未连接</div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-view="today" role="tab">📅 今天</button>
+  <button class="tab" data-view="calendar" role="tab">🗓️ 日历</button>
+  <button class="tab" data-view="trends" role="tab">📈 趋势</button>
+  <button class="tab" data-view="annual" role="tab">📊 年报</button>
+</nav>
+
+<main>
+  <!-- ============ 今天页 ============ -->
+  <section id="view-today" class="view active">
+    <div class="grid-2">
+      <div class="card">
+        <h2>今日状态 <span class="date" id="today-date"></span></h2>
+        <div class="stat-row">
+          <div class="stat"><b id="stat-dist">--</b><span>距离 km</span></div>
+          <div class="stat"><b id="stat-count">--</b><span>运动次数</span></div>
+          <div class="stat"><b id="stat-days">--</b><span>连续天数</span></div>
+        </div>
+        <p class="hint">已接通：<code>queryToday()</code> 首选 sql.js-httpvfs 读 <code>data.db</code>，失败自动降级读当年 CSV。</p>
+        <div class="row">
+          <button id="btn-load-demo">载入示例数据</button>
+          <button id="btn-query-db" class="ghost">从 data.db 查询</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>📸 图片上传框</h2>
+        <p class="hint">运动截图 / 手表照片，先本地预览，后续走导入流水线入库。</p>
+        <label class="dropzone" id="drop-image">
+          <input type="file" id="input-image" accept="image/*" multiple hidden />
+          <span class="dz-icon">🖼️</span>
+          <span>点击选择或拖拽图片到此处</span>
+          <small>JPG / PNG / HEIC，支持多选</small>
+        </label>
+        <div id="image-preview" class="preview-grid"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📂 GPX / TCX / KML 文件框</h2>
+      <p class="hint">从手表 / App 导出的轨迹文件，本地解析预览，入库由 <code>scripts/import_*</code> 完成。</p>
+      <label class="dropzone" id="drop-track">
+        <input type="file" id="input-track" accept=".gpx,.tcx,.kml,application/gpx+xml" multiple hidden />
+        <span class="dz-icon">🛰️</span>
+        <span>点击选择或拖拽轨迹文件到此处</span>
+        <small>.gpx · .tcx · .kml，支持多选</small>
+      </label>
+      <ul id="track-list" class="file-list"><li class="empty">暂无文件</li></ul>
+    </div>
+
+    <div class="card">
+      <h2>🔌 data.db 查询接口（已接通）</h2>
+      <pre class="code">// app.js 已接通（task-6）：
+DB_CONFIG  = { dbUrl: "../data.db" } // 相对 frontend，指向 sport-db/data.db
+initDb()       // sql.js-httpvfs 初始化，多候选地址逐个试
+queryWorkouts({ from, to }) // 主路径查 workouts 表，失败降级读 data/workouts/当年.csv
+queryToday()   // 今天页聚合 + 日历/热力图/年报刷新</pre>
+      <p class="hint">参考 <a href="https://github.com/yihong0618/running_page" target="_blank" rel="noopener">yihong0618/running_page</a> 布局思路：顶部统计 + 热力图 + 列表；数据层经 sql.js-httpvfs 按需读 <code>data.db</code>（需 Range 支持，Pages 原生支持），<code>data.db</code> 缺失时自动降级读 <code>data/workouts/当年.csv</code>。</p>
+    </div>
+  </section>
+
+  <!-- ============ 日历占位 ============ -->
+  <section id="view-calendar" class="view">
+    <div class="card">
+      <h2>🗓️ 运动日历 <small class="tag">占位</small></h2>
+      <p class="hint">GitHub 风格热力图：颜色深浅 = 当日运动量。接 data.db 后按天渲染。</p>
+      <div id="calendar-heatmap" class="heatmap-placeholder">
+        <div class="heat-grid" id="heat-grid"><!-- app.js 生成 26×7 占位格 --></div>
+        <div class="heat-legend"><span>少</span><i class="lv0"></i><i class="lv1"></i><i class="lv2"></i><i class="lv3"></i><i class="lv4"></i><span>多</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>当月列表 <small class="tag">占位</small></h2>
+      <table class="tbl"><thead><tr><th>日期</th><th>类型</th><th>距离</th><th>用时</th><th>来源</th></tr></thead>
+      <tbody id="month-tbody"><tr><td colspan="5" class="empty">接通 data.db 后填充 …</td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- ============ 趋势占位 ============ -->
+  <section id="view-trends" class="view">
+    <div class="card">
+      <h2>📈 距离趋势 <small class="tag">占位</small></h2>
+      <p class="hint">周 / 月距离柱线图占位，图表库后续二选一：Chart.js 或 ECharts。</p>
+      <canvas id="trend-chart" height="120"></canvas>
+      <div class="chart-fake"><i style="height:30%"></i><i style="height:55%"></i><i style="height:40%"></i><i style="height:80%"></i><i style="height:62%"></i><i style="height:95%"></i><i style="height:48%"></i></div>
+    </div>
+  </section>
+
+  <!-- ============ 年报占位 ============ -->
+  <section id="view-annual" class="view">
+    <div class="card">
+      <h2>📊 年度总结 <small class="tag">占位</small></h2>
+      <div class="stat-row big">
+        <div class="stat"><b id="annual-dist">--</b><span>全年距离 km</span></div>
+        <div class="stat"><b id="annual-count">--</b><span>总次数</span></div>
+        <div class="stat"><b id="annual-hours">--</b><span>总时长 h</span></div>
+        <div class="stat"><b id="annual-best">--</b><span>最长单次 km</span></div>
+      </div>
+      <p class="hint">running_page 式年报：总数 + 月均 + 最佳纪录，接 data.db 年度聚合后填充。</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>运动库 SportDB · 静态 PWA 骨架 · 数据不出浏览器（图片/轨迹仅本地预览）</span>
+  <span id="sw-status"></span>
+</footer>
+
+<!-- sql.js-httpvfs 真实接线（task-6）：按需 Range 读取 ../data.db，失败自动降级读 CSV -->
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.8.0/dist/sql-wasm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sql.js-httpvfs@0.9.0/dist/sqlite-httpvfs.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

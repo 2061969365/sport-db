@@ -1,0 +1,64 @@
+== import_mi.py cleaning report ==
+src=F:\worker\mifitness_data out=F:\worker\sport-db\data tz=Asia/Shanghai(+08:00) cutoff=Time<1000000000 desensitise=sha256[:8]
+
+[track] rows=672 kept_unique_times=671 dropped=1 (Time==946668882: 1) gpx_links=671 range=1688222563..1791885408 (2023-07-01..2026-10-13 BJ)
+[ids] distinct raw Uid/Sid/Did collected: 8 (nested scrub map ready)
+[workouts] rows=807 kept=806 dropped=1 (Time==946668882: 1) dup_sid_time_key=0 nested_scrubbed=0
+           range=1683037903..1791885408 (2023-05-02..2026-10-13 BJ)
+           -> data\workouts\2023.csv rows=117 bytes=94546
+           -> data\workouts\2024.csv rows=235 bytes=189480
+           -> data\workouts\2025.csv rows=204 bytes=159474
+           -> data\workouts\2026.csv rows=250 bytes=213740
+[daily] rows=14089 kept=14082 dropped=7 (Time==946668882: 0) dup=0 nested_scrubbed=1232
+        range=1682985600..1791849600 (2023-05-02..2026-10-13 BJ)
+        -> data\daily\2023.csv rows=2384 bytes=480421
+        -> data\daily\2024.csv rows=4681 bytes=919224
+        -> data\daily\2025.csv rows=3991 bytes=747983
+        -> data\daily\2026.csv rows=3026 bytes=560051
+[raw] rows=1037417 kept=1036993 dropped=424 (Time==946668882: 0) nested_scrubbed=3
+      range=1682985600..1791906300 (2023-05-02..2026-10-13 BJ)
+      -> data\raw\fitness\2023\05.csv.gz rows=16575 bytes=179886
+      -> data\raw\fitness\2023\06.csv.gz rows=18163 bytes=196698
+      -> data\raw\fitness\2023\07.csv.gz rows=4285 bytes=48786
+      -> data\raw\fitness\2023\08.csv.gz rows=13349 bytes=147648
+      -> data\raw\fitness\2023\09.csv.gz rows=31044 bytes=330719
+      -> data\raw\fitness\2023\10.csv.gz rows=14918 bytes=163806
+      -> data\raw\fitness\2023\11.csv.gz rows=18959 bytes=211451
+      -> data\raw\fitness\2023\12.csv.gz rows=21319 bytes=240395
+      -> data\raw\fitness\2024\01.csv.gz rows=19816 bytes=225732
+      -> data\raw\fitness\2024\02.csv.gz rows=35813 bytes=390214
+      -> data\raw\fitness\2024\03.csv.gz rows=30674 bytes=338823
+      -> data\raw\fitness\2024\04.csv.gz rows=60356 bytes=588659
+      -> data\raw\fitness\2024\05.csv.gz rows=82987 bytes=806551
+      -> data\raw\fitness\2024\06.csv.gz rows=42452 bytes=420570
+      -> data\raw\fitness\2024\07.csv.gz rows=20658 bytes=220633
+      -> data\raw\fitness\2024\08.csv.gz rows=10182 bytes=111762
+      -> data\raw\fitness\2024\09.csv.gz rows=19769 bytes=197702
+      -> data\raw\fitness\2024\10.csv.gz rows=24167 bytes=250976
+      -> data\raw\fitness\2024\11.csv.gz rows=48555 bytes=493849
+      -> data\raw\fitness\2024\12.csv.gz rows=76443 bytes=762083
+      -> data\raw\fitness\2025\01.csv.gz rows=48198 bytes=492485
+      -> data\raw\fitness\2025\02.csv.gz rows=21133 bytes=230930
+      -> data\raw\fitness\2025\03.csv.gz rows=25040 bytes=280762
+      -> data\raw\fitness\2025\04.csv.gz rows=22063 bytes=255386
+      -> data\raw\fitness\2025\05.csv.gz rows=19876 bytes=227546
+      -> data\raw\fitness\2025\06.csv.gz rows=27186 bytes=300290
+      -> data\raw\fitness\2025\07.csv.gz rows=18494 bytes=210298
+      -> data\raw\fitness\2025\08.csv.gz rows=19919 bytes=221132
+      -> data\raw\fitness\2025\09.csv.gz rows=8154 bytes=96277
+      -> data\raw\fitness\2025\10.csv.gz rows=14187 bytes=163625
+      -> data\raw\fitness\2025\11.csv.gz rows=13757 bytes=163791
+      -> data\raw\fitness\2025\12.csv.gz rows=26889 bytes=296118
+      -> data\raw\fitness\2026\01.csv.gz rows=15105 bytes=163769
+      -> data\raw\fitness\2026\02.csv.gz rows=15088 bytes=163944
+      -> data\raw\fitness\2026\03.csv.gz rows=21506 bytes=242790
+      -> data\raw\fitness\2026\04.csv.gz rows=18343 bytes=214106
+      -> data\raw\fitness\2026\05.csv.gz rows=22771 bytes=273913
+      -> data\raw\fitness\2026\06.csv.gz rows=15184 bytes=183159
+      -> data\raw\fitness\2026\07.csv.gz rows=13292 bytes=155304
+      -> data\raw\fitness\2026\08.csv.gz rows=14036 bytes=163285
+      -> data\raw\fitness\2026\09.csv.gz rows=17485 bytes=207698
+      -> data\raw\fitness\2026\10.csv.gz rows=8803 bytes=102313
+[profile] rows=1 uid_hash=eaadbce5 maxHrm=0 recordMaxHrm={"hrm":190,"source":"auto"} dailyStepGoal=6000 dailyCalGoal=400 initialWeight={"weight":60,"timestamp":1682988140}
+
+RESULT: OK - 50 files, all < 10MB, total 14500783 bytes

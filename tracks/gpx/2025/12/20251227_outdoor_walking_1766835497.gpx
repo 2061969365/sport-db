@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Go GPS Converter">
+  <trk>
+    <name>GPS Track</name>
+    <trkseg>
+      <trkpt lat="23.243866" lon="113.863">
+        <time>2025-12-27T11:38:30Z</time>
+      </trkpt>
+      <trkpt lat="23.243881" lon="113.863">
+        <time>2025-12-27T11:38:31Z</time>
+      </trkpt>
+      <trkpt lat="23.243896" lon="113.863">
+        <time>2025-12-27T11:38:32Z</time>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>

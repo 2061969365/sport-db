@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Go GPS Converter">
+  <trk>
+    <name>GPS Track</name>
+    <trkseg>
+      <trkpt lat="23.392645" lon="113.35178">
+        <time>2024-01-11T00:12:00Z</time>
+      </trkpt>
+      <trkpt lat="23.392635" lon="113.35178">
+        <time>2024-01-11T00:12:01Z</time>
+      </trkpt>
+      <trkpt lat="23.392609" lon="113.35177">
+        <time>2024-01-11T00:12:02Z</time>
+      </trkpt>
+      <trkpt lat="23.392578" lon="113.35176">
+        <time>2024-01-11T00:12:03Z</time>
+      </trkpt>
+      <trkpt lat="23.392542" lon="113.35175">
+        <time>2024-01-11T00:12:04Z</time>
+      </trkpt>
+      <trkpt lat="23.392502" lon="113.35174">
+        <time>2024-01-11T00:12:05Z</time>
+      </trkpt>
+      <trkpt lat="23.392458" lon="113.35173">
+        <time>2024-01-11T00:12:06Z</time>
+      </trkpt>
+      <trkpt lat="23.392418" lon="113.35172">
+        <time>2024-01-11T00:12:07Z</time>
+      </trkpt>
+      <trkpt lat="23.392376" lon="113.35171">
+        <time>2024-01-11T00:12:08Z</time>
+      </trkpt>
+      <trkpt lat="23.392338" lon="113.35169">
+        <time>2024-01-11T00:12:09Z</time>
+      </trkpt>
+      <trkpt lat="23.392298" lon="113.35168">
+        <time>2024-01-11T00:12:10Z</time>
+      </trkpt>
+      <trkpt lat="23.392254" lon="113.35167">
+        <time>2024-01-11T00:12:11Z</time>
+      </trkpt>
+      <trkpt lat="23.392208" lon="113.35166">
+        <time>2024-01-11T00:12:12Z</time>
+      </trkpt>
+      <trkpt lat="23.392164" lon="113.35165">
+        <time>2024-01-11T00:12:13Z</time>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>

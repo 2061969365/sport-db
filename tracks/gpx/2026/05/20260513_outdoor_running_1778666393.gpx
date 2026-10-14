@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Go GPS Converter">
+  <trk>
+    <name>GPS Track</name>
+    <trkseg>
+      <trkpt lat="23.248764" lon="113.86301">
+        <time>2026-05-13T10:00:03Z</time>
+      </trkpt>
+      <trkpt lat="23.248762" lon="113.863">
+        <time>2026-05-13T10:00:04Z</time>
+      </trkpt>
+      <trkpt lat="23.248758" lon="113.862976">
+        <time>2026-05-13T10:00:05Z</time>
+      </trkpt>
+      <trkpt lat="23.248755" lon="113.86296">
+        <time>2026-05-13T10:00:06Z</time>
+      </trkpt>
+      <trkpt lat="23.24875" lon="113.86294">
+        <time>2026-05-13T10:00:07Z</time>
+      </trkpt>
+      <trkpt lat="23.248747" lon="113.86292">
+        <time>2026-05-13T10:00:08Z</time>
+      </trkpt>
+      <trkpt lat="23.248743" lon="113.8629">
+        <time>2026-05-13T10:00:09Z</time>
+      </trkpt>
+      <trkpt lat="23.248741" lon="113.862885">
+        <time>2026-05-13T10:00:10Z</time>
+      </trkpt>
+      <trkpt lat="23.248737" lon="113.86286">
+        <time>2026-05-13T10:00:11Z</time>
+      </trkpt>
+      <trkpt lat="23.248735" lon="113.86285">
+        <time>2026-05-13T10:00:12Z</time>
+      </trkpt>
+      <trkpt lat="23.248732" lon="113.86283">
+        <time>2026-05-13T10:00:13Z</time>
+      </trkpt>
+      <trkpt lat="23.248728" lon="113.86281">
+        <time>2026-05-13T10:00:14Z</time>
+      </trkpt>
+      <trkpt lat="23.248726" lon="113.86279">
+        <time>2026-05-13T10:00:15Z</time>
+      </trkpt>
+      <trkpt lat="23.248722" lon="113.86278">
+        <time>2026-05-13T10:00:16Z</time>
+      </trkpt>
+      <trkpt lat="23.24872" lon="113.86276">
+        <time>2026-05-13T10:00:17Z</time>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>

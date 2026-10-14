@@ -1,0 +1,194 @@
+# SportDB 每日同步：inbox 消费 → build data.db → 发布 Pages（task-6）
+#
+# == inbox 消费说明（写给下一个维护者）==
+# PWA 前端（frontend/「今天」页）把用户新产生的东西先丢进 inbox/uploads/：
+#   - 图片截图  inbox/uploads/YYYYMMDD-NNN.jpg|webp（前端已压 1280px，见 ai_image.py COMPRESS_SPEC）
+#   - 轨迹文件  inbox/uploads/*.{gpx,tcx,kml}（手表/App 单次导出）
+# 本工作流按以下规则消费 inbox（幂等，可重跑；失败进 quarantine/ 不阻塞）：
+#   1. GPX/TCX/KML：scripts/parse_track.py 统一解析为 workouts schema，
+#      去重键 start_time+type+distance（旧行被覆盖修正），原文件归档到
+#      tracks/{gpx,tcx,kml}/YYYY/MM/，解析行追加进 data/workouts/<年>.csv。
+#   2. 图片：需要 Vision 模型（Secret: LLM_API_KEY）。有 Key 时调模型得 JSON，
+#      scripts/ai_image.py --route 按 confidence 路由：
+#        >= 0.8 直接写 data/workouts/<年>.csv + 原图归档 images/YYYY/MM/；
+#        < 0.8  进 review/needs-review-*.json，PWA 标黄人工确认，build_db 会忽略 review。
+#      无 Key（fork/本地跑）时图片留在 inbox 不动，并在 Summary 里提示。
+#   3. 消费完的文件移走（归档），inbox 只留未处理项；data/ 变化触发 build_db 重编。
+# 真相源 = git 里的 CSV + tracks + images；data.db 是构建产物（也进仓，方便直接下载查）。
+#
+# == 与 pages.yml 的分工 ==
+# pages.yml：只动 frontend/ 时的快速预览发布（无数据步骤）。
+# 本文件：inbox/data/scripts 变化 + 每天 cron 全量跑（消费→建库→发布），是数据正路。
+# 两者发布目标同为 GitHub Pages，靠 `concurrency: group: pages` 串行，不会互踩。
+name: sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # 仓库根 = sport-db 时的路径…
+      - 'frontend/**'
+      - 'data/**'
+      - 'scripts/**'
+      - 'inbox/**'
+      - 'review/**'
+      - '.github/workflows/sync.yml'
+      # …以及 sport-db 作为子目录被 checkout 时的路径（双写，命中任一即跑）
+      - 'sport-db/frontend/**'
+      - 'sport-db/data/**'
+      - 'sport-db/scripts/**'
+      - 'sport-db/inbox/**'
+      - 'sport-db/review/**'
+      - 'sport-db/.github/workflows/sync.yml'
+  schedule:
+    # 每天 06:30 北京时间跑一次：即使无 push，也生成日报占位检查 + 保证 Pages 数据新鲜
+    - cron: '30 22 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '手动触发原因（如：补跑某日 inbox）'
+        required: false
+        default: 'manual'
+
+permissions:
+  contents: write # 需要回写 data.db / 归档 tracks / 清空 inbox
+  pages: write
+  id-token: write
+
+# 数据作业不抢跑：同一时刻只跑一个 sync（push 撞上 cron 时排队，不取消进行中的）
+concurrency:
+  group: sportdb-sync
+  cancel-in-progress: false
+
+jobs:
+  ingest-and-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 兼容两种 checkout 布局：仓库根是 sport-db，或 sport-db 是子目录
+      - name: 探测仓库布局
+        id: layout
+        run: |
+          if [ -d "sport-db/frontend" ]; then PREFIX="sport-db"; else PREFIX="."; fi
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "repo prefix=$PREFIX"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ---------- 1. inbox 消费：轨迹文件 ----------
+      - name: 消费 inbox 轨迹 (gpx/tcx/kml)
+        env:
+          PREFIX: ${{ steps.layout.outputs.prefix }}
+        run: |
+          INBOX="$PREFIX/inbox/uploads"
+          mkdir -p "$INBOX" "$PREFIX/quarantine" "$PREFIX/data/workouts"
+          shopt -s nullglob
+          files=("$INBOX"/*.gpx "$INBOX"/*.GPX "$INBOX"/*.tcx "$INBOX"/*.TCX "$INBOX"/*.kml "$INBOX"/*.KML)
+          if [ ${#files[@]} -eq 0 ]; then echo "inbox 无轨迹文件，跳过"; exit 0; fi
+          echo "待消费轨迹：${#files[@]} 个"
+          for f in "${files[@]}"; do
+            base="$(basename "$f")"; ext="${base##*.}"; ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+            # 解析行先过一遍自检（parse 失败 → quarantine，不阻塞其它文件）
+            if ! python3 "$PREFIX/scripts/parse_track.py" "$f" > /tmp/parse_out.txt 2>&1; then
+              echo "PARSE FAIL: $base，移入 quarantine"; cat /tmp/parse_out.txt
+              mv "$f" "$PREFIX/quarantine/$base"; continue
+            fi
+            cat /tmp/parse_out.txt
+            # 从文件名/解析输出取年份（取不到则按当年），追加并去重进 data/workouts/<年>.csv
+            year="$(grep -oE '20[0-9]{2}' <<< "$base" | head -1)"
+            [ -z "$year" ] && year="$(date +%Y)"
+            python3 "$PREFIX/scripts/parse_track.py" "$f" --out "$PREFIX/data/workouts/$year.csv"
+            # 原文件归档 tracks/<fmt>/YYYY/MM/（月份取解析出的 start_beijing，取不到用当前月）
+            month="$(grep -oE '20[0-9]{2}-[0-9]{2}' /tmp/parse_out.txt | head -1 | cut -d- -f2)"
+            [ -z "$month" ] && month="$(date +%m)"
+            dest="$PREFIX/tracks/$ext/$year/$month"
+            mkdir -p "$dest"
+            mv "$f" "$dest/$base"
+            echo "归档 -> $dest/$base"
+          done
+
+      # ---------- 2. inbox 消费：图片截图（需 LLM_API_KEY，无则保留） ----------
+      - name: 消费 inbox 图片 (vision → workouts)
+        env:
+          PREFIX: ${{ steps.layout.outputs.prefix }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          INBOX="$PREFIX/inbox/uploads"
+          shopt -s nullglob
+          imgs=("$INBOX"/*.jpg "$INBOX"/*.jpeg "$INBOX"/*.png "$INBOX"/*.webp "$INBOX"/*.JPG "$INBOX"/*.PNG "$INBOX"/*.WEBP)
+          if [ ${#imgs[@]} -eq 0 ]; then echo "inbox 无图片，跳过"; exit 0; fi
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::warning::LLM_API_KEY 未配置，${#imgs[@]} 张图片保留在 inbox，待配置后自动消费"
+            exit 0
+          fi
+          for f in "${imgs[@]}"; do
+            base="$(basename "$f")"; stem="${base%.*}"
+            # Vision 调用由仓库自备脚本/模型网关完成，结果 JSON 落盘后统一走 --route
+            # （Prompt 与字段契约见 scripts/ai_image.py VISION_PROMPT，confidence<0.8 进 review）
+            echo "TODO-vision: $base → 调模型得 /tmp/vision-$stem.json（网关示例见仓库 docs）"
+            echo "::warning::$base 暂留 inbox：Vision 网关接入后由 ai_image.py --route 自动路由"
+          done
+
+      # ---------- 3. build data.db ----------
+      - name: 合成 data.db (build_db)
+        env:
+          PREFIX: ${{ steps.layout.outputs.prefix }}
+        run: |
+          python3 "$PREFIX/scripts/build_db.py" --data "$PREFIX/data" --out "$PREFIX/data.db"
+          ls -lh "$PREFIX/data.db"
+          # 单文件红线：data.db 必须 < 100MB（首年约几 MB，超了说明有大文件误入）
+          size=$(stat -c%s "$PREFIX/data.db")
+          if [ "$size" -gt 104857600 ]; then echo "::error::data.db 超 100MB ($size bytes)"; exit 1; fi
+
+      # ---------- 4. 回写：data.db + 归档 + 清空的 inbox ----------
+      - name: 回写数据变化
+        env:
+          PREFIX: ${{ steps.layout.outputs.prefix }}
+        run: |
+          git config user.name "sportdb-bot"
+          git config user.email "sportdb-bot@users.noreply.github.com"
+          git add "$PREFIX/data.db" "$PREFIX/data" "$PREFIX/tracks" "$PREFIX/images" "$PREFIX/review" 2>/dev/null || true
+          # inbox 里被消费（已移走）的文件也要提交删除态
+          git add -u "$PREFIX/inbox" 2>/dev/null || true
+          if git diff --cached --quiet; then echo "无数据变化，无需回写"; exit 0; fi
+          git commit -m "sync: inbox消费 + data.db 重编 ($(date -u +%F))"
+          git push
+
+      # ---------- 5. 给 Pages 准备前端产物（含离线数据） ----------
+      - name: 组装 Pages 产物
+        env:
+          PREFIX: ${{ steps.layout.outputs.prefix }}
+        run: |
+          # data.db 拷贝进前端产物：满足 app.js 首选候选 ../data.db（本地布局）与 ./data.db（Pages 布局）
+          mkdir -p "$PREFIX/frontend/data/workouts"
+          cp "$PREFIX/data.db" "$PREFIX/frontend/data.db"
+          cp "$PREFIX/data/workouts/"*.csv "$PREFIX/frontend/data/workouts/" 2>/dev/null || echo "workouts CSV 尚无，跳过"
+          ls -lh "$PREFIX/frontend/data.db"
+          echo "pages-include=data.db + data/workouts/*.csv（CSV 供 httpvfs 失败时降级）"
+          # 运行期不需要的目录不进 Pages（省配额）：raw 大分区/tracks 原轨迹/inbox 暂存一律排除
+          rm -rf "$PREFIX/frontend/data/raw" "$PREFIX/frontend/tracks" 2>/dev/null || true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.layout.outputs.prefix }}/frontend
+
+  deploy-pages:
+    needs: ingest-and-build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages # 与 pages.yml 同组串行
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
