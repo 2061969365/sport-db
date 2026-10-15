@@ -1,6 +1,8 @@
 // SportDbAgent：Think harness 上的运动教练 + 账本管理员。
 // 记忆进 DO state/Session；运动数据仍在 GitHub（tools 经 Contents API）。
 import { Think } from "@cloudflare/think";
+import type { ThinkSession } from "@cloudflare/think";
+import { createCompactFunction } from "agents/sessions";
 import { callable } from "agents";
 import { tool } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
@@ -15,6 +17,25 @@ import {
 
 const COACH_SYS =
   "你是 sport-db 运动库的教练助手。详细指令见 rules 上下文块。";
+
+/** 压缩用摘要：同网关同模型直调，4000 token 上限（推理预留，见实测）。 */
+async function summarizeText(env: Env, prompt: string): Promise<string> {
+  const r = await fetch(env.VISION_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
+    body: JSON.stringify({
+      model: env.VISION_MODEL || "muse-spark-1.3-contributor-free",
+      reasoning_effort: "xhigh",
+      max_tokens: 4000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!r.ok) throw new Error(`摘要模型接口 ${r.status}`);
+  const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
+  const text = (j.choices?.[0]?.message?.content || "").trim();
+  if (!text) throw new Error("摘要返回为空");
+  return text;
+}
 
 const RULES_BLOCK =
   "你是一名私人教练，也是这个运动库的管理员。用户会告诉你他当前的健身水平、目标和生活习惯"
@@ -86,8 +107,20 @@ export class SportDbAgent extends Think<Env> {
     return "ok";
   }
 
-  configureContext() {
-    // 不传 provider → 自动落 durable per-agent SQLite，且经 set_context 可写。
+  configureSession(session: ThinkSession) {
+    // 上下文满了走压缩，不直接报错：12 万 token（400k 窗口的 30%）触发，
+    // 中间压成摘要，最近 ~2 万 token 原文保留；失败打日志跳过，不挡对话。
+    session.onCompaction(createCompactFunction({
+      summarize: (prompt) => summarizeText(this.env, prompt),
+    }));
+    session.onCompactionError((e) => {
+      console.error("[compaction-fail]", e instanceof Error ? e.message : String(e));
+    });
+    session.compactAfter(120_000);
+    return session;
+  }
+
+  configureContext() {    // 不传 provider → 自动落 durable per-agent SQLite，且经 set_context 可写。
     // user_profile：认得“人”（目标/伤病/偏好）；coaching_notes：记得“事”（弱项/执行/下次提醒）。
     // rules：只读 block（inline provider），装 persona + 数据/改库铁律 + 工具边界——
     // 注意：配了 block 后 getSystemPrompt 会被框架忽略，所以铁律必须放在这里。
