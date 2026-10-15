@@ -188,6 +188,27 @@ export async function ghGetFile(env: Env, path: string): Promise<{ text: string;
   return t ? { text: t, sha: "" } : null;
 }
 
+/** 二进制直传（如 TG 原图）：base64 + PUT，返回短 sha。 */
+export async function putBinaryFile(env: Env, path: string, bytes: ArrayBuffer, message: string): Promise<string> {
+  if (!env.GH_PAT) throw new Error("未配 GH_PAT，写库不可用");
+  const u8 = new Uint8Array(bytes);
+  let bin = "";
+  for (let i = 0; i < u8.length; i += 8192) {
+    bin += String.fromCharCode.apply(null, Array.from(u8.subarray(i, i + 8192)));
+  }
+  const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/${path}`, {
+    method: "PUT",
+    headers: ghHeaders(env),
+    body: JSON.stringify({ message, content: btoa(bin), branch: "main" }),
+  });
+  if (r.status === 401 || r.status === 403) {
+    throw new Error(`GitHub写 ${path} 鉴权失败 ${r.status}（PAT 过期或权限不足）`);
+  }
+  if (!r.ok) throw new Error(`GitHub写 ${path} 失败 ${r.status}`);
+  const j = (await r.json()) as { content?: { sha?: string } };
+  return j.content?.sha?.slice(0, 7) ?? "";
+}
+
 /** 写文件：需 sha（新建传空）。sha 过期抛 Conflict 错误。 */
 export async function ghPutFile(env: Env, path: string, text: string, sha: string, message: string): Promise<string> {
   if (!env.GH_PAT) throw new Error("未配 GH_PAT，写库不可用");

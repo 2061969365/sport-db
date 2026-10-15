@@ -3,7 +3,7 @@
 // （?v=sha 破缓存）→ confidence 路由：≥0.8 追加 workouts 当年 CSV；
 // 低的进 review。附言由调用方再跑一轮 agent 一并回答。
 import type { Env } from "./env";
-import { WORKOUT_COLS, WORKOUT_TYPES, ghGetFile, ghPutFile, parseCSV } from "./github";
+import { WORKOUT_TYPES, appendRow, ghPutFile, putBinaryFile } from "./github";
 
 export const REVIEW_THRESHOLD = 0.8;
 const MAX_BYTES = 12 * 1024 * 1024;
@@ -75,15 +75,6 @@ export async function downloadTgFile(env: Env, fileId: string): Promise<{ bytes:
   const ext = (path.split(".").pop() || "jpg").toLowerCase();
   const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
   return { bytes: buf, mime };
-}
-
-function b64Bytes(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 8192) {
-    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 8192)));
-  }
-  return btoa(bin);
 }
 
 /** 调 vision（https 图片地址），返回解析 JSON。 */
@@ -198,17 +189,7 @@ export async function ingestPhoto(
   const day = bjNow().toISOString().slice(0, 10);
   const [y, m, d] = day.split("-");
   const imgPath = `images/${y}/${m}/${d}-tg${mid}.jpg`;
-  const put = await fetch(`https://api.github.com/repos/${env.REPO}/contents/${imgPath}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "sport-db-agent/2.0",
-      Authorization: `Bearer ${env.GH_PAT}`,
-    },
-    body: JSON.stringify({ message: `bot: TG收图 ${imgPath}`, content: b64Bytes(bytes), branch: "main" }),
-  });
-  if (!put.ok) throw new Error(`原图入库失败 ${put.status}`);
-  const sha = ((await put.json()) as { content?: { sha?: string } }).content?.sha?.slice(0, 7) ?? "";
+  const sha = await putBinaryFile(env, imgPath, bytes, `bot: TG收图 ${imgPath}`);
   const imgUrl = `https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}?v=${sha}`;
   let rec: VisionRec;
   try {
@@ -228,41 +209,14 @@ export async function ingestPhoto(
   }
   if (rec.confidence >= REVIEW_THRESHOLD) {
     const row = toWorkoutRow(rec, imgPath);
-    const csvPath = `data/workouts/${row.date.slice(0, 4)}.csv`;
-    const cur = await ghGetFile(env, csvPath).catch(() => null);
-    let header = WORKOUT_COLS;
-    let rows: Record<string, string>[] = [];
-    let curSha = "";
-    if (cur?.text) {
-      rows = parseCSV(cur.text);
-      if (rows.length) header = Object.keys(rows[0]);
-      curSha = cur.sha || "";
-    }
-    rows.push(Object.fromEntries(header.map((h) => [h, row[h] ?? ""])));
-    const esc = (v: string) => (/[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
-    const eol = cur?.text?.includes("\r\n") ? "\r\n" : "\n";
-    const next = header.map(esc).join(",") + eol
-      + rows.map((r) => header.map((h) => esc(r[h] ?? "")).join(",")).join(eol) + eol;
-    await ghPutFile(env, csvPath, next, curSha,
-      `bot: TG图片入库 ${row.date} ${row.type} via tg:${mid}`);
+    await appendRow(env, row, `tg:${mid}`);
     const line = `已入库：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s（confidence ${rec.confidence.toFixed(2)}）`;
     return { rec, line };
   }
   const ts = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);
   const rp = `review/needs-review-tg${mid}-${ts}.json`;
-  await fetch(`https://api.github.com/repos/${env.REPO}/contents/${rp}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "sport-db-agent/2.0",
-      Authorization: `Bearer ${env.GH_PAT}`,
-    },
-    body: JSON.stringify({
-      message: `bot: TG收图待审 ${rp}`,
-      content: btoa(unescape(encodeURIComponent(JSON.stringify(rec, null, 1)))),
-      branch: "main",
-    }),
-  });
+  await ghPutFile(env, rp, JSON.stringify(rec, null, 1), "",
+    `bot: TG收图待审 ${rp}`);
   let line = `这张没看清（confidence ${rec.confidence.toFixed(2)}<0.8），已进 review 等你确认，先别删原图。`;
   if (!isOrig) {
     line += "另外你是直接拍照发的：TG 会把长截图压到最长边1280，字糊了才看不清。重发时点回形针选“文件”方式发原图。";
