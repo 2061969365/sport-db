@@ -57,10 +57,13 @@ interface TgMsg {
 /** 挑图：照片取最大尺寸；文件形式限 image/*。返回 null 表示没图。 */
 export function pickImage(msg: TgMsg): { fileId: string; isOrig: boolean } | null {
   const photos = msg.photo ?? [];
-  if (photos.length) return { fileId: photos[photos.length - 1]?.file_id ?? "", isOrig: false };
+  if (photos.length) {
+    const id = photos[photos.length - 1]?.file_id ?? "";
+    return id ? { fileId: id, isOrig: false } : null;
+  }
   const doc = msg.document;
-  if (doc && (doc.mime_type || "").startsWith("image/")) {
-    return { fileId: doc.file_id ?? "", isOrig: true };
+  if (doc && (doc.mime_type || "").startsWith("image/") && doc.file_id) {
+    return { fileId: doc.file_id, isOrig: true };
   }
   return null;
 }
