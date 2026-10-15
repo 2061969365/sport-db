@@ -3,7 +3,8 @@
 // （?v=sha 破缓存）→ confidence 路由：≥0.8 追加 workouts 当年 CSV；
 // 低的进 review。附言由调用方再跑一轮 agent 一并回答。
 import type { Env } from "./env";
-import { WORKOUT_TYPES, appendRow, ghPutFile, putBinaryFile } from "./github";
+import { WORKOUT_TYPES, appendRow, ghPutFile, putBinaryFile, toWorkoutRow } from "./github";
+import type { VisionRec } from "./github";
 
 export const REVIEW_THRESHOLD = 0.8;
 const MAX_BYTES = 12 * 1024 * 1024;
@@ -20,20 +21,6 @@ const VISION_PROMPT =
   + "配速 5分32秒换算成 332；看不清的字段填 null 并降低 confidence。\n"
   + "截图上显示的时间一般是结束时间：start_time = 结束时间 - duration_s，"
   + "按 “%Y-%m-%d %H:%M:%S +08:00”格式回；无时间显示则填 null。";
-
-export interface VisionRec {
-  type: string;
-  distance_km: number | null;
-  duration_s: number | null;
-  avg_pace_s_per_km: number | null;
-  avg_hr: number | null;
-  calories: number | null;
-  steps: number | null;
-  cadence: number | null;
-  start_time: string | null;
-  confidence: number;
-  [k: string]: unknown;
-}
 
 interface TgMsg {
   photo?: { file_id?: string }[];
@@ -127,55 +114,7 @@ export function parseVisionJson(raw: string): VisionRec {
   return rec;
 }
 
-function parseStart(s: unknown): Date {
-  try {
-    if (typeof s === "string" && s) {
-      // "2026-10-14 17:39:05 +08:00" → ISO
-      const iso = s.replace(" ", "T").replace(" +08:00", "+08:00");
-      const d = new Date(iso);
-      if (!Number.isNaN(d.getTime())) return d;
-    }
-  } catch { /* fallback now */ }
-  return new Date();
-}
-
-/** Vision JSON → workouts 行（与 import_mi / parse_track 同列）。 */
-export function toWorkoutRow(rec: VisionRec, imagePath: string): Record<string, string> {
-  const start = parseStart(rec.start_time);
-  const dur = Math.trunc(Number(rec.duration_s) || 0);
-  const end = new Date(start.getTime() + dur * 1000);
-  const dist: string = (() => {
-    try {
-      return rec.distance_km == null ? "" : String(Math.round(Number(rec.distance_km) * 1000));
-    } catch {
-      return "";
-    }
-  })();
-  const wtype = rec.type || "free_training";
-  const bj = (d: Date) => new Date(d.getTime() + 8 * 36e5).toISOString().replace("T", " ").slice(0, 19) + " +08:00";
-  return {
-    id: `image-${Math.floor(start.getTime() / 1000)}-${wtype}-${dist || 0}`,
-    date: bj(start).slice(0, 10),
-    start_utc: String(Math.floor(start.getTime() / 1000)),
-    start_beijing: bj(start),
-    end_utc: String(Math.floor(end.getTime() / 1000)),
-    end_beijing: bj(end),
-    type: wtype, category: wtype,
-    distance_m: dist, duration_s: String(dur),
-    avg_pace_s: rec.avg_pace_s_per_km != null ? String(rec.avg_pace_s_per_km) : "",
-    max_pace_s: "", avg_speed: "", max_speed: "",
-    avg_hr: rec.avg_hr != null ? String(rec.avg_hr) : "",
-    max_hr: "", min_hr: "",
-    calories: rec.calories != null ? String(rec.calories) : "",
-    steps: rec.steps != null ? String(rec.steps) : "",
-    cadence: rec.cadence != null ? String(rec.cadence) : "",
-    avg_stride: "", total_climbing: "",
-    uid_hash: "", sid_hash: "",
-    has_track: "0", source: "image",
-    confidence: String(rec.confidence ?? 0),
-    value_json: JSON.stringify({ vision: rec, image: imagePath }),
-  };
-}
+/** parseStart/toWorkoutRow 已收归 github.ts（confirm_review 共用），此处不再重复实现。 */
 
 /**
  * 收图主流程（调用方在 server.ts 里接 history/附言）。

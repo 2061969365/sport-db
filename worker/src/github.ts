@@ -341,6 +341,139 @@ export function toolGetSummary(all: Row[], daysRaw: unknown): string {
   return lines.join("\n");
 }
 
+/** Vision 识别结果（截图/AI 统一形状）。 */
+export interface VisionRec {
+  type: string;
+  distance_km: number | null;
+  duration_s: number | null;
+  avg_pace_s_per_km: number | null;
+  avg_hr: number | null;
+  calories: number | null;
+  steps: number | null;
+  cadence: number | null;
+  start_time: string | null;
+  confidence: number;
+  [k: string]: unknown;
+}
+
+function parseStart(s: unknown): Date {
+  try {
+    if (typeof s === "string" && s) {
+      const iso = s.replace(" ", "T").replace(" +08:00", "+08:00");
+      const d = new Date(iso);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+  } catch { /* fallback now */ }
+  return new Date();
+}
+
+/** Vision JSON → workouts 行（与 import_mi / parse_track 同列）。 */
+export function toWorkoutRow(rec: VisionRec, imagePath: string): Record<string, string> {
+  const start = parseStart(rec.start_time);
+  const dur = Math.trunc(Number(rec.duration_s) || 0);
+  const end = new Date(start.getTime() + dur * 1000);
+  let dist = "";
+  try {
+    dist = rec.distance_km == null ? "" : String(Math.round(Number(rec.distance_km) * 1000));
+  } catch { /* 留空 */ }
+  const wtype = rec.type || "free_training";
+  const bj = (d: Date) => new Date(d.getTime() + 8 * 36e5).toISOString().replace("T", " ").slice(0, 19) + " +08:00";
+  return {
+    id: `image-${Math.floor(start.getTime() / 1000)}-${wtype}-${dist || 0}`,
+    date: bj(start).slice(0, 10),
+    start_utc: String(Math.floor(start.getTime() / 1000)),
+    start_beijing: bj(start),
+    end_utc: String(Math.floor(end.getTime() / 1000)),
+    end_beijing: bj(end),
+    type: wtype, category: wtype,
+    distance_m: dist, duration_s: String(dur),
+    avg_pace_s: rec.avg_pace_s_per_km != null ? String(rec.avg_pace_s_per_km) : "",
+    max_pace_s: "", avg_speed: "", max_speed: "",
+    avg_hr: rec.avg_hr != null ? String(rec.avg_hr) : "",
+    max_hr: "", min_hr: "",
+    calories: rec.calories != null ? String(rec.calories) : "",
+    steps: rec.steps != null ? String(rec.steps) : "",
+    cadence: rec.cadence != null ? String(rec.cadence) : "",
+    avg_stride: "", total_climbing: "",
+    uid_hash: "", sid_hash: "",
+    has_track: "0", source: "image",
+    confidence: String(rec.confidence ?? 0),
+    value_json: JSON.stringify({ vision: rec, image: imagePath }),
+  };
+}
+
+/** 删文件（review 确认入库后清理用）。 */
+export async function ghDeleteFile(env: Env, path: string, sha: string, message: string): Promise<void> {
+  if (!env.GH_PAT) throw new Error("未配 GH_PAT，写库不可用");
+  const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/${path}`, {
+    method: "DELETE",
+    headers: ghHeaders(env),
+    body: JSON.stringify({ message, sha, branch: "main" }),
+  });
+  if (!r.ok) throw new Error(`GitHub删 ${path} 失败 ${r.status}`);
+}
+
+/** list_review：列待确认截图（路径+识别摘要），供模型或用户挑选确认。 */
+export async function toolListReview(env: Env): Promise<string> {
+  if (!env.GH_PAT) return "读 review 需要 GH_PAT（公开仓可直接看网页，这里读不了）。";
+  const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/review?ref=main`, {
+    headers: ghHeaders(env),
+  }).catch(() => null);
+  if (!r) return "失败：读 review 目录异常，稍后再试。";
+  if (r.status === 404) return "review 为空，没有待确认项。";
+  if (!r.ok) return `失败：读 review 目录 ${r.status}。`;
+  const list = (await r.json()) as { name?: string; path?: string }[];
+  const files = (Array.isArray(list) ? list : [])
+    .filter((e) => (e.name || "").endsWith(".json"))
+    .slice(0, 20);
+  if (!files.length) return "review 为空，没有待确认项。";
+  const out = [];
+  for (const f of files) {
+    const g = await ghGetFile(env, f.path || "").catch(() => null);
+    let summary = "解析失败";
+    try {
+      const rec = JSON.parse(g?.text || "{}") as Partial<VisionRec> & { image?: string; error?: string };
+      summary = rec.error
+        ? `识别失败：${rec.error}（图 ${rec.image || "?"}）`
+        : `${rec.type} ${rec.distance_km}km/${rec.duration_s}s（confidence ${rec.confidence}，图 ${rec.image || (rec as { vision?: { image?: string } }).vision?.image || "?"}`;
+    } catch { /* 保持解析失败 */ }
+    out.push({ path: f.path, summary });
+  }
+  return JSON.stringify({ total: out.length, items: out });
+}
+
+/** confirm_review：把某条 review 确认入库（写行+删 review 文件），两阶段同样要 confirmed。 */
+export async function toolConfirmReview(
+  env: Env, path: string, confirmed: boolean, actor: string, sql?: SqlTag,
+): Promise<string> {
+  if (!env.GH_PAT) return "失败：写库未授权（Worker 缺 GH_PAT）。";
+  if (!path.startsWith("review/") || !path.endsWith(".json")) {
+    return "失败：path 必须是 review/ 下的 json（先调 list_review 拿路径）。";
+  }
+  const cur = await ghGetFile(env, path).catch(() => null);
+  if (!cur?.text) return `失败：${path} 不存在或已处理，请重查 list_review。`;
+  let rec: VisionRec;
+  try {
+    rec = JSON.parse(cur.text) as VisionRec;
+  } catch {
+    return `失败：${path} 不是合法 JSON，请人工处理。`;
+  }
+  if ((rec as { error?: string }).error || rec.distance_km == null) {
+    return `这条无法自动入库（${(rec as { error?: string }).error || "缺关键数字"}），请人工看图补录，或删掉它。`;
+  }
+  const image = (rec as { image?: string }).image
+    || (rec as { vision?: { image?: string } }).vision?.image || "";
+  const row = toWorkoutRow(rec, image);
+  if (!confirmed) {
+    return `预览（尚未写入）：${row.date} ${row.type} ${row.distance_m ? Number(row.distance_m) / 1000 + "km" : ""}`
+      + `/${row.duration_s}s（confidence ${rec.confidence}），原图 ${image}。`
+      + "用户明确说“确认”后，再用相同 path 带 confirmed=true 调一次；写入后自动删除这条 review。";
+  }
+  await appendRow(env, row, actor, sql);
+  await ghDeleteFile(env, path, cur.sha, `bot: review确认入库 ${row.date} ${row.type} via ${actor}`);
+  return `已入库：${row.date} ${row.type}（id=${row.id}），review 文件已删。`;
+}
+
 /** query_workouts 工具：改数前必须先查到 id。 */
 export function toolQueryWorkouts(
   all: Row[],
