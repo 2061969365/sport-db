@@ -30,8 +30,8 @@ function turnText(result: unknown): string {
 }
 
 async function askAgent(env: Env, instance: string, input: string): Promise<string> {
-  // 经类型化 RPC stub 调 Think 的 runTurn(wait)；idempotencyKey 只有 submit 模式支持，
-  // TG 重推的幂等靠“改数必先查 id + 同值复写无害”兜底（已知可接受）。
+  // runTurn(wait) 同步等答复；重推幂等靠入口的 claimUpdate（update_id 去重），
+  // 这里不再假设“同值复写无害”。
   const agent = (await getAgentByName(env.SportDbAgent, instance)) as unknown as SportDbAgent;
   const result = await agent.runTurn({ input, mode: "wait" });
   const text = turnText(result).trim();
@@ -89,6 +89,15 @@ export default {
       const text = (msg.text || "").trim();
       const chatId = msg.chat?.id;
       if (!chatId) return new Response("no chat", { status: 200 });
+      // 重推去重：同 update_id 只处理一次（claimUpdate 原子认领）。
+      try {
+        const agent0 = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
+        if (!(await agent0.claimUpdate(`tg-${update.update_id ?? `${chatId}-${msg.message_id ?? Date.now()}`}`))) {
+          return new Response("ok-duplicate", { status: 200 });
+        }
+      } catch {
+        /* 认领失败不挡路，继续处理 */
+      }
       if (text === "/new" || text === "重新开始" || text === "新对话") {
         try {
           const agent = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
@@ -154,6 +163,10 @@ export default {
         const chatId = ev?.message?.chat_id;
         if (chatId && text && !text.startsWith("[")) {
           try {
+            const agent0 = (await getAgentByName(env.SportDbAgent, `fs-${chatId}`)) as unknown as SportDbAgent;
+            const msgId = (ev?.message as { message_id?: string })?.message_id ?? `${Date.now()}`;
+            const first = await agent0.claimUpdate(`fs-${chatId}-${msgId}`).catch(() => true);
+            if (!first) return new Response("ok-duplicate", { status: 200 });
             const reply = await askAgent(env, `fs-${chatId}`, text);
             const token = await feishuToken(env);
             await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {

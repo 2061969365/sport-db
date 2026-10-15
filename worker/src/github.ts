@@ -10,6 +10,53 @@ export const EDITABLE_FIELDS = [
 
 export type Row = Record<string, string> & { _year: string };
 
+/** DO SQLite 标签函数最小形态（Think 的 this.sql 直接传进来，bind 好）。 */
+export type SqlTag = (
+  strings: TemplateStringsArray | string,
+  ...values: unknown[]
+) => Array<Record<string, unknown>>;
+
+const CACHE_TTL_MS = 300_000;
+
+function ensureCache(sql?: SqlTag): void {
+  if (!sql) return;
+  sql`CREATE TABLE IF NOT EXISTS csv_cache (path TEXT PRIMARY KEY, text TEXT, sha TEXT, updated_at INTEGER)`;
+}
+
+/** 读年文件：缓存命中（300s）直接用，否则 Contents API 拉取并回填。
+ *  注意：写路径（update）必须用 ghGetFile 拿新鲜 sha，不能吃缓存。 */
+async function cachedGetFile(
+  env: Env, sql: SqlTag | undefined, path: string,
+): Promise<{ text: string; sha: string } | null> {
+  if (sql) {
+    try {
+      ensureCache(sql);
+      const hit = sql`SELECT text, sha, updated_at FROM csv_cache WHERE path = ${path}` as
+        { text: string; sha: string; updated_at: number }[];
+      if (hit.length && Date.now() - hit[0].updated_at < CACHE_TTL_MS) {
+        // 空文本 = 之前确认过不存在（否定缓存，CSV 不可能真空）。
+        if (!hit[0].text) return null;
+        return { text: hit[0].text, sha: hit[0].sha || "" };
+      }
+    } catch { /* 缓存坏了就当 miss */ }
+  }
+  const g = await ghGetFile(env, path).catch(() => null);
+  if (sql) {
+    try {
+      ensureCache(sql);
+      sql`INSERT OR REPLACE INTO csv_cache(path, text, sha, updated_at) VALUES (${path}, ${g?.text ?? ""}, ${g?.sha ?? ""}, ${Date.now()})`;
+    } catch { /* 缓存写失败不影响主流程 */ }
+  }
+  return g;
+}
+
+function invalidateCache(sql: SqlTag | undefined, path: string): void {
+  if (!sql) return;
+  try {
+    sql`DELETE FROM csv_cache WHERE path = ${path}`;
+  } catch { /* 忽略 */ }
+}
+
 export function num(v: unknown): number {
   const n = parseFloat(String(v ?? ""));
   return Number.isFinite(n) ? n : 0;
@@ -116,13 +163,14 @@ export async function ghPutFile(env: Env, path: string, text: string, sha: strin
 
 /** 工具语料：读全 data/workouts/*.csv。
  * 直接并行拉近 6 年文件（不存在的 404 跳过），不依赖目录列举接口——
- * 未鉴权时列举易被限流，曾导致回退只读两年（rows=454 的教训）。 */
-export async function loadWorkouts(env: Env): Promise<Row[]> {
+ * 未鉴权时列举易被限流，曾导致回退只读两年（rows=454 的教训）。
+ * 有 sql 时走 DO 缓存（300s TTL），同 turn 多工具只拉一次。 */
+export async function loadWorkouts(env: Env, sql?: SqlTag): Promise<Row[]> {
   const y = new Date().getUTCFullYear();
   const years = [y - 5, y - 4, y - 3, y - 2, y - 1, y];
   const got = await Promise.all(
     years.map(async (year) => {
-      const g = await ghGetFile(env, `data/workouts/${year}.csv`).catch(() => null);
+      const g = await cachedGetFile(env, sql, `data/workouts/${year}.csv`).catch(() => null);
       return { year, text: g?.text ?? "" };
     }),
   );
@@ -256,10 +304,12 @@ function stringifyCSV(head: string[], rows: Record<string, string>[], eol: strin
     + rows.map((r) => head.map((h) => esc(r[h])).join(",")).join(eol) + eol;
 }
 
-/** update_workout 工具：按 id 改行，白名单字段，sha 冲突重试一次，单行 diff。 */
+/** update_workout 工具（两阶段）：缺 confirmed 时只出预览不写库；
+ * confirmed=true 时新鲜读→校验旧值→写→清缓存。sha 冲突自重试一次。 */
 export async function toolUpdateWorkout(
   env: Env, all: Row[], actor: string,
-  args: { id?: string; fields?: Record<string, unknown> },
+  args: { id?: string; fields?: Record<string, unknown>; confirmed?: boolean },
+  sql?: SqlTag,
 ): Promise<string> {
   if (!env.GH_PAT) {
     return "失败：写库未授权（Worker 缺 GH_PAT，当前只读模式）。"
@@ -276,16 +326,31 @@ export async function toolUpdateWorkout(
   if (bad.length) return `失败：不允许改 ${bad.join(",")}，只能改 ${EDITABLE_FIELDS.join(",")}。`;
   const hit = all.find((r) => r.id === wid);
   if (!hit) return `失败：找不到 id=${wid}，先调 query_workouts 确认。`;
+  const preview = Object.keys(fields)
+    .map((k) => `${k} ${(hit[k] ?? "")}->${fields[k] == null ? "" : String(fields[k])}`)
+    .join("；");
+  if (!args.confirmed) {
+    return `预览（尚未写入）：${wid}（${hit.date} ${hit.type}）：${preview}。`
+      + "请把这条预览念给用户，得到用户明确说“确认”后，再用完全相同的 id+fields 调一次并带 confirmed=true。";
+  }
   const path = `data/workouts/${hit._year}.csv`;
   for (let attempt = 0; attempt < 2; attempt++) {
     const cur = await ghGetFile(env, path).catch(() => null);
-    if (!cur?.text) return `失败：读 ${path} 失败，重试一次。`;
+    if (!cur?.text) {
+      if (attempt === 1) return `失败：读 ${path} 连续失败，稍后再试。`;
+      continue;
+    }
     const parsed = parseCSV(cur.text);
     if (!parsed.length) return `失败：${path} 为空或解析失败。`;
     const header = Object.keys(parsed[0]);
     const idx = parsed.findIndex((r) => r.id === wid);
     if (idx < 0) return `失败：${path} 里找不到 id=${wid}（可能刚被改动），请重查。`;
     const row = parsed[idx];
+    const stale = Object.keys(fields).filter((k) => String(row[k] ?? "") !== String(hit[k] ?? ""));
+    if (stale.length) {
+      return `中止：${wid} 的 ${stale.join(",")} 在预览后被人改过（以库为准），`
+        + "请重查最新值、重新出预览再让用户确认。";
+    }
     const old: Record<string, string> = {};
     for (const k of Object.keys(fields)) old[k] = row[k] ?? "";
     for (const [k, v] of Object.entries(fields)) row[k] = v == null ? "" : String(v);
@@ -295,12 +360,13 @@ export async function toolUpdateWorkout(
     try {
       await ghPutFile(env, path, next, cur.sha || "",
         `bot: update ${wid} ${Object.keys(fields).join(",")} via ${actor}`);
+      invalidateCache(sql, path);
       return `已改 ${wid}（${row.date} ${row.type}）：`
         + Object.keys(fields).map((k) => `${k} ${old[k]}->${row[k]}`).join("；");
     } catch (e) {
       const msg = String((e as Error).message || e);
       if (!msg.startsWith("Conflict:") || attempt === 1) {
-        return `失败：写回冲突或接口错误（${msg.slice(0, 120)}），请重说一次。`;
+        return `失败：写回异常（${msg.slice(0, 120)}），我已重试过，请稍后再试。`;
       }
     }
   }
