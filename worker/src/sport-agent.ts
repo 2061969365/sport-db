@@ -108,15 +108,15 @@ export class SportDbAgent extends Think<Env> {
   }
 
   configureSession(session: ThinkSession) {
-    // 上下文满了走压缩，不直接报错：12 万 token（400k 窗口的 30%）触发，
-    // 中间压成摘要，最近 ~2 万 token 原文保留；失败打日志跳过，不挡对话。
+    // 上下文满了走压缩，不直接报错：32 万 token（400k 窗口的 80%）触发，
+    // 太早压没用；中间压成摘要，最近 ~2 万 token 原文保留；失败打日志跳过，不挡对话。
     session.onCompaction(createCompactFunction({
       summarize: (prompt) => summarizeText(this.env, prompt),
     }));
     session.onCompactionError((e) => {
       console.error("[compaction-fail]", e instanceof Error ? e.message : String(e));
     });
-    session.compactAfter(120_000);
+    session.compactAfter(320_000);
     return session;
   }
 
