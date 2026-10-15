@@ -15,8 +15,14 @@ function tgApi(env: Env, method: string, payload: unknown) {
   });
 }
 
+/** 按码点截断（slice 会切散 emoji/代理对），留 3500 给 TG 4096 上限。 */
+function clip(text: string, n = 3500): string {
+  const units = Array.from(text);
+  return units.length <= n ? text : units.slice(0, n).join("");
+}
+
 async function tgSend(env: Env, chatId: number | string, text: string): Promise<void> {
-  await tgApi(env, "sendMessage", { chat_id: chatId, text: text.slice(0, 3500) });
+  await tgApi(env, "sendMessage", { chat_id: chatId, text: clip(text) });
 }
 
 function turnText(result: unknown): string {
@@ -36,9 +42,10 @@ async function askAgent(env: Env, instance: string, input: string): Promise<stri
   const result = await agent.runTurn({ input, mode: "wait" });
   const text = turnText(result).trim();
   if (result.status !== "completed" || !text) {
-    throw new Error(`turn未完成(status=${result.status ?? "?"})`);
+    const err = (result as { error?: string }).error;
+    throw new Error(err ? `turn失败：${String(err).slice(0, 200)}` : `turn未完成(status=${result.status ?? "?"})`);
   }
-  return text.slice(0, 3500);
+  return clip(text);
 }
 
 function feishuText(message: unknown): string {
@@ -174,8 +181,9 @@ export default {
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
               body: JSON.stringify({ receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: reply }) }),
             });
-          } catch {
-            /* 飞书回失败不抛，避免重试风暴 */
+          } catch (e) {
+            console.error(`[feishu-reply-fail chat=${chatId}]`, (e as Error).message);
+            /* 飞书回失败不抛，避免重试风暴（已打日志） */
           }
         }
       }

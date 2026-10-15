@@ -73,7 +73,16 @@ export class SportDbAgent extends Think<Env> {
   async resetConversation(): Promise<string> {
     // 只清聊天记录：user_profile / coaching_notes 长期记忆保留，
     // 下一轮自动用最新 prompt 重建，不用换窗口。
+    // 排队中的提交一并取消，避免旧问题在新会话里继续跑。
     await this.clearMessages();
+    try {
+      const subs = await this.listSubmissions();
+      for (const s of subs) {
+        if (s.status === "pending" || s.status === "running") {
+          await this.cancelSubmission(s.submissionId, "reset").catch(() => null);
+        }
+      }
+    } catch { /* 老版本无提交表也无妨 */ }
     return "ok";
   }
 

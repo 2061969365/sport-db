@@ -1,9 +1,9 @@
 # sport-db Bot桥 Worker（Telegram + 飞书双接入）
 
-无依赖 Cloudflare Worker：`worker.js` + `wrangler.toml`，零 npm 包。
-问答流程：`raw.githubusercontent` 拉当年+去年 `data/workouts/*.csv` 与
-`data/daily/*.csv` → 算近 30 天摘要 → 调 `VISION_ENDPOINT`/`VISION_MODEL`
-（默认 `muse-spark-1.3-contributor-free`，网关免 Key，不限 `max_tokens`）→ 原通道回消息。
+官方 Agents SDK（Think harness）工程：`src/server.ts`（双通道接线）+ `src/sport-agent.ts`
+（Agent：prompt/工具/记忆）+ `src/github.ts`（GitHub 即数据库）+ `src/photo.ts`（收图）。
+问答流程：TG/飞书 webhook → 按会话取 Agent 实例 → runTurn → 工具读写 GitHub CSV → 原通道回消息。
+记忆在 DO SQLite（会话 + user_profile/coaching_notes），运动数据仍在 GitHub CSV。
 
 ## 1. Telegram 建 Bot + 设 webhook
 
