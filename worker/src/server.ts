@@ -89,6 +89,16 @@ export default {
       const text = (msg.text || "").trim();
       const chatId = msg.chat?.id;
       if (!chatId) return new Response("no chat", { status: 200 });
+      if (text === "/new" || text === "重新开始" || text === "新对话") {
+        try {
+          const agent = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
+          await agent.resetConversation();
+          await tgSend(env, chatId, "已清空本窗聊天记录，从头开始吧。画像记忆（目标/伤病/偏好）还留着。");
+        } catch (e) {
+          await tgSend(env, chatId, `重置失败（${(e as Error).message}），直接换个新群/话题聊也一样。`);
+        }
+        return new Response("ok");
+      }
       const mid = msg.message_id ?? Date.now();
       const picked = pickImage(msg);
       if (picked) {

@@ -1,6 +1,7 @@
 // SportDbAgent：Think harness 上的运动教练 + 账本管理员。
 // 记忆进 DO state/Session；运动数据仍在 GitHub（tools 经 Contents API）。
 import { Think } from "@cloudflare/think";
+import { callable } from "agents";
 import { tool } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
@@ -51,6 +52,14 @@ export class SportDbAgent extends Think<Env> {
     // 注：实测当前网关收下该参数但用量无变化（档位实际由网关/模型侧决定），
     // 留在这里等网关生效，不影响现有行为。
     return { providerOptions: { openai: { reasoningEffort: "xhigh" as const } } };
+  }
+
+  @callable()
+  async resetConversation(): Promise<string> {
+    // 只清聊天记录：user_profile / coaching_notes 长期记忆保留，
+    // 下一轮自动用最新 prompt 重建，不用换窗口。
+    await this.clearMessages();
+    return "ok";
   }
 
   configureContext() {
