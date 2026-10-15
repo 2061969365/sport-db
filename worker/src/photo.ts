@@ -218,7 +218,22 @@ export async function ingestPhoto(
   if (!put.ok) throw new Error(`原图入库失败 ${put.status}`);
   const sha = ((await put.json()) as { content?: { sha?: string } }).content?.sha?.slice(0, 7) ?? "";
   const imgUrl = `https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}?v=${sha}`;
-  const rec = await recognizePhoto(env, imgUrl);
+  let rec: VisionRec;
+  try {
+    rec = await recognizePhoto(env, imgUrl);
+  } catch (e) {
+    // vision 挂了也不能让图变孤儿：进 review，人工看图补录
+    const ts0 = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+    const rp0 = `review/needs-review-tg${mid}-${ts0}.json`;
+    await ghPutFile(env, rp0, JSON.stringify({
+      image: imgPath, error: `vision调用失败：${(e as Error).message}`,
+    }, null, 1), "",
+      `bot: TG收图vision失败转人工 ${rp0}`);
+    return {
+      rec: { type: "free_training", distance_km: null, duration_s: null, avg_pace_s_per_km: null, avg_hr: null, calories: null, steps: null, cadence: null, start_time: null, confidence: 0 },
+      line: `识别服务暂时不可用（${(e as Error).message}），原图已存、已进 review，稍后人工补录，先别删原图。`,
+    };
+  }
   if (rec.confidence >= REVIEW_THRESHOLD) {
     const row = toWorkoutRow(rec, imgPath);
     const csvPath = `data/workouts/${row.date.slice(0, 4)}.csv`;
