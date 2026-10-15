@@ -2,12 +2,12 @@
 """CSV partitions -> sport-db/data.db (task-4).
 
 Inputs (produced by scripts/import_mi.py, task-1):
-  data/workouts/YYYY.csv   (806 data rows total)
+  data/workouts/YYYY.csv   (行数随入库增长；校验只要求库内==CSV 且不低于卫生下限)
     header: id,date,start_utc,start_beijing,end_utc,end_beijing,type,category,
             distance_m,duration_s,avg_pace_s,max_pace_s,avg_speed,max_speed,
             avg_hr,max_hr,min_hr,calories,steps,cadence,avg_stride,
             total_climbing,uid_hash,sid_hash,has_track,source,confidence,value_json
-  data/daily/YYYY.csv      (14082 data rows total)
+  data/daily/YYYY.csv      (行数随入库增长；同上)
     header: date,tag,key,time_utc,time_beijing,uid_hash,sid_hash,update_utc,value_json
     tag/key combos: daily_report/{steps,calories,sleep,heart_rate,stress,spo2,
                     intensity,valid_stand} carry the numeric payloads;
@@ -390,17 +390,18 @@ def main(argv=None) -> int:
     print(f"[build_db] size={res['bytes']} bytes ({mb:.2f} MB)")
     print(f"[build_db] sample_workouts={res['sample']}")
     print(f"[build_db] latest_daily={res['latest_daily']}")
-    ok = (c["workouts"] == res["csv_workouts"] == 806
+    # 自洽校验：库内行数 == CSV 行数（不再写死 806/14082，入库增长是正常的）。
+    # 另设卫生下限：workouts 至少 800 行（防 CSV 被清空），daily 源行至少 14000 行。
+    ok = (c["workouts"] == res["csv_workouts"] >= 800
           and res["csv_daily_dates"] == c["daily_metrics"])
-    # daily source rows are fixed by task-1's report: 14082 kept
     n_src = sum(1 for _ in _iter_daily_rows(data_dir))
-    print(f"[build_db] daily_source_rows={n_src} (expect 14082)")
-    ok = ok and (n_src == 14082)
+    print(f"[build_db] daily_source_rows={n_src} (floor 14000)")
+    ok = ok and (n_src >= 14000)
     if not ok:
-        print("[build_db] VERIFY FAILED: row counts differ from 806/14082 contract",
+        print("[build_db] VERIFY FAILED: db/CSV 行数不一致或低于卫生下限",
               file=sys.stderr)
         return 1
-    print("[build_db] VERIFY OK: 806 workouts + 14082 daily source rows, "
+    print(f"[build_db] VERIFY OK: {c['workouts']} workouts + {n_src} daily source rows, "
           "indexes idx_workouts_date/type(+start_time), vacuumed.")
     return 0
 
