@@ -172,9 +172,9 @@ export class SportDbAgent extends Think<Env> {
 
   getTools() {
     const env = this.env;
-    const self = this;
-    const sql = ((s: TemplateStringsArray | string, ...a: unknown[]) =>
-      (self.sql as unknown as SqlTag)(s, ...a));
+    // this.sql 是实例方法，转手必须 bind，否则内部 this.ctx 丢失
+    // （线上曾报 Cannot read properties of undefined (reading 'ctx')）。
+    const sql = (this.sql as unknown as SqlTag).bind(this);
     return {
       get_summary: tool({
         description: "查近N天分项画像（跑步/骑行分开）。任何分项或天数问题都先调它或 query_workouts，不许凭记忆答。",
