@@ -6,4 +6,6 @@ Thumbs.db
 
 
 .wrangler/
+worker/node_modules/
+worker/.dev.vars
 bot_state/tg-*.jpg

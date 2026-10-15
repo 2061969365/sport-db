@@ -1,8 +1,17 @@
 # sport-db Bot桥 Worker 配置
 
 name = "sport-db-bot"
-main = "worker.js"
+main = "src/server.ts"
 compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+class_name = "SportDbAgent"
+name = "SportDbAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SportDbAgent"]
 
 # 无依赖：零 npm 包，`wrangler deploy` 直接发布。
 # 免费计划注意：Workers 每天 10 万次请求内免费，本 Bot 问答量远低于此。
