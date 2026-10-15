@@ -8,8 +8,8 @@ compatibility_date = "2026-10-01"
 # 免费计划注意：Workers 每天 10 万次请求内免费，本 Bot 问答量远低于此。
 
 [vars]
-# 公开仓库 morningsong/sport-db（按实际改），分支 main。
-# Bot 从 raw.githubusercontent.com 拉 data/workouts/<年>.csv + data/daily/<年>.csv。
+# 公开仓库 2061969365/sport-db，分支 main。
+# Bot 从 GitHub Contents API 读写 data/workouts/<年>.csv + data/daily/<年>.csv。
 REPO = "2061969365/sport-db"
 # 免 Key 网关（不设 max_tokens）。默认模型按任务要求：
 VISION_ENDPOINT = "https://apius2.fastfaster.kdns.fr/v1/chat/completions"

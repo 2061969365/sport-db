@@ -53,6 +53,7 @@ wrangler login
 # 按实际改 REPO 与 VISION_ENDPOINT（wrangler.toml [vars]）
 wrangler secret put TG_BOT_TOKEN
 wrangler secret put TG_SECRET
+wrangler secret put GH_PAT   # 细粒度 PAT，仅 sport-db 的 Contents 读写（方案A直写库用；不配则只读不写）
 wrangler secret put FEISHU_APP_ID
 wrangler secret put FEISHU_APP_SECRET
 # VISION 网关免 Key：不存任何 Key secret
