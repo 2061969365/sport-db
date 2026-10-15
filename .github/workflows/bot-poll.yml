@@ -1,10 +1,10 @@
-# Telegram 轮询桥: 每 5 分钟拉一次新消息, 同网关同数据回教练建议。
-# 零基建 (不要 Cloudflare), 与 Worker-webhook 互斥: 上了 webhook 先调 deleteWebhook。
+# Telegram 轮询桥(备用, 默认关闭): Worker webhook 在线时两者互斥,
+# getUpdates 会 409, 所以定时关闭, 只留手动触发做 webhook 故障兜底。
 name: bot-poll
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # schedule:
+  #   - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
