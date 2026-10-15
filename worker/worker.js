@@ -260,7 +260,10 @@ const AGENT_SYS = "你是一名懂数据的跑步教练，也是这个运动库�
   + "规则：只用数据说话，跑步是跑步、骑行是骑行，配速只谈跑步；"
   + "先给一句话结论，再给1-2条带数字的具体建议；"
   + "摘要里没有的就说不知道，不编数据；只谈训练恢复。"
-  + "改库规则：用户说改数时，必须先调 query_workouts 找到那条的 id 再调 update_workout，"
+  + "查数规则：用户问具体某条、某天、某月、某年、最早/最晚、最多/最少时，"
+  + "必须先调 query_workouts（配好 date_from/date_to/type，找最早用 sort=oldest），"
+  + "拿到工具结果再回答；绝不允许只看画像就说不知道；画像里没有但工具能查到的，以工具为准。"
+  + "改库规则：用户说改数时，必须先调 query_workouts 找到那条的 id 再调 update_workout，";
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；不确定的先问。";
 
 const AGENT_TOOLS = [
@@ -271,11 +274,12 @@ const AGENT_TOOLS = [
         days: { type: "integer", description: "近N天，1-90" } } } } },
   { type: "function",
     function: { name: "query_workouts",
-      description: "按条件查原始记录明细（含id）。改数据前必须先查到id。",
+      description: "按条件查原始记录明细（含id）。改数据前必须先查到id；找最早记录用sort=oldest。",
       parameters: { type: "object", properties: {
         type: { type: "string", description: "如 outdoor_running，不限填空" },
         date_from: { type: "string", description: "YYYY-MM-DD" },
         date_to: { type: "string", description: "YYYY-MM-DD" },
+        sort: { type: "string", description: "latest(默认，取最近N条) 或 oldest(取最早N条)" },
         limit: { type: "integer", description: "默认10，最多30" } } } } },
   { type: "function",
     function: { name: "update_workout",
@@ -286,10 +290,27 @@ const AGENT_TOOLS = [
           description: "字段名->新值，允许：距离米distance_m/秒duration_s/配速avg_pace_s/心率avg_hr,max_hr,min_hr/卡路里calories/步数steps/步频cadence/类型type" } } } } },
 ];
 
-// 当年+去年 workouts 全读进内存做工具查询（个人量级，单文件<1MB）。
+// 工具语料：读全 data/workouts/*.csv（经目录列举，个人量级全内存）。
+// 当年缺失自动回退当年+去年，避免跨年边界查不到。
 async function loadWorkouts(env) {
-  const now = new Date();
-  const years = [now.getUTCFullYear(), now.getUTCFullYear() - 1];
+  let years = [];
+  try {
+    const r = await fetch(`https://api.github.com/repos/${env.REPO}/contents/data/workouts?ref=main`, {
+      headers: ghHeaders(env),
+    });
+    if (r.ok) {
+      const list = await r.json();
+      years = (Array.isArray(list) ? list : [])
+        .map((e) => (e.name || "").match(/^(20\d{2})\.csv$/))
+        .filter(Boolean)
+        .map((m) => Number(m[1]))
+        .sort();
+    }
+  } catch { /* fallback below */ }
+  if (!years.length) {
+    const now = new Date();
+    years = [now.getUTCFullYear() - 1, now.getUTCFullYear()];
+  }
   const out = [];
   for (const y of years) {
     const g = await ghGetFile(env, `data/workouts/${y}.csv`).catch(() => null);
@@ -359,7 +380,8 @@ function toolQueryWorkouts(all, args) {
       max_hr: r.max_hr, steps: r.steps, source: r.source });
   }
   out.sort((a, b) => String(a.date) < String(b.date) ? -1 : 1);
-  return JSON.stringify(out.slice(-lim));
+  const rows = args.sort === "oldest" ? out.slice(0, lim) : out.slice(-lim);
+  return JSON.stringify({ total: out.length, rows });
 }
 
 // CSV 行转回文本（只替换目标列，保持其余列与引号原样，用解析器重建）。
