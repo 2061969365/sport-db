@@ -385,13 +385,15 @@ function toolQueryWorkouts(all, args) {
 }
 
 // CSV 行转回文本（只替换目标列，保持其余列与引号原样，用解析器重建）。
-function stringifyCSV(head, rows) {
+// eol 沿用原文件的换行符（本库 CSV 是 CRLF），避免整文件 diff。
+function stringifyCSV(head, rows, eol) {
+  eol = eol || "\n";
   const esc = (v) => {
     v = v == null ? "" : String(v);
     return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
   };
-  return head.map(esc).join(",") + "\n"
-    + rows.map((r) => head.map((h) => esc(r[h])).join(",")).join("\n") + "\n";
+  return head.map(esc).join(",") + eol
+    + rows.map((r) => head.map((h) => esc(r[h])).join(",")).join(eol) + eol;
 }
 
 async function toolUpdateWorkout(env, all, actor, args) {
@@ -424,7 +426,7 @@ async function toolUpdateWorkout(env, all, actor, args) {
     for (const k of Object.keys(fields)) old[k] = row[k] ?? "";
     for (const [k, v] of Object.entries(fields)) row[k] = (v == null ? "" : String(v));
     if (fields.type !== undefined) row.category = fields.type;
-    const next = stringifyCSV(header, parsed);
+    const next = stringifyCSV(header, parsed, cur.text.includes("\r\n") ? "\r\n" : "\n");
     try {
       await ghPutFile(env, path, next, cur.sha || "",
         `bot: update ${wid} ${Object.keys(fields).join(",")} via ${actor}`);
