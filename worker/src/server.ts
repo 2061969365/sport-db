@@ -2,6 +2,7 @@
 // Think 默认的 WebSocket 聊天协议同时保留（routeAgentRequest兜底），供 PWA 接入。
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
+import { ingestPhoto, pickImage } from "./photo";
 import type { Env } from "./env";
 
 export { SportDbAgent };
@@ -66,8 +67,18 @@ export default {
       }
       let update: {
         update_id?: number;
-        message?: { message_id?: number; text?: string; chat?: { id?: number }; from?: { username?: string } };
-        edited_message?: { message_id?: number; text?: string; chat?: { id?: number }; from?: { username?: string } };
+        message?: {
+          message_id?: number; text?: string; caption?: string;
+          photo?: { file_id?: string }[];
+          document?: { file_id?: string; mime_type?: string };
+          chat?: { id?: number }; from?: { username?: string };
+        };
+        edited_message?: {
+          message_id?: number; text?: string; caption?: string;
+          photo?: { file_id?: string }[];
+          document?: { file_id?: string; mime_type?: string };
+          chat?: { id?: number }; from?: { username?: string };
+        };
       } = {};
       try {
         update = await request.json();
@@ -78,6 +89,26 @@ export default {
       const text = (msg.text || "").trim();
       const chatId = msg.chat?.id;
       if (!chatId) return new Response("no chat", { status: 200 });
+      const mid = msg.message_id ?? Date.now();
+      const picked = pickImage(msg);
+      if (picked) {
+        const caption = (msg.caption || "").trim();
+        try {
+          const { rec, line } = await ingestPhoto(env, picked.fileId, picked.isOrig, mid);
+          if (!caption) {
+            await tgSend(env, chatId, line);
+          } else {
+            const follow = await askAgent(env, `tg-${chatId}`,
+              `[用户发了一张运动截图并附言：${caption}]\n`
+              + `[截图识别结果：${JSON.stringify(rec)}]\n`
+              + `[入库情况：${line}]\n请先报入库情况，再回答附言。`);
+            await tgSend(env, chatId, follow);
+          }
+        } catch (e) {
+          await tgSend(env, chatId, `这张图处理失败（${(e as Error).message}），换张清晰的再发一次。`);
+        }
+        return new Response("ok");
+      }
       if (!text) {
         await tgSend(env, chatId, "发我一句话吧，比如：总结一下我最近的运动情况");
         return new Response("ok");
