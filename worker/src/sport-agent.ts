@@ -10,8 +10,9 @@ import { z } from "zod";
 import type { Env } from "./env";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
-  toolAppendWorkout, toolConfirmReview, toolDeleteWorkout, toolGetSummary,
-  toolListReview, toolQueryWorkouts, toolStatsWorkouts, toolUpdateWorkout,
+  toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout,
+  toolGetSummary, toolListReview, toolQueryWorkouts, toolRecords,
+  toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout,
   type SqlTag,
 } from "./github";
 
@@ -54,7 +55,7 @@ const RULES_BLOCK =
   + "拿预览diff念给用户；用户明确说“确认”后，再用相同参数带 confirmed=true 调一次才写入。"
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；"
   + "白名单外的字段、找不到的记录，明说做不到或找不到，让用户确认，不擅自发挥。"
-  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/update_workout/delete_workout/append_workout/list_review/confirm_review 八个工具读写；"
+  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/trends/records/compare_periods/streaks/update_workout/delete_workout/append_workout/list_review/confirm_review 十二个工具读写；"
   + "workspace 的文件工具（读写删改查）一律不许碰，数据不在那里。"
 
 export class SportDbAgent extends Think<Env> {
@@ -299,6 +300,46 @@ export class SportDbAgent extends Think<Env> {
         }),
         execute: async (args: { path: string; confirmed?: boolean }) => {
           return toolConfirmReview(env, args.path, !!args.confirmed, "think-agent", sql);
+        },
+      }),
+      trends: tool({
+        description: "看趋势（有没有进步）：配速/心率/跑量按周或按月序列。问进步、状态、越跑越快这类必调它，别翻明细自己算。",
+        inputSchema: z.object({
+          metric: z.enum(["pace", "hr", "distance"]).default("pace"),
+          per: z.enum(["week", "month"]).default("week"),
+          date_from: z.string().optional(),
+          date_to: z.string().optional(),
+          limit: z.number().int().min(4).max(52).default(26),
+        }),
+        execute: async (args: { metric?: string; per?: string; date_from?: string; date_to?: string; limit?: number }) => {
+          const all = await loadWorkouts(env, sql);
+          return toolTrends(all, args);
+        },
+      }),
+      records: tool({
+        description: "PB 榜：最长单次跑、最快配速、单月最高跑量、累计总量。问PB/最佳/纪录必调它。",
+        inputSchema: z.object({}),
+        execute: async () => {
+          const all = await loadWorkouts(env, sql);
+          return toolRecords(all);
+        },
+      }),
+      compare_periods: tool({
+        description: "两段时间对照（如本月vs上月）：次数/跑量/配速/心率及变化百分比。问对比、有没有退步必调它，给齐两段起止。",
+        inputSchema: z.object({
+          a_from: z.string(), a_to: z.string(), b_from: z.string(), b_to: z.string(),
+        }),
+        execute: async (args: { a_from?: string; a_to?: string; b_from?: string; b_to?: string }) => {
+          const all = await loadWorkouts(env, sql);
+          return toolCompare(all, args);
+        },
+      }),
+      streaks: tool({
+        description: "连击：当前连续运动天数、历史最长、活跃天数。问坚持、打卡、连击必调它。",
+        inputSchema: z.object({}),
+        execute: async () => {
+          const all = await loadWorkouts(env, sql);
+          return toolStreaks(all);
         },
       }),
     };

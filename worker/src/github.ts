@@ -741,3 +741,147 @@ export function toolStatsWorkouts(
   });
   return JSON.stringify({ total_periods: out.length, rows: out });
 }
+
+/** 周一日期（YYYY-MM-DD）作为周 key。 */
+function mondayOf(dateStr: string): string {
+  const d = new Date(`${dateStr}T12:00:00+08:00`);
+  if (Number.isNaN(d.getTime())) return dateStr.slice(0, 7);
+  const bj = new Date(d.getTime() + 8 * 36e5);
+  const wd = (bj.getUTCDay() + 6) % 7;
+  const mon = new Date(bj.getTime() - wd * 864e5);
+  return mon.toISOString().slice(0, 10);
+}
+
+/** trends 工具：“有没有进步”看这个——配速/心率/跑量随时间序列，不用翻明细。 */
+export function toolTrends(
+  all: Row[],
+  args: { metric?: string; per?: string; date_from?: string; date_to?: string; limit?: number },
+): string {
+  const dateErr = checkDates(args);
+  if (dateErr) return dateErr;
+  const metric = ["pace", "hr", "distance"].includes(args.metric || "") ? args.metric! : "pace";
+  const per = args.per === "month" ? "month" : "week";
+  let lim = Math.trunc(Number(args.limit) || 26);
+  if (!Number.isFinite(lim)) lim = 26;
+  lim = Math.min(52, Math.max(4, lim));
+  const groups = new Map<string, Row[]>();
+  for (const r of all) {
+    if (!RUN_TYPES.includes(r.type || "")) continue;
+    if (args.date_from && (r.date || "") < args.date_from) continue;
+    if (args.date_to && (r.date || "") > args.date_to) continue;
+    const k = per === "month" ? (r.date || "").slice(0, 7) : mondayOf(r.date || "");
+    if (!k) continue;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(r);
+  }
+  const keys = [...groups.keys()].sort().slice(-lim);
+  const points = keys.map((k) => {
+    const rs = groups.get(k)!;
+    const pd = rs.reduce((a, w) => a + num(w.distance_m), 0);
+    const pt = rs.reduce((a, w) => a + num(w.duration_s), 0);
+    const hrs = rs.map((w) => num(w.avg_hr)).filter((x) => x);
+    return {
+      period: k, count: rs.length,
+      run_km: +(pd / 1000).toFixed(1),
+      avg_pace: pd > 0 && pt > 0 ? fmtPace(pt / (pd / 1000)) : null,
+      avg_hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
+    };
+  });
+  const pick = (p: (typeof points)[number]) =>
+    metric === "hr" ? p.avg_hr : metric === "distance" ? p.run_km : p.avg_pace;
+  const vals = points.map(pick).filter((v) => v != null) as (string | number)[];
+  return JSON.stringify({ metric, per, points, note: `共${points.length}个点，数值列见 ${metric}（配速越小越快）` , values: vals });
+}
+
+/** records 工具：PB 榜——最长单次、最快配速、月最高跑量、累计。 */
+export function toolRecords(all: Row[]): string {
+  const runs = all.filter((r) => RUN_TYPES.includes(r.type || "") && num(r.distance_m) > 0);
+  if (!runs.length) return "库里还没有跑步记录。";
+  const byDist = [...runs].sort((a, b) => num(b.distance_m) - num(a.distance_m))[0];
+  const paced = runs
+    .map((r) => ({ r, p: num(r.duration_s) > 0 ? num(r.duration_s) / (num(r.distance_m) / 1000) : 0 }))
+    .filter((x) => x.p > 0 && num(x.r.distance_m) >= 3000)
+    .sort((a, b) => a.p - b.p)[0];
+  const byMonth = new Map<string, number>();
+  for (const r of runs) {
+    const k = (r.date || "").slice(0, 7);
+    byMonth.set(k, (byMonth.get(k) || 0) + num(r.distance_m));
+  }
+  const bestMonth = [...byMonth.entries()].sort((a, b) => b[1] - a[1])[0];
+  const totalKm = runs.reduce((a, w) => a + num(w.distance_m), 0) / 1000;
+  return JSON.stringify({
+    longest_run: { date: byDist.date, km: +(num(byDist.distance_m) / 1000).toFixed(2) },
+    fastest_pace_3k: paced
+      ? { date: paced.r.date, km: +(num(paced.r.distance_m) / 1000).toFixed(2), pace: fmtPace(paced.p) }
+      : null,
+    best_month: bestMonth ? { month: bestMonth[0], km: +(bestMonth[1] / 1000).toFixed(1) } : null,
+    total_runs: runs.length, total_km: +totalKm.toFixed(1),
+  });
+}
+
+function summarizeSpan(all: Row[], from?: string, to?: string) {
+  const rs = all.filter((r) =>
+    (!from || (r.date || "") >= from) && (!to || (r.date || "") <= to));
+  const runs = rs.filter((r) => RUN_TYPES.includes(r.type || ""));
+  const pd = runs.reduce((a, w) => a + num(w.distance_m), 0);
+  const pt = runs.reduce((a, w) => a + num(w.duration_s), 0);
+  const hrs = runs.map((w) => num(w.avg_hr)).filter((x) => x);
+  return {
+    count: rs.length, run_count: runs.length, run_km: +(pd / 1000).toFixed(1),
+    avg_pace_s: pd > 0 && pt > 0 ? Math.round(pt / (pd / 1000)) : null,
+    avg_hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
+  };
+}
+
+/** compare 工具：两段时间对照（本月vs上月），直接给变化百分比。 */
+export function toolCompare(
+  all: Row[],
+  args: { a_from?: string; a_to?: string; b_from?: string; b_to?: string },
+): string {
+  const dateErr = checkDates({ date_from: args.a_from, date_to: args.a_to })
+    || checkDates({ date_from: args.b_from, date_to: args.b_to });
+  if (dateErr) return dateErr;
+  if (!args.a_from || !args.a_to || !args.b_from || !args.b_to) {
+    return "失败：要给齐两段区间的起止（a_from/a_to/b_from/b_to，YYYY-MM-DD），如本月和上月。";
+  }
+  const a = summarizeSpan(all, args.a_from, args.a_to);
+  const b = summarizeSpan(all, args.b_from, args.b_to);
+  const delta = (x: number | null, y: number | null) =>
+    x == null || y == null || y === 0 ? null : +(((x - y) / y) * 100).toFixed(1);
+  return JSON.stringify({
+    a: { range: `${args.a_from}~${args.a_to}`, ...a },
+    b: { range: `${args.b_from}~${args.b_to}`, ...b },
+    delta_pct: {
+      run_km: delta(a.run_km, b.run_km),
+      run_count: delta(a.run_count, b.run_count),
+      avg_pace_s: delta(a.avg_pace_s, b.avg_pace_s),
+      avg_hr: delta(a.avg_hr, b.avg_hr),
+    },
+    note: "配速delta为负=变快（秒数减少），心率delta为正=同强度更累，供教练解读",
+  });
+}
+
+/** streaks 工具：连击——当前连续天数、历史最长、活跃天数。 */
+export function toolStreaks(all: Row[]): string {
+  const days = [...new Set(all.map((r) => r.date || "").filter(Boolean))].sort();
+  if (!days.length) return "库里还没有记录。";
+  const today = new Date(Date.now() + 8 * 36e5).toISOString().slice(0, 10);
+  const set = new Set(days);
+  let cur = 0;
+  let d = today;
+  if (!set.has(d)) {
+    d = new Date(Date.parse(`${d}T12:00:00+08:00`) - 864e5).toISOString().slice(0, 10);
+  }
+  while (set.has(d)) {
+    cur++;
+    d = new Date(Date.parse(`${d}T12:00:00+08:00`) - 864e5).toISOString().slice(0, 10);
+  }
+  let best = 0, run = 1;
+  for (let i = 1; i < days.length; i++) {
+    const gap = Math.round((Date.parse(`${days[i]}T12:00:00+08:00`) - Date.parse(`${days[i - 1]}T12:00:00+08:00`)) / 864e5);
+    run = gap === 1 ? run + 1 : 1;
+    best = Math.max(best, run);
+  }
+  best = Math.max(best, run, cur);
+  return JSON.stringify({ today, current_streak_days: cur, longest_streak_days: best, active_days: days.length });
+}
