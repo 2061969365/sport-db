@@ -105,6 +105,16 @@ export default {
       } catch {
         /* 认领失败不挡路，继续处理 */
       }
+      if (text === "/start" || text === "/help" || text === "帮助" || text === "你能干什么") {
+        await tgSend(env, chatId,
+          "我是你的跑步教练+运动账本管理员，会查你库里真实数据说话。\n\n"
+          + "直接问：近30天跑了多少 / 2023年第一次跑步哪天 / 今年每月跑量\n"
+          + "发图记账：运动截图直接发（文件方式最清晰），自动识别入库\n"
+          + "改数：跟我说哪条改成多少，我先出预览，你说确认才写\n"
+          + "补录：如“昨天跑了5km帮我记上”；删除同理，先预览后执行\n"
+          + "指令：/status 看上下文水位，/new 另起话题（画像保留）");
+        return new Response("ok");
+      }
       if (text === "/status" || text === "水位" || text === "上下文") {
         try {
           const agent = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
@@ -197,6 +207,44 @@ export default {
         }
       }
       return new Response("ok");
+    }
+
+    // ---------------- PWA 聊天（经 Worker 走 Agent：工具+记忆+规则全套） ----------------
+    if (url.pathname === "/api/chat") {
+      const cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      };
+      if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+      if (request.method !== "POST") {
+        return new Response("method not allowed", { status: 405, headers: cors });
+      }
+      let body: { session?: string; key?: string; text?: string } = {};
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "JSON 解析失败" }, { status: 400, headers: cors });
+      }
+      const session = String(body.session || "");
+      const key = String(body.key || "");
+      const text = String(body.text || "").trim().slice(0, 2000);
+      if (!/^[A-Za-z0-9-]{8,64}$/.test(session) || !/^[A-Za-z0-9-]{8,64}$/.test(key) || !text) {
+        return Response.json({ error: "参数不对（session/key/text）" }, { status: 400, headers: cors });
+      }
+      try {
+        const agent = (await getAgentByName(env.SportDbAgent, `pwa-${session}`)) as unknown as SportDbAgent;
+        if (!(await agent.checkQuota(session))) {
+          return Response.json({ error: "问太快了，每小时 60 轮，歇会再来" }, { status: 429, headers: cors });
+        }
+        if (!(await agent.claimUpdate(`pwa-${key}`))) {
+          return Response.json({ error: "重复提交（请用新 key 重试）" }, { status: 409, headers: cors });
+        }
+        const reply = await askAgent(env, `pwa-${session}`, text);
+        return Response.json({ reply }, { headers: cors });
+      } catch (e) {
+        return Response.json({ error: `处理失败（${(e as Error).message}），请稍后重试` }, { status: 500, headers: cors });
+      }
     }
 
     return (await routeAgentRequest(request, env)) ?? new Response("Not found", { status: 404 });

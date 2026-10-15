@@ -8,8 +8,8 @@ import { z } from "zod";
 import type { Env } from "./env";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
-  toolAppendWorkout, toolDeleteWorkout, toolGetSummary, toolQueryWorkouts,
-  toolStatsWorkouts, toolUpdateWorkout,
+  toolAppendWorkout, toolConfirmReview, toolDeleteWorkout, toolGetSummary,
+  toolListReview, toolQueryWorkouts, toolStatsWorkouts, toolUpdateWorkout,
   type SqlTag,
 } from "./github";
 
@@ -33,7 +33,7 @@ const RULES_BLOCK =
   + "拿预览diff念给用户；用户明确说“确认”后，再用相同参数带 confirmed=true 调一次才写入。"
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；"
   + "白名单外的字段、找不到的记录，明说做不到或找不到，让用户确认，不擅自发挥。"
-  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/update_workout/delete_workout/append_workout 六个工具读写；"
+  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/update_workout/delete_workout/append_workout/list_review/confirm_review 八个工具读写；"
   + "workspace 的文件工具（读写删改查）一律不许碰，数据不在那里。"
 
 export class SportDbAgent extends Think<Env> {
@@ -153,6 +153,23 @@ export class SportDbAgent extends Think<Env> {
       + `（msgChars=${msgChars} 供调试）`;
   }
 
+  @callable()
+  async checkQuota(session: string): Promise<boolean> {
+    // /api/chat 限流：每会话每小时 60 轮，超了返回 false（公开端点防刷）。
+    const sql = this.sql as unknown as SqlTag;
+    sql`CREATE TABLE IF NOT EXISTS chat_quota (session TEXT PRIMARY KEY, window_start INTEGER, count INTEGER)`;
+    const now = Date.now();
+    const rows = sql`SELECT window_start, count FROM chat_quota WHERE session = ${session}` as
+      { window_start: number; count: number }[];
+    if (!rows.length || now - rows[0].window_start > 3600000) {
+      sql`INSERT OR REPLACE INTO chat_quota(session, window_start, count) VALUES (${session}, ${now}, 1)`;
+      return true;
+    }
+    if (rows[0].count >= 60) return false;
+    sql`UPDATE chat_quota SET count = ${rows[0].count + 1} WHERE session = ${session}`;
+    return true;
+  }
+
   getTools() {
     const env = this.env;
     const self = this;
@@ -233,6 +250,21 @@ export class SportDbAgent extends Think<Env> {
         execute: async (args: { group_by?: string; type?: string; date_from?: string; date_to?: string }) => {
           const all = await loadWorkouts(env, sql);
           return toolStatsWorkouts(all, args);
+        },
+      }),
+      list_review: tool({
+        description: "列出待确认的截图识别项（review/）。用户问有没有没入库的图、或要确认之前没看清的图时调它。",
+        inputSchema: z.object({}),
+        execute: async () => toolListReview(env),
+      }),
+      confirm_review: tool({
+        description: "把某条 review 确认入库：先不带confirmed调一次拿预览念给用户，用户明确说确认后，再用相同path带confirmed=true调一次；写入后自动删 review 文件。",
+        inputSchema: z.object({
+          path: z.string(),
+          confirmed: z.boolean().default(false),
+        }),
+        execute: async (args: { path: string; confirmed?: boolean }) => {
+          return toolConfirmReview(env, args.path, !!args.confirmed, "think-agent", sql);
         },
       }),
     };

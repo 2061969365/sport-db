@@ -9,12 +9,10 @@
 'use strict';
 
 /* ================= 常量（可改） ================= */
-const VISION_MODEL_DEFAULT = 'muse-spark-1.3-contributor-free';
-const VISION_ENDPOINT_DEFAULT = ''; // 无默认网关：在页面设置里填写后存 localStorage
+const BOT_DEFAULT = 'https://sport-db-bot.xia2061969365.workers.dev';
 const LS_HISTORY = 'sportdb.chat.history.v1';
-const LS_CONFIG = 'sportdb.chat.config.v1';
-const HISTORY_CONTEXT_N = 8; // 发送时附带最近 N 条历史作多轮上下文
-const REPLY_CLIP = 3500; // 与 worker.js 一致的单条上限内裁剪
+const LS_CONFIG = 'sportdb.chat.config.v2';
+const REPLY_CLIP = 3500; // 服务端已裁剪，此为展示兜底
 
 /* CSV 降级基址候选（与 app.js 一致，兼容本地根服务 / Pages 两种布局） */
 const CSV_BASE_CANDIDATES = [
@@ -40,17 +38,25 @@ function esc(s) {
   }[c]));
 }
 
-/* ================= 配置（localStorage） ================= */
+/* ================= 配置（localStorage）：Bot 地址 + 本机会话 ID ================= */
+function newSessionId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return `s-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+}
 function loadConfig() {
-  try {
-    return Object.assign(
-      { endpoint: VISION_ENDPOINT_DEFAULT, model: VISION_MODEL_DEFAULT },
-      JSON.parse(localStorage.getItem(LS_CONFIG) || '{}'),
-    );
-  } catch { return { endpoint: VISION_ENDPOINT_DEFAULT, model: VISION_MODEL_DEFAULT }; }
+  let cfg = {};
+  try { cfg = JSON.parse(localStorage.getItem(LS_CONFIG) || '{}'); } catch { cfg = {}; }
+  if (!cfg || typeof cfg !== 'object') cfg = {};
+  if (!cfg.bot) cfg.bot = BOT_DEFAULT;
+  if (!cfg.session) { cfg.session = newSessionId(); saveConfig(cfg); }
+  return cfg;
 }
 function saveConfig(cfg) {
   localStorage.setItem(LS_CONFIG, JSON.stringify(cfg));
+}
+function newKey() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return `k-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 }
 
 /* ================= 历史（localStorage） ================= */
@@ -164,24 +170,18 @@ async function buildSummary30d() {
   return summarizeRows(recent);
 }
 
-/* ================= 直调模型（免 Key，不传 max_tokens） ================= */
-async function askModel(endpoint, model, summary, history, question) {
-  const messages = [
-    { role: 'system', content: '你是一名懂数据的跑步教练，用简短口语中文回答（200字内）。规则：只用摘要数据说话，跑步是跑步、骑行是骑行，配速只谈跑步；先给一句话结论，再给1-2条带数字的具体建议；摘要里没有的就说不知道，不编数据；只谈训练恢复。以下是该用户近30天运动摘要：\n' + summary },
-    ...history.slice(-HISTORY_CONTEXT_N).map((m) => ({ role: m.role, content: m.content })),
-    { role: 'user', content: question },
-  ];
-  const r = await fetch(endpoint, {
+/* ================= 经 Worker 走 Agent（工具+记忆+规则全套，不再直调网关） ================= */
+async function askBot(botBase, session, key, question) {
+  const r = await fetch(`${String(botBase).replace(/\/$/, '')}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, temperature: 0.3, messages }),
+    body: JSON.stringify({ session, key, text: question }),
   });
-  if (!r.ok) throw new Error(`模型接口 HTTP ${r.status}`);
-  const data = await r.json();
-  const text = data && data.choices && data.choices[0] && data.choices[0].message
-    && data.choices[0].message.content;
-  if (!text) throw new Error('模型返回为空');
-  return String(text).slice(0, REPLY_CLIP);
+  let data = null;
+  try { data = await r.json(); } catch { /* fallthrough */ }
+  if (!r.ok) throw new Error((data && data.error) || `Bot 服务 HTTP ${r.status}`);
+  if (!data || !data.reply) throw new Error('Bot 返回为空');
+  return String(data.reply).slice(0, REPLY_CLIP);
 }
 
 /* ================= 页面逻辑 ================= */
@@ -199,25 +199,28 @@ let sending = false;
 
 (function initSettings() {
   const cfg = loadConfig();
-  endpointEl.value = cfg.endpoint || '';
-  modelEl.value = cfg.model || VISION_MODEL_DEFAULT;
-  endpointEl.placeholder = 'https://你的网关/v1/chat/completions';
-  hintEl.textContent = cfg.endpoint
-    ? `当前 endpoint 已保存，模型 ${cfg.model || VISION_MODEL_DEFAULT}`
-    : '尚未配置 endpoint：发送前请填写网关地址（/v1/chat/completions，免 Key）。';
+  endpointEl.value = cfg.bot || BOT_DEFAULT;
+  endpointEl.placeholder = BOT_DEFAULT;
+  modelEl.value = cfg.session || '';
+  modelEl.readOnly = true;
+  hintEl.textContent = `Bot 服务：${cfg.bot}；本机会话 ${cfg.session}（服务端同样记忆，清空记录会换新身份）。`;
 })();
 
 document.getElementById('btn-save-cfg').addEventListener('click', () => {
-  const cfg = { endpoint: endpointEl.value.trim(), model: modelEl.value.trim() || VISION_MODEL_DEFAULT };
+  const old = loadConfig();
+  const cfg = { bot: endpointEl.value.trim() || BOT_DEFAULT, session: old.session };
   saveConfig(cfg);
-  hintEl.textContent = cfg.endpoint
-    ? `已保存：${cfg.endpoint}，模型 ${cfg.model}`
-    : '已保存（endpoint 为空时无法发送，请填写）。';
+  hintEl.textContent = `已保存 Bot 服务：${cfg.bot}。`;
 });
 
 document.getElementById('btn-clear').addEventListener('click', () => {
   history = [];
   saveHistory(history);
+  const cfg = loadConfig();
+  cfg.session = newSessionId();
+  saveConfig(cfg);
+  modelEl.value = cfg.session;
+  hintEl.textContent = '已清空记录并换了新身份（服务端记忆另起）。';
   renderAll();
 });
 
@@ -273,16 +276,6 @@ async function send(question, isRetry) {
   question = (question || '').trim();
   if (!question || sending) return;
   const cfg = loadConfig();
-  if (!cfg.endpoint) {
-    if (!isRetry) {
-      history.push({ role: 'user', content: question, ts: Date.now() });
-      saveHistory(history);
-      renderAll();
-    }
-    addErrorWithRetry(question, '未配置 VISION_ENDPOINT，请先在上方设置里填写网关地址后重试。');
-    document.querySelector('details.settings').open = true;
-    return;
-  }
   sending = true;
   sendBtn.disabled = true;
   sendBtn.textContent = '发送中…';
@@ -296,14 +289,9 @@ async function send(question, isRetry) {
     logEl.appendChild(thinking);
     logEl.scrollTop = logEl.scrollHeight;
 
-    let summary;
-    try {
-      summary = await buildSummary30d();
-      summaryEl.textContent = summary;
-    } catch (err) {
-      summary = `（注：近30天本地数据不可读：${(err && err.message) || err}，请基于通用知识回答并提醒用户检查数据服务。）`;
-    }
-    const reply = await askModel(cfg.endpoint, cfg.model || VISION_MODEL_DEFAULT, summary, history, question);
+    // 摘要卡照常刷新（纯本地展示，不再拼进请求，画像由服务端算）
+    buildSummary30d().then((s) => { summaryEl.textContent = s; }).catch(() => {});
+    const reply = await askBot(cfg.bot, cfg.session, newKey(), question);
     thinking.remove();
     history.push({ role: 'assistant', content: reply, ts: Date.now() });
     saveHistory(history);

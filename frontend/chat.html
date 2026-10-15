@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta name="theme-color" content="#fc4c02" />
-<meta name="description" content="运动库 SportDB — 运动健康问答：近30天摘要 + 模型直调" />
+<meta name="description" content="运动库 SportDB — 运动健康问答：经 Bot 服务走 Agent（工具+记忆）" />
 <title>聊天 · 运动库 SportDB</title>
 <link rel="stylesheet" href="./style.css" />
 <link rel="stylesheet" href="./chat.css" />
@@ -17,7 +17,7 @@
     <span class="logo">💬</span>
     <div>
       <h1>运动聊天 <span class="en">SportDB Bot</span></h1>
-      <p class="subtitle">近30天摘要 → 模型直调（免 Key 网关）</p>
+      <p class="subtitle">经 Bot 服务走 Agent（工具+记忆+规则，和 TG 里同一个）</p>
     </div>
   </div>
   <a class="back" href="./index.html">← 返回首页</a>
@@ -25,12 +25,12 @@
 
 <main class="chat-main">
   <details class="card settings">
-    <summary>⚙️ 网关设置（VISION_ENDPOINT / 模型，点击展开）</summary>
-    <label>Endpoint（/v1/chat/completions，免 Key）
-      <input id="cfg-endpoint" type="url" placeholder="https://你的网关/v1/chat/completions" autocomplete="off" />
+    <summary>⚙️ Bot 服务设置（点击展开）</summary>
+    <label>Bot 服务地址
+      <input id="cfg-endpoint" type="url" placeholder="https://sport-db-bot.<账号>.workers.dev" autocomplete="off" />
     </label>
-    <label>模型（默认常量可改）
-      <input id="cfg-model" type="text" autocomplete="off" />
+    <label>本机会话 ID（服务端同样记忆，清空即换身份）
+      <input id="cfg-model" type="text" readonly autocomplete="off" />
     </label>
     <div class="row">
       <button id="btn-save-cfg" type="button">保存设置</button>
@@ -50,7 +50,7 @@
       <input id="chat-input" type="text" placeholder="问问你的训练情况…（如：我最近跑量怎么样？）" autocomplete="off" maxlength="500" />
       <button id="btn-send" type="submit">发送</button>
     </form>
-    <p class="hint">记录仅存本机 localStorage；图片/轨迹不上传，摘要只含距离·次数·配速·心率等数字。</p>
+    <p class="hint">记录存本机；服务端按会话 ID 独立记忆。每小时 60 轮限流。</p>
   </div>
 </main>
 
