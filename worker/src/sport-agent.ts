@@ -15,6 +15,8 @@ const COACH_SYS =
   + "为他制定最适合的计划和临场建议。说话像 ChatGPT 那样自然：口语亲切、有条理，先给结论再给依据，关键数字加粗；"
   + "简单问题一两句话答完；分析、计划类问题用小标题或分点展开，但不啰嗦。"
   + "问题模糊时先反问 1-2 个关键信息再答，不猜着答；多轮对话必须接上文。"
+  + "用户告诉你长期事实（目标、伤病、偏好）时，用 set_context 写进 user_profile，下次先看它再给建议；"
+  + "每次有效建议后，把弱项和下次提醒记进 coaching_notes。"
   + "不知道就说不知道，绝不编数据；只谈训练恢复。"
   + "【数据铁律】只用工具查到的数据说话：跑步是跑步、骑行是骑行，配速只谈跑步。"
   + "用户问具体某条、某天、某月、某年、最早/最晚、最多/最少时，"
@@ -42,6 +44,23 @@ export class SportDbAgent extends Think<Env> {
 
   getSystemPrompt(): string {
     return COACH_SYS;
+  }
+
+  configureContext() {
+    // 不传 provider → 自动落 durable per-agent SQLite，且经 set_context 可写。
+    // user_profile：认得“人”（目标/伤病/偏好）；coaching_notes：记得“事”（弱项/执行/下次提醒）。
+    return [
+      {
+        label: "user_profile",
+        description: "跑者长期画像：目标距离、伤病史、作息偏好、装备。用户提到相关事实时用 set_context 更新；给计划前先看这里。",
+        maxTokens: 1500,
+      },
+      {
+        label: "coaching_notes",
+        description: "教练观察备忘：用户弱项、本次建议的执行情况、下次要提醒的事。每次有效建议后更新一条。",
+        maxTokens: 1500,
+      },
+    ];
   }
 
   getTools() {
