@@ -3,15 +3,10 @@
 // （?v=sha 破缓存）→ confidence 路由：≥0.8 追加 workouts 当年 CSV；
 // 低的进 review。附言由调用方再跑一轮 agent 一并回答。
 import type { Env } from "./env";
-import { ghGetFile, ghPutFile, parseCSV } from "./github";
+import { WORKOUT_COLS, WORKOUT_TYPES, ghGetFile, ghPutFile, parseCSV } from "./github";
 
 export const REVIEW_THRESHOLD = 0.8;
 const MAX_BYTES = 12 * 1024 * 1024;
-
-const WORKOUT_TYPES = [
-  "outdoor_running", "indoor_running", "outdoor_run_class",
-  "outdoor_riding", "outdoor_walking", "pool_swimming", "free_training",
-];
 
 const VISION_PROMPT =
   "你是运动截图解析器。看这张运动 App 截图（小米运动健康 / Keep / 悦跑圈版式兼容），\n"
@@ -25,14 +20,6 @@ const VISION_PROMPT =
   + "配速 5分32秒换算成 332；看不清的字段填 null 并降低 confidence。\n"
   + "截图上显示的时间一般是结束时间：start_time = 结束时间 - duration_s，"
   + "按 “%Y-%m-%d %H:%M:%S +08:00”格式回；无时间显示则填 null。";
-
-export const WORKOUT_COLS = [
-  "id", "date", "start_utc", "start_beijing", "end_utc", "end_beijing",
-  "type", "category", "distance_m", "duration_s", "avg_pace_s", "max_pace_s",
-  "avg_speed", "max_speed", "avg_hr", "max_hr", "min_hr", "calories",
-  "steps", "cadence", "avg_stride", "total_climbing",
-  "uid_hash", "sid_hash", "has_track", "source", "confidence", "value_json",
-];
 
 export interface VisionRec {
   type: string;
@@ -101,7 +88,8 @@ function b64Bytes(buf: ArrayBuffer): string {
 
 /** 调 vision（https 图片地址），返回解析 JSON。 */
 export async function recognizePhoto(env: Env, imgUrl: string): Promise<VisionRec> {
-  const body = {
+  // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
+  const body: Record<string, unknown> = {
     model: env.VISION_MODEL || "muse-spark-1.3-contributor-free",
     reasoning_effort: "xhigh",
     messages: [{

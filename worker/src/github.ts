@@ -3,6 +3,33 @@
 import type { Env } from "./env";
 
 export const RUN_TYPES = ["outdoor_running", "indoor_running", "outdoor_run_class"];
+
+export const WORKOUT_TYPES = [
+  "outdoor_running", "indoor_running", "outdoor_run_class",
+  "outdoor_riding", "indoor_riding", "outdoor_walking",
+  "pool_swimming", "free_training", "rope_skipping",
+];
+
+/** 规范 28 列（新年文件建表用，与 import_mi 同序）。 */
+export const WORKOUT_COLS = [
+  "id", "date", "start_utc", "start_beijing", "end_utc", "end_beijing",
+  "type", "category", "distance_m", "duration_s", "avg_pace_s", "max_pace_s",
+  "avg_speed", "max_speed", "avg_hr", "max_hr", "min_hr", "calories",
+  "steps", "cadence", "avg_stride", "total_climbing",
+  "uid_hash", "sid_hash", "has_track", "source", "confidence", "value_json",
+];
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function checkDates(args: { date_from?: string; date_to?: string }): string | null {
+  for (const k of ["date_from", "date_to"] as const) {
+    const v = args[k];
+    if (v && !DATE_RE.test(v)) {
+      return `日期格式不对（${k}=${v}），必须用 YYYY-MM-DD，例如 2026-10-01。请修正后重调，不要编造结果。`;
+    }
+  }
+  return null;
+}
 export const EDITABLE_FIELDS = [
   "distance_m", "duration_s", "avg_pace_s", "avg_hr",
   "max_hr", "min_hr", "calories", "steps", "cadence", "type",
@@ -112,6 +139,22 @@ function ghHeaders(env: Env): Record<string, string> {
   return h;
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** 429/5xx 重试一次（1s 退避）；404/401/403 直接按原语义处理，不重试。 */
+async function ghFetch(input: string, init?: RequestInit): Promise<Response> {
+  const r = await fetch(input, init);
+  if ((r.status === 429 || r.status >= 500) && (init?.method || "GET") !== "GET") {
+    // 写请求不自动重试（避免 double-write），抛给调用方处理
+    return r;
+  }
+  if (r.status === 429 || r.status >= 500) {
+    await sleep(1000);
+    return fetch(input, init);
+  }
+  return r;
+}
+
 async function fetchText(url: string): Promise<string> {
   try {
     const r = await fetch(url);
@@ -126,10 +169,13 @@ async function fetchText(url: string): Promise<string> {
 export async function ghGetFile(env: Env, path: string): Promise<{ text: string; sha: string } | null> {
   if (env.GH_PAT) {
     try {
-      const r = await fetch(`https://api.github.com/repos/${env.REPO}/contents/${path}?ref=main`, {
+      const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/${path}?ref=main`, {
         headers: ghHeaders(env),
       });
       if (r.status === 404) return null;
+      if (r.status === 401 || r.status === 403) {
+        throw new Error(`GitHub读 ${path} 鉴权失败 ${r.status}（PAT 过期或权限不足）`);
+      }
       if (!r.ok) throw new Error(`GitHub读 ${path} 失败 ${r.status}`);
       const j = (await r.json()) as { type?: string; content?: string; sha?: string };
       if (j.type !== "file" || !j.content) return null;
@@ -147,11 +193,14 @@ export async function ghPutFile(env: Env, path: string, text: string, sha: strin
   if (!env.GH_PAT) throw new Error("未配 GH_PAT，写库不可用");
   const body: Record<string, string> = { message, content: utf8ToB64(text), branch: "main" };
   if (sha) body.sha = sha;
-  const r = await fetch(`https://api.github.com/repos/${env.REPO}/contents/${path}`, {
+  const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/${path}`, {
     method: "PUT",
     headers: ghHeaders(env),
     body: JSON.stringify(body),
   });
+  if (r.status === 401 || r.status === 403) {
+    throw new Error(`GitHub写 ${path} 鉴权失败 ${r.status}（PAT 过期或权限不足）`);
+  }
   if (r.status === 409 || r.status === 422) {
     const t = await r.text();
     throw new Error(`Conflict:${t.slice(0, 160)}`);
@@ -279,6 +328,8 @@ export function toolQueryWorkouts(
   let lim = Math.trunc(Number(args.limit) || 10);
   if (!Number.isFinite(lim)) lim = 10;
   lim = Math.min(30, Math.max(1, lim));
+  const dateErr = checkDates(args);
+  if (dateErr) return dateErr;
   const out = [];
   for (const r of all) {
     if (args.type && r.type !== args.type) continue;
@@ -371,4 +422,168 @@ export async function toolUpdateWorkout(
     }
   }
   return "失败：连续冲突，请稍后再试。";
+}
+
+/** append 的写核：读（或新建）年文件 → 追加一行 → 写回 → 清缓存。P2 会把 photo.ts 收图并过来。 */
+export async function appendRow(
+  env: Env, row: Record<string, string>, actor: string, sql?: SqlTag,
+): Promise<string> {
+  const path = `data/workouts/${row.date.slice(0, 4)}.csv`;
+  const cur = await ghGetFile(env, path).catch(() => null);
+  let header = WORKOUT_COLS;
+  let rows: Record<string, string>[] = [];
+  if (cur?.text) {
+    rows = parseCSV(cur.text);
+    if (rows.length) header = Object.keys(rows[0]);
+  }
+  rows.push(Object.fromEntries(header.map((h) => [h, row[h] ?? ""])));
+  const esc = (v: string) => (/[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
+  const eol = cur?.text?.includes("\r\n") ? "\r\n" : "\n";
+  const next = header.map(esc).join(",") + eol
+    + rows.map((r) => header.map((h) => esc(r[h] ?? "")).join(",")).join(eol) + eol;
+  await ghPutFile(env, path, next, cur?.sha || "",
+    `bot: append ${row.id} via ${actor}`);
+  invalidateCache(sql, path);
+  return path;
+}
+
+/** delete_workout 工具（两阶段）：预览 → confirmed=true 才删。删后 git 可 revert。 */
+export async function toolDeleteWorkout(
+  env: Env, all: Row[], actor: string,
+  args: { id?: string; confirmed?: boolean }, sql?: SqlTag,
+): Promise<string> {
+  if (!env.GH_PAT) {
+    return "失败：写库未授权（Worker 缺 GH_PAT，当前只读模式），删记录做不了。";
+  }
+  const wid = String(args.id || "").trim();
+  if (!wid) return "失败：缺 id，先调 query_workouts 确认。";
+  const hit = all.find((r) => r.id === wid);
+  if (!hit) return `失败：找不到 id=${wid}，先调 query_workouts 确认。`;
+  if (!args.confirmed) {
+    return `预览（尚未删除）：${wid}（${hit.date} ${hit.type} `
+      + `${Number(hit.distance_m || 0) / 1000}km/${hit.duration_s || "?"}s）`
+      + "删除后 git 可 revert。得到用户明确说“确认删除”后，再用相同 id 带 confirmed=true 调一次。";
+  }
+  const path = `data/workouts/${hit._year}.csv`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const cur = await ghGetFile(env, path).catch(() => null);
+    if (!cur?.text) {
+      if (attempt === 1) return `失败：读 ${path} 连续失败，稍后再试。`;
+      continue;
+    }
+    const parsed = parseCSV(cur.text);
+    const idx = parsed.findIndex((r) => r.id === wid);
+    if (idx < 0) return `失败：该条已不在库中（可能已被删），请重查。`;
+    const [gone] = parsed.splice(idx, 1);
+    const header = Object.keys(parsed[0] ?? gone);
+    const esc = (v: string) => (/[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
+    const eol = cur.text.includes("\r\n") ? "\r\n" : "\n";
+    const next = header.map(esc).join(",") + eol
+      + parsed.map((r) => header.map((h) => esc(r[h] ?? "")).join(",")).join(eol) + eol;
+    try {
+      await ghPutFile(env, path, next, cur.sha || "", `bot: delete ${wid} via ${actor}`);
+      invalidateCache(sql, path);
+      return `已删 ${wid}（${gone.date} ${gone.type}）。删错了可在 GitHub 上 revert 这次提交。`;
+    } catch (e) {
+      const msg = String((e as Error).message || e);
+      if (!msg.startsWith("Conflict:") || attempt === 1) {
+        return `失败：写回异常（${msg.slice(0, 120)}），我已重试过，请稍后再试。`;
+      }
+    }
+  }
+  return "失败：连续冲突，请稍后再试。";
+}
+
+/** append_workout 工具（两阶段）：纯文字补录，如“昨天跑了5km帮我记上”。 */
+export async function toolAppendWorkout(
+  env: Env, all: Row[],
+  args: {
+    type?: string; date?: string; distance_m?: number; duration_s?: number;
+    avg_hr?: number; calories?: number; steps?: number; cadence?: number;
+    confirmed?: boolean;
+  },
+  sql?: SqlTag,
+): Promise<string> {
+  void all;
+  if (!env.GH_PAT) {
+    return "失败：写库未授权（Worker 缺 GH_PAT，当前只读模式），补录做不了。";
+  }
+  const wtype = args.type || "outdoor_running";
+  if (!WORKOUT_TYPES.includes(wtype)) {
+    return `失败：type 只能是 ${WORKOUT_TYPES.join("/")}，不确定就空着（默认 outdoor_running）。`;
+  }
+  const today = new Date(Date.now() + 8 * 36e5).toISOString().slice(0, 10);
+  const date = args.date || today;
+  if (!DATE_RE.test(date)) {
+    return `日期格式不对（${args.date}），必须用 YYYY-MM-DD，例如 ${today}。`;
+  }
+  const distM = Math.trunc(Number(args.distance_m) || 0);
+  const dur = Math.trunc(Number(args.duration_s) || 0);
+  if (distM <= 0 && dur <= 0) {
+    return "失败：距离和时长至少要给一个能用的数字（distance_m 单位米，duration_s 单位秒）。";
+  }
+  const startUtc = Math.floor(Date.parse(`${date}T12:00:00+08:00`) / 1000);
+  const numOr = (v: unknown) => (v == null || v === "" ? "" : String(Math.trunc(Number(v) || 0)));
+  const row: Record<string, string> = {
+    id: `manual-${startUtc}-${wtype}-${distM}`,
+    date,
+    start_utc: String(startUtc),
+    start_beijing: `${date} 12:00:00 +08:00`,
+    end_utc: String(startUtc + dur),
+    end_beijing: `${date} 12:${String(Math.floor(dur / 60)).padStart(2, "0")}:${String(dur % 60).padStart(2, "0")} +08:00`,
+    type: wtype, category: wtype,
+    distance_m: distM ? String(distM) : "", duration_s: dur ? String(dur) : "",
+    avg_pace_s: "", max_pace_s: "", avg_speed: "", max_speed: "",
+    avg_hr: numOr(args.avg_hr), max_hr: "", min_hr: "",
+    calories: numOr(args.calories), steps: numOr(args.steps), cadence: numOr(args.cadence),
+    avg_stride: "", total_climbing: "",
+    uid_hash: "", sid_hash: "",
+    has_track: "0", source: "manual",
+    confidence: "1.0",
+    value_json: JSON.stringify({ manual: { type: wtype, date, distance_m: distM, duration_s: dur } }),
+  };
+  if (!args.confirmed) {
+    return `预览（尚未写入）：${date} ${wtype} ${distM ? distM / 1000 + "km" : "距离未知"}/${dur ? dur + "s" : "时长未知"}`
+      + "（纯文字补录，无轨迹）。得到用户明确说“确认”后，再用完全相同参数带 confirmed=true 调一次。";
+  }
+  const path = await appendRow(env, row, "think-agent", sql);
+  void path;
+  return `已补录：${date} ${wtype} ${distM ? distM / 1000 + "km" : ""}${dur ? "/" + dur + "s" : ""}（id=${row.id}）。`;
+}
+
+/** stats_workouts 工具：按月/年聚合，替代把几百行全拉回来的查法。 */
+export function toolStatsWorkouts(
+  all: Row[],
+  args: { group_by?: string; type?: string; date_from?: string; date_to?: string },
+): string {
+  const dateErr = checkDates(args);
+  if (dateErr) return dateErr;
+  const mode = args.group_by === "year" ? "year" : "month";
+  const len = mode === "year" ? 4 : 7;
+  const groups = new Map<string, Row[]>();
+  for (const r of all) {
+    if (args.type && r.type !== args.type) continue;
+    if (args.date_from && (r.date || "") < args.date_from) continue;
+    if (args.date_to && (r.date || "") > args.date_to) continue;
+    const k = (r.date || "").slice(0, len);
+    if (!/^\d/.test(k)) continue;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(r);
+  }
+  if (groups.size > 36) {
+    return `区间太大（${groups.size} 个${mode === "year" ? "年" : "月"}），请缩小 date_from/date_to 再查。`;
+  }
+  const out = [...groups.entries()].sort().map(([k, rs]) => {
+    const runs = rs.filter((r) => RUN_TYPES.includes(r.type || ""));
+    const pd = runs.reduce((a, w) => a + num(w.distance_m), 0);
+    const pt = runs.reduce((a, w) => a + num(w.duration_s), 0);
+    const hrs = runs.map((w) => num(w.avg_hr)).filter((x) => x);
+    return {
+      period: k, count: rs.length,
+      run_count: runs.length, run_km: +(pd / 1000).toFixed(1),
+      avg_pace: pd > 0 && pt > 0 ? fmtPace(pt / (pd / 1000)) : null,
+      avg_hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
+    };
+  });
+  return JSON.stringify({ total_periods: out.length, rows: out });
 }

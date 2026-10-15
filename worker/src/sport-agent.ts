@@ -7,7 +7,9 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
 import {
-  buildProfile, loadWorkouts, toolGetSummary, toolQueryWorkouts, toolUpdateWorkout,
+  WORKOUT_TYPES, buildProfile, loadWorkouts,
+  toolAppendWorkout, toolDeleteWorkout, toolGetSummary, toolQueryWorkouts,
+  toolStatsWorkouts, toolUpdateWorkout,
   type SqlTag,
 } from "./github";
 
@@ -27,11 +29,11 @@ const RULES_BLOCK =
   + "用户问具体某条、某天、某月、某年、最早/最晚、最多/最少时，"
   + "必须先调 query_workouts（配好 date_from/date_to/type，找最早用 sort=oldest），"
   + "拿到工具结果再回答；绝不允许凭印象说不知道；工具能查到的，以工具为准。"
-  + "【改库铁律】用户说改数时分两步：先调 query_workouts 找到 id，再不带 confirmed 调 update_workout"
-  + "拿预览diff念给用户；用户明确说“确认”后，再用相同 id+fields 带 confirmed=true 调一次才写入。"
+  + "【改库铁律】改数、删除、补录统一分两步：先调对应工具（update/delete/append_workout）不带 confirmed"
+  + "拿预览diff念给用户；用户明确说“确认”后，再用相同参数带 confirmed=true 调一次才写入。"
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；"
   + "白名单外的字段、找不到的记录，明说做不到或找不到，让用户确认，不擅自发挥。"
-  + "【工具边界】运动数据只许用 get_summary/query_workouts/update_workout 三个工具读写；"
+  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/update_workout/delete_workout/append_workout 六个工具读写；"
   + "workspace 的文件工具（读写删改查）一律不许碰，数据不在那里。"
 
 export class SportDbAgent extends Think<Env> {
@@ -62,6 +64,8 @@ export class SportDbAgent extends Think<Env> {
     // 思考档 xhigh：经 AI SDK providerOptions 透传给 OpenAI-compatible 网关。
     // 注：实测当前网关收下该参数但用量无变化（档位实际由网关/模型侧决定），
     // 留在这里等网关生效，不影响现有行为。
+    // 输出 token 不设限：推理模型先烧 token 再答，上限会直接腰斩长回复。
+    // 真要控成本应该换档位/换模型，而不是砍上限。
     return { providerOptions: { openai: { reasoningEffort: "xhigh" as const } } };
   }
 
@@ -127,7 +131,7 @@ export class SportDbAgent extends Think<Env> {
       query_workouts: tool({
         description: "按条件查原始记录明细（含id）。改数据前必须先查到id；找最早记录用sort=oldest。type 只能从枚举里选，不确定就空着别填。",
         inputSchema: z.object({
-          type: z.enum(["outdoor_running", "indoor_running", "outdoor_run_class", "outdoor_riding", "indoor_riding", "outdoor_walking", "pool_swimming", "free_training", "rope_skipping"]).optional(),
+          type: z.enum(WORKOUT_TYPES as [string, ...string[]]).optional(),
           date_from: z.string().optional(),
           date_to: z.string().optional(),
           sort: z.enum(["latest", "oldest"]).default("latest"),
@@ -148,6 +152,48 @@ export class SportDbAgent extends Think<Env> {
         execute: async (args: { id: string; fields: Record<string, string | number>; confirmed?: boolean }) => {
           const all = await loadWorkouts(env, sql);
           return toolUpdateWorkout(env, all, "think-agent", args, sql);
+        },
+      }),
+      delete_workout: tool({
+        description: "按id删一条记录，分两步：先不带confirmed调一次拿预览念给用户，用户明确说确认删除后，再带confirmed=true调一次。删后git可revert。",
+        inputSchema: z.object({
+          id: z.string(),
+          confirmed: z.boolean().default(false),
+        }),
+        execute: async (args: { id: string; confirmed?: boolean }) => {
+          const all = await loadWorkouts(env, sql);
+          return toolDeleteWorkout(env, all, "think-agent", args, sql);
+        },
+      }),
+      append_workout: tool({
+        description: "纯文字补录一条运动（如昨天跑了5km），分两步：先不带confirmed拿预览，用户确认后再带confirmed=true写入。type从枚举选，date用YYYY-MM-DD，distance_m单位米，duration_s单位秒。",
+        inputSchema: z.object({
+          type: z.enum(WORKOUT_TYPES as [string, ...string[]]).default("outdoor_running"),
+          date: z.string().optional(),
+          distance_m: z.number().optional(),
+          duration_s: z.number().optional(),
+          avg_hr: z.number().optional(),
+          calories: z.number().optional(),
+          steps: z.number().optional(),
+          cadence: z.number().optional(),
+          confirmed: z.boolean().default(false),
+        }),
+        execute: async (args: { type?: string; date?: string; distance_m?: number; duration_s?: number; avg_hr?: number; calories?: number; steps?: number; cadence?: number; confirmed?: boolean }) => {
+          const all = await loadWorkouts(env, sql);
+          return toolAppendWorkout(env, all, args, sql);
+        },
+      }),
+      stats_workouts: tool({
+        description: "按月或按年聚合统计（次数/跑量/均配速/均心率），查跨度统计用它，别把几百行全拉回来。",
+        inputSchema: z.object({
+          group_by: z.enum(["month", "year"]).default("month"),
+          type: z.enum(WORKOUT_TYPES as [string, ...string[]]).optional(),
+          date_from: z.string().optional(),
+          date_to: z.string().optional(),
+        }),
+        execute: async (args: { group_by?: string; type?: string; date_from?: string; date_to?: string }) => {
+          const all = await loadWorkouts(env, sql);
+          return toolStatsWorkouts(all, args);
         },
       }),
     };
