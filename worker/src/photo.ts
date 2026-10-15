@@ -103,6 +103,7 @@ function b64Bytes(buf: ArrayBuffer): string {
 export async function recognizePhoto(env: Env, imgUrl: string): Promise<VisionRec> {
   const body = {
     model: env.VISION_MODEL || "muse-spark-1.3-contributor-free",
+    reasoning_effort: "xhigh",
     messages: [{
       role: "user",
       content: [

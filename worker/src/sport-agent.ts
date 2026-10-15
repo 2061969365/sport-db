@@ -46,6 +46,13 @@ export class SportDbAgent extends Think<Env> {
     return COACH_SYS;
   }
 
+  beforeTurn() {
+    // 思考档 xhigh：经 AI SDK providerOptions 透传给 OpenAI-compatible 网关。
+    // 注：实测当前网关收下该参数但用量无变化（档位实际由网关/模型侧决定），
+    // 留在这里等网关生效，不影响现有行为。
+    return { providerOptions: { openai: { reasoningEffort: "xhigh" as const } } };
+  }
+
   configureContext() {
     // 不传 provider → 自动落 durable per-agent SQLite，且经 set_context 可写。
     // user_profile：认得“人”（目标/伤病/偏好）；coaching_notes：记得“事”（弱项/执行/下次提醒）。
