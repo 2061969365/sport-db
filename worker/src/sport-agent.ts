@@ -113,12 +113,12 @@ export class SportDbAgent extends Think<Env> {
 
   @callable()
   async claimUpdate(updateId: string): Promise<boolean> {    // TG/飞书重推去重：同实例单线程，先查后写足够；顺带清 7 天前的旧键。
-    const sql = this.sql as unknown as SqlTag;
-    sql`CREATE TABLE IF NOT EXISTS processed_updates (id TEXT PRIMARY KEY, at INTEGER)`;
-    const seen = sql`SELECT id FROM processed_updates WHERE id = ${updateId}` as { id: string }[];
+    // 注意：this.sql 必须以方法形式调用（this.sql`...`），摘出来存变量再调会丢 receiver。
+    this.sql`CREATE TABLE IF NOT EXISTS processed_updates (id TEXT PRIMARY KEY, at INTEGER)`;
+    const seen = this.sql`SELECT id FROM processed_updates WHERE id = ${updateId}` as { id: string }[];
     if (seen.length) return false;
-    sql`DELETE FROM processed_updates WHERE at < ${Date.now() - 7 * 864e5}`;
-    sql`INSERT INTO processed_updates(id, at) VALUES (${updateId}, ${Date.now()})`;
+    this.sql`DELETE FROM processed_updates WHERE at < ${Date.now() - 7 * 864e5}`;
+    this.sql`INSERT INTO processed_updates(id, at) VALUES (${updateId}, ${Date.now()})`;
     return true;
   }
 
@@ -156,25 +156,26 @@ export class SportDbAgent extends Think<Env> {
   @callable()
   async checkQuota(session: string): Promise<boolean> {
     // /api/chat 限流：每会话每小时 60 轮，超了返回 false（公开端点防刷）。
-    const sql = this.sql as unknown as SqlTag;
-    sql`CREATE TABLE IF NOT EXISTS chat_quota (session TEXT PRIMARY KEY, window_start INTEGER, count INTEGER)`;
+    this.sql`CREATE TABLE IF NOT EXISTS chat_quota (session TEXT PRIMARY KEY, window_start INTEGER, count INTEGER)`;
     const now = Date.now();
-    const rows = sql`SELECT window_start, count FROM chat_quota WHERE session = ${session}` as
+    const rows = this.sql`SELECT window_start, count FROM chat_quota WHERE session = ${session}` as
       { window_start: number; count: number }[];
     if (!rows.length || now - rows[0].window_start > 3600000) {
-      sql`INSERT OR REPLACE INTO chat_quota(session, window_start, count) VALUES (${session}, ${now}, 1)`;
+      this.sql`INSERT OR REPLACE INTO chat_quota(session, window_start, count) VALUES (${session}, ${now}, 1)`;
       return true;
     }
     if (rows[0].count >= 60) return false;
-    sql`UPDATE chat_quota SET count = ${rows[0].count + 1} WHERE session = ${session}`;
+    this.sql`UPDATE chat_quota SET count = ${rows[0].count + 1} WHERE session = ${session}`;
     return true;
   }
 
   getTools() {
     const env = this.env;
-    // this.sql 是实例方法，转手必须 bind，否则内部 this.ctx 丢失
-    // （线上曾报 Cannot read properties of undefined (reading 'ctx')）。
-    const sql = (this.sql as unknown as SqlTag).bind(this);
+    // 传给工具的 sql 必须是箭头闭包，每次以方法形式调 this.sql，
+    // 摘出来存变量（哪怕 bind 过）也可能丢内部上下文，线上实测过坑。
+    const self = this;
+    const sql: SqlTag = (s, ...a) =>
+      (self.sql(s as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
     return {
       get_summary: tool({
         description: "查近N天分项画像（跑步/骑行分开）。任何分项或天数问题都先调它或 query_workouts，不许凭记忆答。",
