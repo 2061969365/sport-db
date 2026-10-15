@@ -373,6 +373,12 @@ function stringifyCSV(head, rows) {
 }
 
 async function toolUpdateWorkout(env, all, actor, args) {
+  if (!env.GH_PAT) {
+    return "失败：写库未授权（Worker 缺 GH_PAT，当前只读模式）。"
+      + "请明确告诉用户：改数功能需要先配好写权限——去 GitHub 建细粒度 PAT"
+      + "（仅 sport-db 的 Contents 读写），再 wrangler secret put GH_PAT；"
+      + "配好之前不要让用户重复发送同样的改数指令。";
+  }
   const wid = String(args.id || "").trim();
   const fields = args.fields || {};
   if (!wid || typeof fields !== "object" || !Object.keys(fields).length) {
