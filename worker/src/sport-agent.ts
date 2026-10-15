@@ -112,8 +112,7 @@ export class SportDbAgent extends Think<Env> {
   }
 
   @callable()
-  async claimUpdate(updateId: string): Promise<boolean> {
-    // TG/飞书重推去重：同实例单线程，先查后写足够；顺带清 7 天前的旧键。
+  async claimUpdate(updateId: string): Promise<boolean> {    // TG/飞书重推去重：同实例单线程，先查后写足够；顺带清 7 天前的旧键。
     const sql = this.sql as unknown as SqlTag;
     sql`CREATE TABLE IF NOT EXISTS processed_updates (id TEXT PRIMARY KEY, at INTEGER)`;
     const seen = sql`SELECT id FROM processed_updates WHERE id = ${updateId}` as { id: string }[];
@@ -121,6 +120,37 @@ export class SportDbAgent extends Think<Env> {
     sql`DELETE FROM processed_updates WHERE at < ${Date.now() - 7 * 864e5}`;
     sql`INSERT INTO processed_updates(id, at) VALUES (${updateId}, ${Date.now()})`;
     return true;
+  }
+
+  @callable()
+  async status(): Promise<string> {
+    // 上下文水位：消息条数 + 文本估算 token + 记忆块大小。不调模型，零 token 开销。
+    const textOf = (m: unknown): string => {
+      const parts = (m as { parts?: { type?: string; text?: string }[] }).parts;
+      if (!Array.isArray(parts)) return "";
+      return parts.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("");
+    };
+    const est = (s: string) => Math.round(s.length / 3);
+    const messages = await this.getMessages().catch(() => []);
+    const msgChars = messages.reduce((a, m) => a + textOf(m).length, 0);
+    // 直接读 context 的 blocks（失败则显示读取失败，不编数字）
+    let blockLines = "读取失败";
+    try {
+      const ctx = this.context as {
+        getBlocks?: () => { label?: string; content?: string }[];
+      };
+      const bs = ctx.getBlocks?.() ?? [];
+      blockLines = bs.length
+        ? bs.map((b) => `${b.label ?? "?"}: 约${est(String(b.content ?? ""))}tk`).join("；")
+        : "空";
+    } catch {
+      blockLines = "读取失败";
+    }
+    return `上下文水位（估算，中文按3字≈1tk）：\n`
+      + `消息 ${messages.length} 条，约${est(messages.reduce((a, m) => a + textOf(m), ""))}tk\n`
+      + `记忆块：${blockLines}\n`
+      + `窗口上限 400k，输出上限 50k；满了发 /new 另起（画像保留）。\n`
+      + `（msgChars=${msgChars} 供调试）`;
   }
 
   getTools() {

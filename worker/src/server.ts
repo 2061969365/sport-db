@@ -105,6 +105,15 @@ export default {
       } catch {
         /* 认领失败不挡路，继续处理 */
       }
+      if (text === "/status" || text === "水位" || text === "上下文") {
+        try {
+          const agent = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
+          await tgSend(env, chatId, await agent.status());
+        } catch (e) {
+          await tgSend(env, chatId, `水位读取失败（${(e as Error).message}）。`);
+        }
+        return new Response("ok");
+      }
       if (text === "/new" || text === "重新开始" || text === "新对话") {
         try {
           const agent = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
