@@ -13,8 +13,9 @@ import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
   toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout,
-  toolGetSummary, toolListReview, toolQueryWorkouts, toolRecords,
-  toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout,
+  toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts,
+  toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends,
+  toolUpdateWorkout, toolWritePlan,
   type SqlTag,
 } from "./github";
 
@@ -57,10 +58,15 @@ const RULES_BLOCK =
   + "拿预览diff念给用户；用户明确说“确认”后，再用相同参数带 confirmed=true 调一次才写入。"
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；"
   + "白名单外的字段、找不到的记录，明说做不到或找不到，让用户确认，不擅自发挥。"
-  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/trends/records/compare_periods/streaks/update_workout/delete_workout/append_workout/list_review/confirm_review 十二个工具读写；"
-  + "另外有 current_time（现在几点/算日期）、weather（天气）、web_search（联网搜索）、fetch_url（抓网页）四个外部工具可用，"
-  + "这些是查外部信息的唯一途径，不许假装搜过。"
-  + "workspace 的文件工具（读写删改查）一律不许碰，数据不在那里。"
+  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/trends/records/compare_periods/streaks/update_workout/delete_workout/append_workout/list_review/confirm_review 十二个数据工具读写；"
+  + "另外有 current_time（时间）、weather（天气）、web_search（联网检索）、fetch_url（抓网页）、"
+  + "list_repo_dir / read_repo_file / write_plan（看/写仓库里的日报·计划文件）、"
+  + "set_reminder / list_reminders / cancel_reminder（定时提醒）这些工具可用，都是查外部信息或存计划的正路，不许假装用过。"
+  + "workspace 的内置文件工具（读写删改查 + bash）一律不许碰：数据不在那里，要用文件就走 list_repo_dir/read_repo_file/write_plan。"
+  + "【计划留存】给用户排好完整计划后，主动问一句要不要存进仓里；用户同意就用 write_plan 写到 plans/ 下（两步确认），"
+  + "以后他要「我的计划」就读出来，别凭记忆复述。"
+  + "【提醒】用户说「提醒我」「到点叫我」就用 set_reminder；时间先用 current_time 确认，"
+  + "相对时间用 +2h/+1d，固定每天用 cron（如每天 7 点 = 0 7 * * *）。"
   + "【计划纪律】用户要训练计划/让他别受伤/问接下来怎么练时，按这个顺序做，不许跳步："
   + "①先调 current_time 确认今天日期（算「下周六」「还有几天」必须用它，不许自己猜）；"
   + "②调 get_summary 和 trends 看真实训练量与近期强度，别拿旧记忆当现状；"
@@ -133,6 +139,82 @@ export class SportDbAgent extends Think<Env> {
     });
     session.compactAfter(320_000);
     return session;
+  }
+
+  /** 提醒到点：由调度器调用，把话推到当前通道。 */
+  async fireReminder(payload: { text?: string; once?: boolean; id?: string }): Promise<void> {
+    const text = String(payload?.text || "").trim() || "该训练了。";
+    try {
+      const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
+        { channel?: string; chat_id?: string }[];
+      const channel = tv[0]?.channel || "";
+      const chatId = tv[0]?.chat_id || "";
+      const body = `⏰ 提醒：${text}`;
+      if (channel === "tg" && chatId) await tgSend(this.env, chatId, body);
+      else if (channel === "feishu" && chatId) await feishuSend(this.env, chatId, body);
+      if (payload?.once && payload?.id) {
+        this.sql`DELETE FROM reminders WHERE id = ${payload.id}`;
+      }
+      this.sql`INSERT OR REPLACE INTO reminder_log(id, text, at) VALUES (${payload?.id || "?"}, ${text}, ${Date.now()})`;
+    } catch (e) {
+      console.error("[fireReminder-fail]", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** 设置提醒（工具用）：支持 ISO 时间、+30m/+2h/+1d 相对量、5 段 cron。 */
+  @callable()
+  async addReminder(when: string, text: string): Promise<string> {
+    const spec = String(when || "").trim();
+    const body = String(text || "").trim();
+    if (!body) return "失败：提醒内容不能为空。";
+    this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
+    let target: Date | string;
+    let kind = "once";
+    const rel = spec.match(/^\+(\d+)([mhd])$/i);
+    if (rel) {
+      const mul = rel[2].toLowerCase() === "m" ? 60_000 : rel[2].toLowerCase() === "h" ? 3_600_000 : 86_400_000;
+      target = new Date(Date.now() + Number(rel[1]) * mul);
+    } else if (/^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/.test(spec)) {
+      target = spec; // 5 段 cron
+      kind = "cron";
+    } else {
+      let iso = spec.replace(" ", "T");
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(iso)) iso += "+08:00"; // 无时区按北京时间
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) {
+        return `失败：时间格式认不出（${spec}）。用「2026-10-17 07:00」或「+2h」或 cron「0 7 * * *」。`;
+      }
+      if (d.getTime() < Date.now() - 60_000) {
+        return `失败：${spec} 是过去的时间，重新确认一下（今天日期先用 current_time 查）。`;
+      }
+      target = d;
+    }
+    const s = await this.schedule(target, "fireReminder", { text: body, once: kind === "once" },
+      { idempotent: kind !== "once" });
+    const id = String(s?.id || "");
+    const whenText = typeof target === "string" ? target : target.toISOString();
+    this.sql`INSERT OR REPLACE INTO reminders(id, when_spec, text, kind, at) VALUES (${id}, ${whenText}, ${body}, ${kind}, ${Date.now()})`;
+    return `已设定提醒（id=${id}）：${kind === "cron" ? `按周期 ${whenText}` : whenText} 推送「${body}」。`;
+  }
+
+  /** 列出/取消提醒。 */
+  @callable()
+  async listReminders(): Promise<string> {
+    this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
+    const rows = this.sql`SELECT id, when_spec, text, kind FROM reminders ORDER BY at DESC LIMIT 20` as
+      { id: string; when_spec: string; text: string; kind: string }[];
+    if (!rows.length) return "当前没有提醒。";
+    return rows.map((r) => `${r.id}｜${r.kind === "cron" ? "周期" : "一次性"} ${r.when_spec}｜${r.text}`).join("\n");
+  }
+
+  @callable()
+  async cancelReminder(id: string): Promise<string> {
+    const rid = String(id || "").trim();
+    if (!rid) return "失败：要给 id（先 list_reminders 查）。";
+    this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
+    this.sql`DELETE FROM reminders WHERE id = ${rid}`;
+    await this.cancelSchedule(rid).catch(() => null);
+    return `已取消提醒 ${rid}。`;
   }
 
   /** 记住这条会话的回复去处：异步 turn 完成后由 onChatResponse 推回去。 */
@@ -454,6 +536,49 @@ export class SportDbAgent extends Think<Env> {
           max_chars: z.number().int().min(500).max(8000).default(4000),
         }),
         execute: async (args: { url?: string; max_chars?: number }) => toolFetchUrl(env, args),
+      }),
+      list_repo_dir: tool({
+        description: "列数据仓里的目录（只读）：plans/ 训练计划、reports/daily/ 每日报告、data/ 数据、docs/ 文档。想知道有什么文件时用它。",
+        inputSchema: z.object({ path: z.string() }),
+        execute: async ({ path }: { path?: string }) => toolListDir(env, path || ""),
+      }),
+      read_repo_file: tool({
+        description: "读数据仓里的文本文件（日报、计划、文档、CSV）。用户问「我的计划呢」「昨天的日报」就用它。",
+        inputSchema: z.object({
+          path: z.string(),
+          max_chars: z.number().int().min(500).max(20000).default(6000),
+        }),
+        execute: async (args: { path?: string; max_chars?: number }) =>
+          toolReadRepoFile(env, args.path || "", args.max_chars ?? 6000),
+      }),
+      write_plan: tool({
+        description: "把训练计划/长期笔记写进仓里的 plans/*.md（两步：先预览，用户确认后带 confirmed=true 再调一次）。只写 plans/，运动数据别用这个改。",
+        inputSchema: z.object({
+          path: z.string(),
+          content: z.string(),
+          confirmed: z.boolean().default(false),
+        }),
+        execute: async (args: { path?: string; content?: string; confirmed?: boolean }) =>
+          toolWritePlan(env, args.path || "", args.content || "", !!args.confirmed, "think-agent", sql),
+      }),
+      set_reminder: tool({
+        description: "设定时提醒（到点自动推消息给用户）：支持「2026-10-17 07:00」「+2h」「+1d」或 cron「0 7 * * *」（每天 7 点）。用户说「明天提醒我跑间歇」就用它。",
+        inputSchema: z.object({
+          when: z.string(),
+          text: z.string(),
+        }),
+        execute: async ({ when, text }: { when?: string; text?: string }) =>
+          self.addReminder(when || "", text || ""),
+      }),
+      list_reminders: tool({
+        description: "列出已设的提醒（含 id）。用户问「我设了哪些提醒」用它。",
+        inputSchema: z.object({}),
+        execute: async () => self.listReminders(),
+      }),
+      cancel_reminder: tool({
+        description: "按 id 取消提醒（先 list_reminders 拿 id）。",
+        inputSchema: z.object({ id: z.string() }),
+        execute: async ({ id }: { id?: string }) => self.cancelReminder(id || ""),
       }),
     };
   }

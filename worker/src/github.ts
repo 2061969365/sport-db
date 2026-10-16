@@ -705,6 +705,71 @@ export async function toolAppendWorkout(
   return `已补录：${date} ${wtype} ${distM ? distM / 1000 + "km" : ""}${dur ? "/" + dur + "s" : ""}（id=${row.id}）。`;
 }
 
+/** 仓库内文件路径白名单：只允许相对路径 + 常见字符，挡掉 ../ 与绝对路径。 */
+function safeRepoPath(p: string): string | null {
+  const path = String(p || "").trim().replace(/^\/+/, "");
+  if (!path || path.length > 200) return null;
+  if (path.includes("..") || path.includes("//")) return null;
+  if (!/^[A-Za-z0-9._\-\/]+$/.test(path)) return null;
+  return path;
+}
+
+/** list_repo_dir：列仓库目录（只读），用来看 plans/、reports/daily/、data/ 里有什么。 */
+export async function toolListDir(env: Env, dir: string): Promise<string> {
+  const path = safeRepoPath(dir);
+  if (path === null) return "失败：目录路径不合法（用相对路径，如 plans 或 reports/daily）。";
+  if (!env.GH_PAT) return "失败：列目录需要 GH_PAT。";
+  const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/${path}?ref=main`, {
+    headers: ghHeaders(env),
+  }).catch(() => null);
+  if (!r) return "失败：列目录异常，稍后再试。";
+  if (r.status === 404) return `目录 ${path} 不存在（或为空）。`;
+  if (!r.ok) return `失败：列目录 ${r.status}。`;
+  const list = (await r.json()) as { path?: string; type?: string; size?: number }[];
+  if (!Array.isArray(list)) return `失败：${path} 是文件不是目录，用 read_repo_file 读它。`;
+  const rows = list.slice(0, 100).map((e) =>
+    `${e.type === "dir" ? "📁" : "📄"} ${e.path}${e.type === "file" ? ` (${e.size ?? 0}B)` : ""}`);
+  return `${path} 下 ${list.length} 项：\n${rows.join("\n")}`;
+}
+
+/** read_repo_file：读仓库里的文本文件（日报、文档、计划、CSV 都行）。 */
+export async function toolReadRepoFile(env: Env, file: string, maxChars = 6000): Promise<string> {
+  const path = safeRepoPath(file);
+  if (path === null) return "失败：文件路径不合法。";
+  let mc = Math.trunc(Number(maxChars) || 6000);
+  if (!Number.isFinite(mc)) mc = 6000;
+  mc = Math.min(20000, Math.max(500, mc));
+  const g = await ghGetFile(env, path).catch(() => null);
+  if (!g?.text) return `失败：读不到 ${path}（不存在，或是图片等二进制文件）。`;
+  const text = g.text.slice(0, mc);
+  return `${path}（共 ${g.text.length} 字符，已给前 ${text.length}）：\n${text}`
+    + (text.length >= mc ? "\n…（截断，需要更多可提高 max_chars）" : "");
+}
+
+/** write_plan：把训练计划写进 plans/（两阶段确认）。只允许写这个目录，绝不碰 data/。 */
+export async function toolWritePlan(
+  env: Env, file: string, content: string, confirmed: boolean, actor: string, sql?: SqlTag,
+): Promise<string> {
+  if (!env.GH_PAT) return "失败：写库未授权（缺 GH_PAT）。";
+  const path = safeRepoPath(file);
+  if (path === null) return "失败：文件路径不合法（示例：plans/2026-11-half-marathon.md）。";
+  if (!path.startsWith("plans/") || !path.endsWith(".md")) {
+    return "失败：只能写 plans/ 下的 .md 文件，运动数据不在这里改。";
+  }
+  const body = String(content || "");
+  if (body.length < 20) return "失败：内容太短，像是没写完，先把完整计划写出来。";
+  if (body.length > 60000) return "失败：内容太长（>6 万字符），拆成多个文件。";
+  const cur = await ghGetFile(env, path).catch(() => null);
+  if (!confirmed) {
+    return `预览（尚未写入）：${cur ? "覆盖" : "新建"} ${path}，共 ${body.length} 字符。`
+      + `开头：${body.slice(0, 120).replace(/\n/g, " ")}…\n`
+      + "得到用户明确说“确认”后，再用相同 path+content 带 confirmed=true 调一次。";
+  }
+  await ghPutFile(env, path, body, cur?.sha || "", `bot: plan ${path} via ${actor}`);
+  invalidateCache(sql, path);
+  return `已${cur ? "更新" : "新建"} ${path}（${body.length} 字符）。以后用户问“我的计划呢”就用 read_repo_file 读它。`;
+}
+
 /** stats_workouts 工具：按月/年聚合，替代把几百行全拉回来的查法。 */
 export function toolStatsWorkouts(
   all: Row[],

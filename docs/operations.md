@@ -25,7 +25,14 @@ npx wrangler secret put GH_PAT         # 细粒度 PAT，只给该仓 Contents �
 # 飞书（可选，尚未启用）：FEISHU_APP_ID / FEISHU_APP_SECRET
 ```
 
-非密钥在 `wrangler.toml` 的 `[vars]`：`REPO` / `VISION_ENDPOINT` / `VISION_MODEL`。
+非密钥在 `wrangler.toml` 的 `[vars]`：`REPO` / `VISION_ENDPOINT` / `VISION_MODEL`
+/ 可选 `HOME_CITY`（天气工具的默认城市）。
+
+可选增强（不配也能跑）：
+
+```bash
+npx wrangler secret put TAVILY_API_KEY  # 配了才有真正的全网搜索；不配只有维基兜底
+```
 
 ### 两个坑（都真踩过）
 
@@ -64,8 +71,16 @@ curl -X POST "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook" \
 ```
 
 `getWebhookInfo` 出现 `Read timeout expired` 属正常：复杂问题跑得久，Telegram
-等不及。**无害** —— 重推会被 `claimUpdate` 去重，不会重复执行、不会重复写库。
-想根治要改成异步 `submit` 模式（尚未做，属已知待办）。
+等不及。**无害** —— turn 是异步提交的，webhook 立刻返回 200，
+重推会被 `claimUpdate` 去重，答复由 `onChatResponse` 跑完后推回。
+
+### 为什么必须是异步（别改回同步）
+
+早期 `/tg` 与 `/api/chat` 都用 `runTurn(wait)` 同步等答复，实测**稳定在 80.7 秒
+断开连接**（要训练计划这类重问题必然超时），用户收到的是「什么都没有」。
+现在：webhook 提交后立刻 200 → DO 队列把 turn 跑完 → `onChatResponse` 把答复推回原通道；
+`/api/chat` 等 70 秒仍没完就返 `202 {pending,since}`，前端轮询 `/api/chat/result`。
+**别为了「代码简单」改回同步** —— 长问题必然丢答复。
 
 ## 工作流
 
@@ -90,6 +105,10 @@ daily ≥ 14000 的卫生下限）。早期写死 806/14082 的断言会在正�
 | 回「数据拉取失败」 | `REPO` 写错 / 分支不是 `main` / GitHub 限流（5000 次/小时） |
 | 回「模型接口 NNN」 | `VISION_ENDPOINT` 不可达或模型名不对 |
 | 回答像失忆 | 发 `/status` 看水位；涨太高发 `/new` |
+| 长问题（计划类）没回复 | 正常情况下 TG 会显示「正在输入」然后推答复；若始终没有，看 Worker 日志里的 `[onChatResponse-fail]` |
+| 搜索总说「没联网搜到」 | 免 Key 通用搜索被反爬拦（DDG/Mojeek 都拦），配 `TAVILY_API_KEY` 才有全网搜索 |
+| 天气工具说不知道城市 | 让用户说一次城市，或设 `HOME_CITY` var |
+| 答复开头粘一串「收到…我来帮你查」 | 模型在工具间隙输出了旁白。代码只取最后一次工具调用之后的文本；若又出现，检查 `notify.ts` 的 `finalReplyText` 分片判断 |
 | 改数没走两步确认 | 检查 `rules` 块是否完整（改 prompt 时最容易漏） |
 | SQL 报 `Cannot read properties of undefined (reading 'ctx')` | `this.sql` 被摘出来调用了，改成箭头闭包内以方法形式调 |
 
