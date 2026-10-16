@@ -25,14 +25,14 @@ test("铁律：失败必须如实说，不许把失败讲成没有数据", () =>
   assert.match(SRC, /绝不许编|不许编造|不编数据/, "防幻觉约束被删了");
 });
 
-test("工具集：22 个工具都注册了（少一个说明改坏了）", () => {
+test("工具集：23 个工具都注册了（少一个说明改坏了）", () => {
   const names = [
     "get_summary", "query_workouts", "stats_workouts", "trends", "records",
     "compare_periods", "streaks", "update_workout", "delete_workout",
     "append_workout", "list_review", "confirm_review",
     "current_time", "weather", "web_search", "fetch_url",
     "list_repo_dir", "read_repo_file", "write_plan",
-    "set_reminder", "list_reminders", "cancel_reminder",
+    "set_reminder", "list_reminders", "cancel_reminder", "coach_check",
   ];
   for (const n of names) {
     assert.ok(new RegExp(`\\b${n}:\\s*tool\\(`).test(SRC), `工具 ${n} 没注册`);
@@ -42,6 +42,12 @@ test("工具集：22 个工具都注册了（少一个说明改坏了）", () =>
 test("故障不静默：onChatError 兜底还在", () => {
   assert.match(SRC, /async onChatError\(/, "onChatError 没了 → 网关挂了用户会静默失联");
   assert.match(SRC, /模型服务这会儿不可用|模型服务不可用/, "故障提示文案没了");
+});
+
+test("主动教练：定时自查与每天最多打扰一次的闸门还在", () => {
+  assert.match(SRC, /scheduleEvery\(\s*6 \* 3600/, "主动自查的定时没挂上");
+  assert.match(SRC, /20 \* 3600_000/, "每天最多打扰一次的闸门被删了 → 会变骚扰");
+  assert.match(SRC, /channel !== "tg" && channel !== "feishu"/, "网页版不该走主动推送");
 });
 
 test("答复整形：丢掉工具调用间隙的旁白，只留最终答复", () => {

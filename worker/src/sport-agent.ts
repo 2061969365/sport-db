@@ -9,6 +9,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
 import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
+import { analyzeSignals } from "./proactive";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
@@ -286,6 +287,53 @@ export class SportDbAgent extends Think<Env> {
   async setReplyTarget(channel: string, chatId: string): Promise<void> {
     this.sql`CREATE TABLE IF NOT EXISTS reply_target (slot TEXT PRIMARY KEY, channel TEXT, chat_id TEXT, at INTEGER)`;
     this.sql`INSERT OR REPLACE INTO reply_target(slot, channel, chat_id, at) VALUES ('current', ${channel}, ${chatId}, ${Date.now()})`;
+    this.armProactive();
+  }
+
+  /** 挂上主动自查（幂等：同 callback+间隔+payload 只会存在一条）。 */
+  private armProactive(): void {
+    try {
+      void this.scheduleEvery(6 * 3600, "proactiveCheck", { v: 1 })
+        .catch((e) => console.error("[proactive-arm-fail]", String(e).slice(0, 120)));
+    } catch (e) {
+      console.error("[proactive-arm-fail]", String(e).slice(0, 120));
+    }
+  }
+
+  /**
+   * 主动教练：每 6 小时自查一次数据，**只在发现值得说的信号时**才开口，
+   * 且 20 小时内最多打扰一次。没有信号就静默返回（不花 token）。
+   */
+  async proactiveCheck(): Promise<void> {
+    try {
+      const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
+        { channel?: string; chat_id?: string }[];
+      const channel = tv[0]?.channel || "";
+      const chatId = tv[0]?.chat_id || "";
+      // 网页版没有主动推送通道：只在 TG/飞书开口
+      if (!chatId || (channel !== "tg" && channel !== "feishu")) return;
+
+      this.sql`CREATE TABLE IF NOT EXISTS proactive_log(id TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+      const last = this.sql`SELECT at FROM proactive_log ORDER BY at DESC LIMIT 1` as { at: number }[];
+      if (last.length && Date.now() - last[0].at < 20 * 3600_000) return;
+
+      // 注意：sql 必须是箭头闭包、以方法形式调 this.sql（bind/摘出来都会丢 ctx）
+      const self = this;
+      const sql: SqlTag = (s, ...a) =>
+        (self.sql(s as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
+      const all = await loadWorkouts(this.env, sql);
+      const signals = analyzeSignals(all).filter((s) => s.weight >= 55);
+      if (!signals.length) return;
+
+      const top = signals[0];
+      const body = `📣 教练提醒\n${top.text}`;
+      if (channel === "tg") await tgSend(this.env, chatId, body);
+      else await feishuSend(this.env, chatId, body);
+      this.sql`INSERT OR REPLACE INTO proactive_log(id, text, at) VALUES (${`${top.key}-${Date.now()}`}, ${body}, ${Date.now()})`;
+      console.log(`[proactive-sent weight=${top.weight}] ${top.key}`);
+    } catch (e) {
+      console.error("[proactive-fail]", e instanceof Error ? e.message : String(e));
+    }
   }
 
   /** 网页版轮询用：取 since 之后的最新回复。 */
@@ -655,6 +703,17 @@ export class SportDbAgent extends Think<Env> {
         }),
         execute: async (args: { path?: string; content?: string; confirmed?: boolean }) =>
           toolWritePlan(env, args.path || "", args.content || "", !!args.confirmed, "think-agent", sql),
+      }),
+      coach_check: tool({
+        description: "教练自查：看最近数据有没有值得提醒的事（中断、跑量突变、心率漂移、破月纪录）。用户问「我最近状态有什么问题」「我该注意什么」时用它；用户主动问就直接给结论，不用等他同意。",
+        inputSchema: z.object({}),
+        execute: async () => {
+          const all = await loadWorkouts(env, sql);
+          const signals = analyzeSignals(all);
+          if (!signals.length) return "自查结果：没有异常信号（训练连贯、跑量心率都正常）。不用编问题出来。";
+          return "自查发现以下信号（按重要度排序）：\n"
+            + signals.map((s) => `- [${s.weight}] ${s.key}\n  ${s.text}`).join("\n");
+        },
       }),
       set_reminder: tool({
         description: "设定时提醒（到点自动推消息给用户）：支持「2026-10-17 07:00」「+2h」「+1d」或 cron「0 7 * * *」（每天 7 点）。用户说「明天提醒我跑间歇」就用它。",
