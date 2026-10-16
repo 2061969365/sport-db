@@ -11,6 +11,7 @@ import type { Env } from "./env";
 import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
 import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
+import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import {
   NOTES_PATH, NOTES_SEED, PROFILE_PATH, PROFILE_SEED,
   profileShared, repoProfileProvider,
@@ -369,6 +370,7 @@ export class SportDbAgent extends Think<Env> {
   async onChatError(error: unknown, ctx?: { classification?: string }): Promise<unknown> {
     const raw = error instanceof Error ? error.message : String(error);
     console.error("[chat-error]", ctx?.classification || "", raw.slice(0, 300));
+    this.bumpMetrics({ errors: 1 });
     try {
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
@@ -393,8 +395,12 @@ export class SportDbAgent extends Think<Env> {
     return error;
   }
 
-  /** 每一步开始时刷新 TG「正在输入」：长 turn（计划类）期间让用户看到还在跑。 */
-  async onStepFinish(): Promise<void> {
+  /** 每一步开始时刷新 TG「正在输入」，顺便记 token/工具用量。 */
+  async onStepFinish(step?: unknown): Promise<void> {
+    try {
+      const u = extractUsage(step);
+      this.bumpMetrics({ inTok: u.inTok, outTok: u.outTok, toolCalls: u.toolCalls });
+    } catch { /* 记账失败不影响对话 */ }
     try {
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
@@ -402,6 +408,39 @@ export class SportDbAgent extends Think<Env> {
         await tgTyping(this.env, tv[0].chat_id);
       }
     } catch { /* 指示丢了无所谓 */ }
+  }
+
+  /** 用量落库（按天聚合，一次 upsert）。 */
+  private bumpMetrics(d: { inTok?: number; outTok?: number; toolCalls?: number; turns?: number; errors?: number }): void {
+    try {
+      this.sql`CREATE TABLE IF NOT EXISTS metrics_day (day TEXT PRIMARY KEY, turns INTEGER, errors INTEGER, in_tok INTEGER, out_tok INTEGER, tool_calls INTEGER, updated_at INTEGER)`;
+      const day = bjToday();
+      const turns = d.turns ?? 0, errors = d.errors ?? 0;
+      const inTok = d.inTok ?? 0, outTok = d.outTok ?? 0, toolCalls = d.toolCalls ?? 0;
+      this.sql`INSERT INTO metrics_day(day, turns, errors, in_tok, out_tok, tool_calls, updated_at)
+        VALUES (${day}, ${turns}, ${errors}, ${inTok}, ${outTok}, ${toolCalls}, ${Date.now()})
+        ON CONFLICT(day) DO UPDATE SET
+          turns = turns + ${turns},
+          errors = errors + ${errors},
+          in_tok = in_tok + ${inTok},
+          out_tok = out_tok + ${outTok},
+          tool_calls = tool_calls + ${toolCalls},
+          updated_at = ${Date.now()}`;
+    } catch (e) {
+      console.error("[metrics-fail]", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** 用量报表（/status 与 usage_stats 工具共用）。 */
+  @callable()
+  async usageReport(days = 7): Promise<string> {
+    let rows: DayMetric[] = [];
+    try {
+      this.sql`CREATE TABLE IF NOT EXISTS metrics_day (day TEXT PRIMARY KEY, turns INTEGER, errors INTEGER, in_tok INTEGER, out_tok INTEGER, tool_calls INTEGER, updated_at INTEGER)`;
+      const n = Math.min(30, Math.max(1, Math.trunc(Number(days) || 7)));
+      rows = (this.sql`SELECT day, turns, errors, in_tok, out_tok, tool_calls FROM metrics_day ORDER BY day DESC LIMIT ${n}` as unknown) as DayMetric[];
+    } catch { /* 表还没建 */ }
+    return formatUsage(rows, bjToday());
   }
 
   /**
@@ -425,7 +464,9 @@ export class SportDbAgent extends Think<Env> {
       const chatId = tv[0]?.chat_id || "";
 
       let text = finalReplyText(result).trim();
-      if (result?.status !== "completed" || !text) {
+      const ok = result?.status === "completed" && !!text;
+      this.bumpMetrics(ok ? { turns: 1 } : { turns: 1, errors: 1 });
+      if (!ok) {
         text = result?.status === "aborted"
           ? "这次被中断了（可能你发了 /new），有需要再问一次。"
           : `这次没处理成功（${String(result?.error || result?.status || "未知原因").slice(0, 160)}），换个问法或稍后再试。`;
@@ -527,10 +568,15 @@ export class SportDbAgent extends Think<Env> {
     } catch {
       blockLines = "读取失败";
     }
+    let usage = "";
+    try {
+      usage = "用量：" + (await this.usageReport(7)).split("\n").slice(0, 2).join("；");
+    } catch { /* 没记账就算了 */ }
     return `上下文水位（估算，中文按3字≈1tk）：\n`
       + `消息 ${messages.length} 条，约${est(messages.reduce((a, m) => a + textOf(m), ""))}tk\n`
       + `记忆块：${blockLines}\n`
       + `窗口上限 400k，输出上限 50k；满了发 /new 另起（画像保留）。\n`
+      + (usage ? usage + "\n" : "")
       + `（msgChars=${msgChars} 供调试）`;
   }
 
@@ -754,6 +800,11 @@ export class SportDbAgent extends Think<Env> {
           return "自查发现以下信号（按重要度排序）：\n"
             + signals.map((s) => `- [${s.weight}] ${s.key}\n  ${s.text}`).join("\n");
         },
+      }),
+      usage_stats: tool({
+        description: "看这个 agent 自己的用量：对话轮数、失败次数、token 消耗、工具调用次数。用户问「你花了多少」「你用得多不多」时用它。",
+        inputSchema: z.object({ days: z.number().int().min(1).max(30).default(7) }),
+        execute: async ({ days }: { days?: number }) => self.usageReport(days ?? 7),
       }),
       plan_save: tool({
         description: "把排好的训练计划存成结构化计划（可打卡、可看进度）。两步：先不带 confirmed 调一次拿预览，用户确认后再带 confirmed=true。计划必须按次给出日期。",
