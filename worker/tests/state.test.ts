@@ -1,7 +1,7 @@
 // 状态备份：提醒落仓 + 换账号后能恢复（哪些该重挂、哪些该清）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { REMINDERS_PATH, readStateJson, rearmPlan, stateLoc, writeStateJson } from "../src/state.ts";
+import { REMINDERS_PATH, mergeReminders, readStateJson, rearmPlan, stateLoc, writeStateJson } from "../src/state.ts";
 import { makeEnv } from "./helpers.ts";
 
 const NOW = Date.parse("2026-10-16T12:00:00+08:00");
@@ -82,4 +82,35 @@ test("恢复计划：空列表和脏数据都不炸", () => {
   assert.deepEqual(rearmPlan([], NOW).arm, []);
   const r = rearmPlan([{ id: "x", when: iso(10), kind: "once", text: "" }] as never[], NOW);
   assert.equal(r.arm.length, 0, "没内容的提醒不该被重挂");
+});
+
+test("属主隔离：别的会话的提醒不会被本会话恢复（防串台）", () => {
+  const items = [
+    { id: "tg1", when: iso(60), kind: "once", text: "TG 的提醒", owner: "tg-5896689604" },
+    { id: "web1", when: iso(60), kind: "once", text: "网页的提醒", owner: "pwa-abc12345" },
+  ] as never[];
+  const tg = rearmPlan(items, NOW, "tg-5896689604");
+  assert.deepEqual(tg.arm.map((x) => x.id), ["tg1"]);
+  const web = rearmPlan(items, NOW, "pwa-abc12345");
+  assert.deepEqual(web.arm.map((x) => x.id), ["web1"]);
+  const other = rearmPlan(items, NOW, "fs-someone");
+  assert.equal(other.arm.length, 0, "不相干的会话一条都不该挂");
+});
+
+test("合并：只替换自己的条目，别人的原样保留", () => {
+  const all = [
+    { id: "tg1", when: iso(60), kind: "once", text: "TG 的", owner: "tg-1" },
+    { id: "web1", when: iso(60), kind: "once", text: "网页的", owner: "pwa-2" },
+  ] as never[];
+  const mine = [{ id: "tg2", when: iso(120), kind: "once", text: "TG 新加的" }] as never[];
+  const merged = mergeReminders(all, mine, "tg-1");
+  assert.deepEqual(merged.map((r) => r.id).sort(), ["tg2", "web1"]);
+  assert.equal(merged.find((r) => r.id === "web1")?.owner, "pwa-2", "别人的属主不能被改");
+  assert.equal(merged.find((r) => r.id === "tg2")?.owner, "tg-1", "自己的条目要打上属主");
+});
+
+test("合并：自己取消光了也不会误删别人的提醒", () => {
+  const all = [{ id: "web1", when: iso(60), kind: "once", text: "网页的", owner: "pwa-2" }] as never[];
+  const merged = mergeReminders(all, [], "tg-1");
+  assert.deepEqual(merged.map((r) => r.id), ["web1"]);
 });

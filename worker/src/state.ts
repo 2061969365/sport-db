@@ -92,17 +92,33 @@ export interface ReminderState {
   when: string;
   kind: "once" | "cron";
   text: string;
+  /**
+   * 属主 = 这个提醒属于哪个会话实例（tg-<chatId> / pwa-<session> / fs-<chatId>）。
+   * 必须隔离：每个会话是独立 DO，启动时都会读这份文件；不隔离的话
+   * 网页版一开就会把 TG 的提醒重挂一遍、还推到错的通道。
+   */
+  owner?: string;
+}
+
+/** 把"我的提醒"合并进整份列表：只替换自己这个 owner 的条目，别人的原样保留。 */
+export function mergeReminders(
+  all: ReminderState[], mine: ReminderState[], owner: string,
+): ReminderState[] {
+  const others = all.filter((r) => (r.owner || "") !== owner);
+  return [...others, ...mine.map((r) => ({ ...r, owner }))];
 }
 
 /** 恢复计划：哪些要重新挂上调度、哪些已过期可以清掉。纯函数，便于测试。 */
 export function rearmPlan(
-  items: ReminderState[], now: number,
+  items: ReminderState[], now: number, owner?: string,
 ): { arm: ReminderState[]; drop: ReminderState[]; keep: ReminderState[] } {
   const arm: ReminderState[] = [];
   const drop: ReminderState[] = [];
   const keep: ReminderState[] = [];
   for (const it of items) {
     if (!it?.text) continue;
+    // 只看自己的：别的会话的提醒归它们自己恢复
+    if (owner !== undefined && (it.owner || "") !== owner) continue;
     if (it.kind === "cron") {
       arm.push(it); // 周期提醒永远有效
       continue;

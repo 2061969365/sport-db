@@ -13,7 +13,7 @@ import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import {
-  REMINDERS_PATH, readStateJson, rearmPlan, writeStateJson, type ReminderState,
+  REMINDERS_PATH, mergeReminders, readStateJson, rearmPlan, writeStateJson, type ReminderState,
 } from "./state";
 import {
   NOTES_PATH, NOTES_SEED, PROFILE_PATH, PROFILE_SEED,
@@ -273,20 +273,23 @@ export class SportDbAgent extends Think<Env> {
     return `已设定提醒（id=${id}）：${kind === "cron" ? `按周期 ${whenText}` : whenText} 推送「${body}」。`;
   }
 
-  /** 把提醒列表写进 state/reminders.json（失败不影响提醒本身）。 */
+  /** 把提醒列表合并写进 state/reminders.json（只动自己这个会话的条目，别人的保留）。 */
   private async persistReminders(): Promise<void> {
     try {
       this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
       const rows = this.sql`SELECT id, when_spec, text, kind FROM reminders ORDER BY at DESC LIMIT 100` as
         { id: string; when_spec: string; text: string; kind: string }[];
-      const items: ReminderState[] = rows.map((r) => ({
+      const mine: ReminderState[] = rows.map((r) => ({
         id: r.id,
         when: r.when_spec,
         kind: r.kind === "cron" ? "cron" : "once",
         text: r.text,
       }));
-      await writeStateJson(this.env, REMINDERS_PATH, { updated_at: Date.now(), reminders: items },
-        `bot: 提醒备份（${items.length} 条）`);
+      const file = await readStateJson<{ reminders?: ReminderState[] }>(this.env, REMINDERS_PATH);
+      const all = Array.isArray(file?.reminders) ? file!.reminders! : [];
+      const merged = mergeReminders(all, mine, this.name);
+      await writeStateJson(this.env, REMINDERS_PATH, { updated_at: Date.now(), reminders: merged },
+        `bot: 提醒备份（${merged.length} 条）`);
     } catch (e) {
       console.error("[persist-reminders-fail]", e instanceof Error ? e.message : String(e));
     }
@@ -301,7 +304,8 @@ export class SportDbAgent extends Think<Env> {
       const file = await readStateJson<{ reminders?: ReminderState[] }>(this.env, REMINDERS_PATH);
       const items = Array.isArray(file?.reminders) ? file!.reminders! : [];
       if (!items.length) return;
-      const { arm, drop, keep } = rearmPlan(items, Date.now());
+      // 只恢复属于本会话的（this.name）：别的通道的提醒由它们自己恢复
+      const { arm, drop, keep } = rearmPlan(items, Date.now(), this.name);
       this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
       const existing = this.sql`SELECT id FROM reminders` as { id: string }[];
       const known = new Set(existing.map((r) => r.id));
