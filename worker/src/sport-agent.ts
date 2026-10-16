@@ -369,7 +369,7 @@ export class SportDbAgent extends Think<Env> {
         execute: async (args: { city?: string; days?: number }) => toolWeather(env, args),
       }),
       web_search: tool({
-        description: "联网搜索（比赛信息、路线、装备参数、训练方法等外部知识）。结果要标明来源；搜不到就说不确定，绝不许编造搜索结果。",
+        description: "联网检索外部信息（比赛信息、路线、装备参数、训练方法）。结果会标明来源（全网搜索或维基百科）；若工具说没搜到，就如实说不确定，绝不许编造搜索结果。",
         inputSchema: z.object({
           query: z.string(),
           limit: z.number().int().min(1).max(8).default(5),

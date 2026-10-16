@@ -158,7 +158,12 @@ export async function toolWeather(
   }
 }
 
-/** 搜索：优先 Tavily（配了 key），否则解析 DuckDuckGo lite。 */
+/** 搜索：Tavily（配了 key）→ DuckDuckGo → Wikipedia（免 Key 兜底）。
+ *
+ * 实测（2026-10-16，从 Cloudflare 出口发起）：
+ *   lite.duckduckgo.com 返回反爬挑战页、mojeek 返回验证码页 —— 免 Key 的通用搜索
+ *   基本都被拦；Wikimedia API 正常。所以通用搜索想稳，得配 TAVILY_API_KEY（免费额度足够个人用）。
+ * 这里仍然逐级降级，并在结果里说明来源，绝不让模型把「没搜到」演成「搜到了」。 */
 export async function toolWebSearch(
   env: Env, args: { query?: string; limit?: number },
 ): Promise<string> {
@@ -167,37 +172,66 @@ export async function toolWebSearch(
   let limit = Math.trunc(Number(args.limit) || 5);
   if (!Number.isFinite(limit)) limit = 5;
   limit = Math.min(8, Math.max(1, limit));
+  const notes: string[] = [];
 
   if (env.TAVILY_API_KEY) {
-    const t = withTimeout(15_000);
-    try {
-      const r = await fetch("https://api.tavily.com/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "User-Agent": UA },
-        body: JSON.stringify({
-          api_key: env.TAVILY_API_KEY, query: q, max_results: limit, search_depth: "basic",
-        }),
-        signal: t.signal,
-      });
-      if (!r.ok) return `失败：搜索接口 ${r.status}。`;
-      const j = (await r.json()) as { results?: { title?: string; url?: string; content?: string }[] };
-      const rows = (j.results ?? []).map((x) => `- ${x.title}\n  ${x.url}\n  ${(x.content ?? "").slice(0, 300)}`);
-      return rows.length ? `“${q}”结果：\n${rows.join("\n")}` : `“${q}”没搜到结果。`;
-    } catch (e) {
-      return `失败：搜索异常（${(e as Error).message}）。`;
-    } finally {
-      t.done();
-    }
+    const got = await searchTavily(env, q, limit);
+    if (typeof got === "string") return got;
+    notes.push("Tavily 没返回结果");
   }
 
+  const ddg = await searchDdg(q, limit);
+  if (typeof ddg === "string") return ddg;
+  notes.push(ddg.reason);
+
+  const wiki = await searchWikipedia(q, limit);
+  if (typeof wiki === "string") {
+    return wiki + `\n（说明：通用搜索被反爬拦了，上面是维基百科的结果，不是全网搜索；`
+      + `要全网搜索请让管理员配置 TAVILY_API_KEY。${notes.join("；")}）`;
+  }
+  notes.push(wiki.reason);
+  return `失败：联网搜索没成功（${notes.join("；")}）。`
+    + "不要编造搜索结果，就用你已有知识回答，并如实告诉用户“这次没联网搜到”。";
+}
+
+/** Tavily 搜索（需 key）。成功返回文本，未配置/无结果返回 null。 */
+async function searchTavily(env: Env, q: string, limit: number): Promise<string | null> {
+  const t = withTimeout(15_000);
+  try {
+    const r = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": UA },
+      body: JSON.stringify({
+        api_key: env.TAVILY_API_KEY, query: q, max_results: limit, search_depth: "basic",
+      }),
+      signal: t.signal,
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as { results?: { title?: string; url?: string; content?: string }[] };
+    const rows = (j.results ?? []).map((x) => `- ${x.title}\n  ${x.url}\n  ${(x.content ?? "").slice(0, 300)}`);
+    return rows.length ? `“${q}”结果（Tavily · 全网搜索）：\n${rows.join("\n")}` : null;
+  } catch {
+    return null;
+  } finally {
+    t.done();
+  }
+}
+
+type SearchMiss = { reason: string };
+
+/** DuckDuckGo lite：多半会被反爬拦，拦了就返回原因交给下一级。 */
+async function searchDdg(q: string, limit: number): Promise<string | SearchMiss> {
   const t = withTimeout(15_000);
   try {
     const r = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`, {
       headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
       signal: t.signal,
     });
-    if (!r.ok) return `失败：搜索接口 ${r.status}（可能被限流），稍后再试。`;
+    if (!r.ok) return { reason: `DDG ${r.status}` };
     const html = await readCapped(r, 200_000);
+    if (/bots use DuckDuckGo|complete the following challenge|anomaly/i.test(html)) {
+      return { reason: "DDG 返回反爬挑战页" };
+    }
     const items: { title: string; url: string; snippet: string }[] = [];
     const re = /<a[^>]*href="([^"]+)"[^>]*class='result-link'>([\s\S]*?)<\/a>/g;
     let m: RegExpExecArray | null;
@@ -213,14 +247,36 @@ export async function toolWebSearch(
       const sm = rest.match(/class='result-snippet'>([\s\S]*?)<\/td>/);
       items.push({ title: stripTags(m[2]), url, snippet: sm ? stripTags(sm[1]) : "" });
     }
-    if (!items.length) {
-      return `失败：搜索没解析出结果（可能被反爬拦了）。别编搜索结果，改用已有知识回答，并告诉用户“没联网搜到”。`;
-    }
+    if (!items.length) return { reason: "DDG 页面结构变了，解析不出结果" };
     return `“${q}”结果（DuckDuckGo）：\n`
-      + items.map((x) => `- ${x.title}\n  ${x.url}\n  ${x.snippet.slice(0, 260)}`).join("\n")
-      + "\n（摘要来自搜索结果，引用时分清哪些是搜到的、哪些是你的建议）";
+      + items.map((x) => `- ${x.title}\n  ${x.url}\n  ${x.snippet.slice(0, 260)}`).join("\n");
   } catch (e) {
-    return `失败：搜索异常（${(e as Error).message}）。`;
+    return { reason: `DDG 异常 ${(e as Error).message}` };
+  } finally {
+    t.done();
+  }
+}
+
+/** Wikipedia 检索（免 Key、程序化 API，实测从 Worker 可达）。 */
+async function searchWikipedia(q: string, limit: number): Promise<string | SearchMiss> {
+  const t = withTimeout(15_000);
+  try {
+    const r = await fetch(
+      "https://zh.wikipedia.org/w/api.php?action=query&list=search&utf8=1&format=json"
+      + `&srlimit=${limit}&srsearch=${encodeURIComponent(q)}`,
+      { headers: { "User-Agent": UA }, signal: t.signal },
+    );
+    if (!r.ok) return { reason: `Wikipedia ${r.status}` };
+    const j = (await r.json()) as {
+      query?: { search?: { title?: string; snippet?: string; size?: number }[] };
+    };
+    const rows = (j.query?.search ?? []).filter((x) => x.title);
+    if (!rows.length) return { reason: "Wikipedia 也没有相关条目" };
+    return `“${q}”检索结果（维基百科）：\n`
+      + rows.map((x) => `- ${x.title}\n  https://zh.wikipedia.org/wiki/${encodeURIComponent(x.title || "")}\n`
+        + `  ${stripTags(x.snippet ?? "").slice(0, 260)}`).join("\n");
+  } catch (e) {
+    return { reason: `Wikipedia 异常 ${(e as Error).message}` };
   } finally {
     t.done();
   }
