@@ -96,6 +96,17 @@ curl -X POST "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook" \
 daily ≥ 14000 的卫生下限）。早期写死 806/14082 的断言会在正常入库后自杀 —— 
 你那张截图入库变成 807 行时 sync 连挂两次，就是这么来的。
 
+## 健康检查
+
+```bash
+curl https://sport-db-bot.xia2061969365.workers.dev/health
+# {"ok":true,"ms":2335,"checks":[{"name":"gateway",...},{"name":"github",...}],"config":{...}}
+```
+
+一次看清：模型网关能不能回、GitHub PAT 有没有过期（顺带报剩余配额）、
+备用网关/搜索 Key/城市等配置有没有生效。`ok:false` 时 HTTP 状态码也是 503。
+**排障先打这个**，比翻日志快。
+
 ## 排障
 
 | 现象 | 查法 |
@@ -115,12 +126,14 @@ daily ≥ 14000 的卫生下限）。早期写死 806/14082 的断言会在正�
 
 ## 发版前自检清单
 
-- [ ] `npx tsc --noEmit` **不加管道**，真实退出码为 0；
+- [ ] `cd worker && npm run check`（类型 + 31 条行为测试，一条命令）；
 - [ ] 前端改动：`node --check frontend/*.js`；
-- [ ] 涉及写库的改动：跑一遍 mock 单测（预览不写、确认才写、冲突中止三条）；
 - [ ] CSV/数据库结构改动：本地 `python scripts/build_db.py --data data --out /tmp/t.db` 看 VERIFY OK；
 - [ ] `git pull --rebase` 后再 push（bot 会自动回写提交，容易撞车）；
-- [ ] 部署后打一次 `/api/chat` 冒烟。
+- [ ] 部署后 `curl .../health` 看两项都 ok，再打一次 `/api/chat` 冒烟。
+
+CI 里 `.github/workflows/agent-tests.yml` 会在每次动 `worker/**` 时自动跑
+`tsc --noEmit` + 行为测试（不需要任何密钥，GitHub 与 DO SQLite 都 mock 掉了）。
 
 ## 安全
 
