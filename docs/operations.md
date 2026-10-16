@@ -151,10 +151,12 @@ npx wrangler secret put GH_PAT
 - 落点：`state/chat/YYYY-MM-DD.md`，按天分文件，只记对话文本（不含工具调用与内部推理）；
 - 格式：`# 2026-10-16 对话记录` + 逐条 `🧑 我` / `🤖 教练`，带北京时间。
 
-> ⚠️ **待处理的安全事项**：`STATE_PAT` 目前用的是本机 `gh` CLI 的 OAuth token
-> （scope 含 `repo`/`workflow`/`gist`，能访问你**所有**仓库）——功能没问题但权限过宽。
-> 建议换成细粒度 PAT（只授权 `sport-db-private` 一个仓的 Contents 读写）后重设：
-> `cd sport-db/worker && npx wrangler secret put STATE_PAT`
+> **凭据说明**：`STATE_PAT` 用的是你自己的细粒度 PAT（已验证对
+> `sport-db` 与 `sport-db-private` 两个仓都是 200）。细粒度 PAT **有有效期**
+> （默认 30~90 天），到期后对话备份和提醒恢复会失败——`/health` 的 config 里能看到
+> `fallback_model` 等开关，但看不到 token 是否过期，所以到期前记得换新：
+> `cd sport-db/worker && npx wrangler secret put STATE_PAT`。
+> 另外这个 token 在聊天里出现过，介意的话轮换一次即可（换完重设上面两个 secret）。
 
 > 小提示：手动触发是在**当轮进行中**取的快照，所以那条「已备份」的回复本身要等下一次
 > 导出才进文件；自动导出在 turn 结束后跑，内容是完整的。
