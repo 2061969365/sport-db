@@ -62,7 +62,8 @@ export default {
             method: "POST",
             headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
             body: JSON.stringify({
-              model: env.VISION_MODEL, max_tokens: 8,
+              // 注意：该网关要求 max_tokens >= 16，写 8 会被 400 拒掉（踩过）
+              model: env.VISION_MODEL, max_tokens: 32,
               messages: [{ role: "user", content: "ping" }],
             }),
             signal: ctl.signal,

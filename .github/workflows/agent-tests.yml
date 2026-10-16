@@ -1,0 +1,37 @@
+# Agent 回归：类型检查 + 行为测试。
+# 这些测试钉住的是「最不能坏的东西」：两阶段确认（预览不写/确认才写）、
+# 路径白名单、读缓存、答复整形、以及 prompt 里的铁律是否还在。
+# 不需要任何密钥：GitHub 与 DO SQLite 都在进程内 mock 掉了。
+name: agent-tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - '.github/workflows/agent-tests.yml'
+  pull_request:
+    paths:
+      - 'worker/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 装依赖
+        run: npm ci
+      - name: 类型检查（必须 0，否则后面都不可信）
+        run: npx tsc --noEmit
+      - name: 行为回归测试
+        run: node --test "tests/*.test.ts"
