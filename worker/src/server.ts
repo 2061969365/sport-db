@@ -7,6 +7,7 @@
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
 import { ingestPhoto, pickImage } from "./photo";
+import { ghHealth } from "./github";
 import { clip, messageText, tgSend } from "./notify";
 import type { Env } from "./env";
 
@@ -40,7 +41,60 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-      return new Response("sport-db think agent OK. POST /tg (Telegram) | POST /feishu (Feishu)\n");
+      return new Response("sport-db think agent OK. POST /tg (Telegram) | POST /feishu (Feishu) | GET /health\n");
+    }
+
+    // ---------------- 健康检查：一眼看清依赖是否都在 ----------------
+    if (request.method === "GET" && url.pathname === "/health") {
+      const t0 = Date.now();
+      const check = async (name: string, fn: () => Promise<string>) => {
+        try {
+          return { name, ok: true, detail: await fn() };
+        } catch (e) {
+          return { name, ok: false, detail: String((e as Error).message || e).slice(0, 160) };
+        }
+      };
+      const gateway = async () => {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 12_000);
+        try {
+          const r = await fetch(`${env.VISION_ENDPOINT.replace(/\/chat\/completions\/?$/, "")}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
+            body: JSON.stringify({
+              model: env.VISION_MODEL, max_tokens: 8,
+              messages: [{ role: "user", content: "ping" }],
+            }),
+            signal: ctl.signal,
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return `主网关 OK（${env.VISION_MODEL}）`;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const github = async () => {
+        if (!env.GH_PAT) return "未配 GH_PAT（只读模式）";
+        return `Contents API ${await ghHealth(env)}`;
+      };
+      const results = await Promise.all([
+        check("gateway", gateway),
+        check("github", github),
+      ]);
+      const cfg = {
+        repo: env.REPO,
+        fallback_model: !!(env.VISION_ENDPOINT_ALT && env.VISION_MODEL_ALT),
+        anysearch_key: !!env.ANYSEARCH_API_KEY,
+        tavily_key: !!env.TAVILY_API_KEY,
+        home_city: env.HOME_CITY || null,
+        telegram: !!env.TG_BOT_TOKEN,
+        feishu: !!(env.FEISHU_APP_ID && env.FEISHU_APP_SECRET),
+      };
+      const ok = results.every((r) => r.ok);
+      return Response.json(
+        { ok, ms: Date.now() - t0, checks: results, config: cfg },
+        { status: ok ? 200 : 503 },
+      );
     }
 
     // ---------------- Telegram webhook ----------------

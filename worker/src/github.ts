@@ -770,6 +770,15 @@ export async function toolWritePlan(
   return `已${cur ? "更新" : "新建"} ${path}（${body.length} 字符）。以后用户问“我的计划呢”就用 read_repo_file 读它。`;
 }
 
+/** 健康检查用：一次轻量鉴权读，顺带报剩余配额。 */
+export async function ghHealth(env: Env): Promise<string> {
+  const r = await ghFetch(`https://api.github.com/repos/${env.REPO}`, { headers: ghHeaders(env) });
+  if (r.status === 401 || r.status === 403) throw new Error(`鉴权失败 ${r.status}（PAT 过期或权限不足）`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const left = r.headers.get("x-ratelimit-remaining");
+  return left ? `OK（剩余配额 ${left}）` : "OK";
+}
+
 /** stats_workouts 工具：按月/年聚合，替代把几百行全拉回来的查法。 */
 export function toolStatsWorkouts(
   all: Row[],

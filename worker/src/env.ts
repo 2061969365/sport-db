@@ -21,5 +21,9 @@ export interface Env {
   ANYSEARCH_API_KEY?: string;
   /** 可选：AnySearch 网关地址覆盖（默认 https://api.anysearch.com）。 */
   ANYSEARCH_BASE_URL?: string;
+  /** 可选：备用模型网关（主网关 429/5xx/连不上时自动切过去，用户无感）。 */
+  VISION_ENDPOINT_ALT?: string;
+  VISION_MODEL_ALT?: string;
+  ALT_API_KEY?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;
 }

@@ -85,15 +85,73 @@ export class SportDbAgent extends Think<Env> {
 
   getModel() {
     // apius2 是免 Key 的 OpenAI-compatible 网关：用哑 key 占位，
-    // 下面的自定义 fetch 会剥掉 Authorization 头再发出去。
+    // 自定义 fetch 会剥掉 Authorization 头再发出去。
+    //
+    // 这一层同时负责「别让 agent 死在一个网关上」：
+    //   1. 429/5xx/网络抖动 → 退避重试（最多 2 次）；
+    //   2. 仍失败且配了备用网关（VISION_ENDPOINT_ALT/VISION_MODEL_ALT）→ 就地改写
+    //      请求体里的 model 并换 URL 重发一次，用户无感；
+    //   3. 全挂 → 抛出去，由 onChatError 明确告诉用户「模型服务不可用」，
+    //      绝不静默失联。
+    const env = this.env;
+    const fallbackArmed = () => !!(env.VISION_ENDPOINT_ALT && env.VISION_MODEL_ALT);
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    const raw: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      headers.delete("authorization"); // 免 Key 网关：别把占位 key 发出去
+      const bodyText = typeof init?.body === "string" ? init.body : null;
+
+      const send = async (targetUrl: string, body: string | null, extra?: Record<string, string>) => {
+        const h = new Headers(headers);
+        if (extra) for (const [k, v] of Object.entries(extra)) h.set(k, v);
+        return fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
+      };
+
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const r = await send(url, bodyText);
+          if (r.status === 429 || r.status >= 500) {
+            lastErr = new Error(`网关 ${r.status}`);
+            if (attempt < 2) {
+              await sleep(800 * (attempt + 1));
+              continue;
+            }
+            break;
+          }
+          return r;
+        } catch (e) {
+          lastErr = e;
+          if (attempt < 2) {
+            await sleep(800 * (attempt + 1));
+            continue;
+          }
+        }
+      }
+
+      // 主网关彻底不可用：有备用就换过去（改写 model 字段）
+      if (fallbackArmed() && bodyText) {
+        try {
+          const altUrl = `${String(env.VISION_ENDPOINT_ALT).replace(/\/chat\/completions\/?$/, "")}/chat/completions`;
+          const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+          parsed.model = env.VISION_MODEL_ALT;
+          const h: Record<string, string> = {};
+          if (env.ALT_API_KEY) h.authorization = `Bearer ${env.ALT_API_KEY}`;
+          console.error("[model-fallback]", String(lastErr).slice(0, 120));
+          return await send(altUrl, JSON.stringify(parsed), h);
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      throw new Error(`模型服务不可用（${String((lastErr as Error)?.message || lastErr).slice(0, 120)}）`);
+    }) as typeof fetch;
+
     const provider = createOpenAI({
       baseURL: `${this.env.VISION_ENDPOINT.replace(/\/chat\/completions\/?$/, "")}`,
       apiKey: "sportdb-no-key",
-      fetch: (async (url: string | URL | Request, init?: RequestInit) => {
-        const headers = new Headers(init?.headers);
-        headers.delete("authorization");
-        return fetch(url, { ...init, headers });
-      }) as typeof fetch,
+      fetch: raw,
     });
     return provider(this.env.VISION_MODEL || "muse-spark-1.3-contributor-free");
   }
@@ -237,6 +295,37 @@ export class SportDbAgent extends Think<Env> {
     const rows = this.sql`SELECT text, at FROM pwa_reply WHERE slot = 'latest'` as { text: string; at: number }[];
     if (!rows.length || rows[0].at <= (Number(since) || 0)) return "";
     return rows[0].text || "";
+  }
+
+  /**
+   * turn 失败时的兜底：onChatResponse 只在成功路径触发，报错走这里。
+   * 不实现它 = 网关抽风时用户永远等不到任何消息（只有日志），这是最伤体验的失败模式。
+   */
+  async onChatError(error: unknown, ctx?: { classification?: string }): Promise<unknown> {
+    const raw = error instanceof Error ? error.message : String(error);
+    console.error("[chat-error]", ctx?.classification || "", raw.slice(0, 300));
+    try {
+      const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
+        { channel?: string; chat_id?: string }[];
+      const channel = tv[0]?.channel || "";
+      const chatId = tv[0]?.chat_id || "";
+      const cls = String(ctx?.classification || "");
+      const hint = cls === "rate_limit"
+        ? "模型服务在限流，等一两分钟再问一次就好。"
+        : /模型服务不可用|网关/.test(raw)
+          ? "模型服务这会儿不可用（重试过也没成），过几分钟再试；你的数据没受影响。"
+          : "这次没答上来。可以再发一次，或把问题拆小一点。";
+      const body = `⚠️ ${hint}\n（技术原因：${raw.slice(0, 160)}）`;
+      if (channel === "tg" && chatId) await tgSend(this.env, chatId, body);
+      else if (channel === "feishu" && chatId) await feishuSend(this.env, chatId, body);
+      this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+      this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${body}, ${Date.now()})`;
+      this.sql`CREATE TABLE IF NOT EXISTS error_log(id TEXT PRIMARY KEY, msg TEXT, at INTEGER)`;
+      this.sql`INSERT OR REPLACE INTO error_log(id, msg, at) VALUES (${`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`}, ${body}, ${Date.now()})`;
+    } catch (e) {
+      console.error("[onChatError-fail]", e instanceof Error ? e.message : String(e));
+    }
+    return error;
   }
 
   /** 每一步开始时刷新 TG「正在输入」：长 turn（计划类）期间让用户看到还在跑。 */
