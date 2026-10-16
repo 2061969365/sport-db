@@ -8,6 +8,7 @@ import { tool } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
+import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
   toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout,
@@ -56,7 +57,17 @@ const RULES_BLOCK =
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；"
   + "白名单外的字段、找不到的记录，明说做不到或找不到，让用户确认，不擅自发挥。"
   + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/trends/records/compare_periods/streaks/update_workout/delete_workout/append_workout/list_review/confirm_review 十二个工具读写；"
+  + "另外有 current_time（现在几点/算日期）、weather（天气）、web_search（联网搜索）、fetch_url（抓网页）四个外部工具可用，"
+  + "这些是查外部信息的唯一途径，不许假装搜过。"
   + "workspace 的文件工具（读写删改查）一律不许碰，数据不在那里。"
+  + "【计划纪律】用户要训练计划/让他别受伤/问接下来怎么练时，按这个顺序做，不许跳步："
+  + "①先调 current_time 确认今天日期（算「下周六」「还有几天」必须用它，不许自己猜）；"
+  + "②调 get_summary 和 trends 看真实训练量与近期强度，别拿旧记忆当现状；"
+  + "③计划含户外跑时调 weather 看降水概率和风速；"
+  + "④需要外部信息（比赛日期、路线、装备参数）才调 web_search/fetch_url，搜到就标明来源，没搜到就说没联网搜到；"
+  + "⑤输出计划要能直接执行：分周期/分天，每天写清距离或时长、配速区间（用他库里的真实配速换算）、强度意图，"
+  + "并写清休息日与减量周；给依据（心率/跑量/恢复），不要泛泛而谈。"
+  + "数据不足就先要信息（周可训练天数、目标赛事与日期、伤病），别硬编一份通用模板。"
 
 export class SportDbAgent extends Think<Env> {
   // 内置 workspace 的 bash 工具对本项目无用且危险，直接关闭；
@@ -341,6 +352,37 @@ export class SportDbAgent extends Think<Env> {
           const all = await loadWorkouts(env, sql);
           return toolStreaks(all);
         },
+      }),
+      current_time: tool({
+        description: "当前北京时间（日期+星期+ISO周），可带偏移天数算任意一天。做计划、算「下周六」「还有几天」必须先调它，不许自己猜日期。",
+        inputSchema: z.object({
+          offset_days: z.number().int().min(-3650).max(3650).default(0),
+        }),
+        execute: async ({ offset_days }: { offset_days?: number }) => toolCurrentTime(offset_days ?? 0),
+      }),
+      weather: tool({
+        description: "查天气（免 Key，1~7 天日预报：温度/降水概率/风速）。安排户外训练前调它；不传 city 就用配置的常驻城市，没配会要求你说城市。",
+        inputSchema: z.object({
+          city: z.string().optional(),
+          days: z.number().int().min(1).max(7).default(3),
+        }),
+        execute: async (args: { city?: string; days?: number }) => toolWeather(env, args),
+      }),
+      web_search: tool({
+        description: "联网搜索（比赛信息、路线、装备参数、训练方法等外部知识）。结果要标明来源；搜不到就说不确定，绝不许编造搜索结果。",
+        inputSchema: z.object({
+          query: z.string(),
+          limit: z.number().int().min(1).max(8).default(5),
+        }),
+        execute: async (args: { query?: string; limit?: number }) => toolWebSearch(env, args),
+      }),
+      fetch_url: tool({
+        description: "抓取指定网页并转成纯文本（curl 的安全替代：只 http/https、禁内网、限大小）。已知具体网址时用它读内容。",
+        inputSchema: z.object({
+          url: z.string(),
+          max_chars: z.number().int().min(500).max(8000).default(4000),
+        }),
+        execute: async (args: { url?: string; max_chars?: number }) => toolFetchUrl(env, args),
       }),
     };
   }
