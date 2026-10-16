@@ -9,7 +9,8 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
 import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
-import { analyzeSignals } from "./proactive";
+import { analyzeSignals, bjToday } from "./proactive";
+import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import {
   NOTES_PATH, NOTES_SEED, PROFILE_PATH, PROFILE_SEED,
   profileShared, repoProfileProvider,
@@ -326,7 +327,19 @@ export class SportDbAgent extends Think<Env> {
       const sql: SqlTag = (s, ...a) =>
         (self.sql(s as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
       const all = await loadWorkouts(this.env, sql);
-      const signals = analyzeSignals(all).filter((s) => s.weight >= 55);
+      let signals = analyzeSignals(all);
+
+      // 计划漏练也算信号：读最近的计划，把"该练没打卡"并进来
+      try {
+        const listing = await listPlans(this.env);
+        const slug = (listing.match(/^([a-z0-9-]+)：/m) || [])[1];
+        if (slug) {
+          const plan = await readPlan(this.env, slug);
+          if (plan) signals = signals.concat(planSignals(plan, bjToday()));
+        }
+      } catch { /* 没计划就算了 */ }
+
+      signals = signals.filter((s) => s.weight >= 55).sort((a, b) => b.weight - a.weight);
       if (!signals.length) return;
 
       const top = signals[0];
@@ -740,6 +753,78 @@ export class SportDbAgent extends Think<Env> {
           if (!signals.length) return "自查结果：没有异常信号（训练连贯、跑量心率都正常）。不用编问题出来。";
           return "自查发现以下信号（按重要度排序）：\n"
             + signals.map((s) => `- [${s.weight}] ${s.key}\n  ${s.text}`).join("\n");
+        },
+      }),
+      plan_save: tool({
+        description: "把排好的训练计划存成结构化计划（可打卡、可看进度）。两步：先不带 confirmed 调一次拿预览，用户确认后再带 confirmed=true。计划必须按次给出日期。",
+        inputSchema: z.object({
+          slug: z.string().describe("计划标识，字母数字短横线，如 half-marathon-2026-11"),
+          name: z.string(),
+          goal: z.string().optional(),
+          sessions: z.array(z.object({
+            date: z.string().describe("YYYY-MM-DD"),
+            type: z.enum(["easy", "long", "tempo", "interval", "rest", "race", "other"]),
+            target: z.string().describe("如 6km @6'10\"/km 或 LSD 14km"),
+          })).min(1),
+          confirmed: z.boolean().default(false),
+        }),
+        execute: async (args: {
+          slug?: string; name?: string; goal?: string;
+          sessions?: { date: string; type: string; target: string }[]; confirmed?: boolean;
+        }) => {
+          const norm = normalizePlan(
+            { name: args.name, goal: args.goal, created: bjToday(), sessions: args.sessions }, bjToday());
+          if (typeof norm === "string") return norm;
+          const path = planPath(args.slug || "");
+          if (!path) return "失败：slug 只能用字母数字和短横线（如 half-marathon-2026-11）。";
+          const prev = await readPlan(env, args.slug || "");
+          if (!args.confirmed) {
+            return `预览（尚未写入）：${path}${prev ? "（会覆盖已有计划）" : ""}\n`
+              + `${planProgress(norm, bjToday())}\n`
+              + "得到用户明确说“确认”后，再用完全相同参数带 confirmed=true 调一次。";
+          }
+          const msg = await writePlan(env, args.slug || "", norm, "think-agent", sql);
+          return msg;
+        },
+      }),
+      plan_list: tool({
+        description: "列出已有的训练计划（含名称、目标、次数）。用户问「我的计划呢」先用它。",
+        inputSchema: z.object({}),
+        execute: async () => listPlans(env),
+      }),
+      plan_progress: tool({
+        description: "看某个计划的完成情况：完成率、该练没打卡的、接下来几次。用户问进度/完成得怎么样时用它。",
+        inputSchema: z.object({ slug: z.string() }),
+        execute: async ({ slug }: { slug?: string }) => {
+          const p = await readPlan(env, slug || "");
+          if (!p) return `失败：找不到计划 ${slug}（先 plan_list 看有哪些）。`;
+          return planProgress(p, bjToday());
+        },
+      }),
+      plan_mark: tool({
+        description: "给计划里的某一天打卡：done（练了）/ skipped（没练）。用户说「今天练完了」「昨天没跑」时用它。这是低风险的状态更新，不用等确认，但要说清改了哪天。",
+        inputSchema: z.object({
+          slug: z.string(),
+          date: z.string().describe("YYYY-MM-DD"),
+          status: z.enum(["done", "skipped"]),
+          actual: z.string().optional().describe("实际完成情况，如 6.2km @6'05\""),
+        }),
+        execute: async (args: { slug?: string; date?: string; status?: string; actual?: string }) => {
+          const p = await readPlan(env, args.slug || "");
+          if (!p) return `失败：找不到计划 ${args.slug}（先 plan_list）。`;
+          const d = String(args.date || "");
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return "失败：日期要 YYYY-MM-DD。";
+          const hit = p.sessions.filter((s) => s.date === d);
+          if (!hit.length) {
+            return `失败：这个计划里 ${d} 没有安排（可用日期：${p.sessions.slice(0, 5).map((s) => s.date).join("、")}…）。`;
+          }
+          for (const s of hit) {
+            s.status = args.status === "done" ? "done" : "skipped";
+            if (args.actual) s.actual = String(args.actual).slice(0, 120);
+          }
+          await writePlan(env, args.slug || "", p, "think-agent", sql);
+          return `已把 ${d} 标记为${args.status === "done" ? "完成" : "跳过"}`
+            + `${args.actual ? `（${args.actual}）` : ""}。\n${planProgress(p, bjToday())}`;
         },
       }),
       set_reminder: tool({
