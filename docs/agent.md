@@ -11,7 +11,7 @@ Agent 本体在 `worker/src/sport-agent.ts`（Think harness）。三层构成：
 | `/status` | `水位`、`上下文` | 上下文水位：消息条数 + 估算 token + 记忆块大小（不调模型，零 token 开销） |
 | `/new` | `重新开始`、`新对话` | 清空聊天记录并取消排队中的提交；**长期画像保留** |
 
-## 22 个工具
+## 28 个工具
 
 **查运动数据**（只读，随便调）
 
@@ -58,6 +58,19 @@ Agent 本体在 `worker/src/sport-agent.ts`（Think harness）。三层构成：
 | `list_reminders` | 列出已设提醒（含 id） |
 | `cancel_reminder` | 按 id 取消 |
 | `coach_check` | 教练自查：立刻扫一遍数据看有没有值得提醒的事（中断/跑量突变/心率漂移/破月纪录） |
+| `usage_stats` | 看 agent 自己的用量：轮数、失败次数、token、工具调用数 |
+
+**训练计划**（结构化，可打卡）
+
+| 工具 | 用途 |
+|---|---|
+| `plan_save` | 存计划到 `plans/<slug>.json`（两阶段确认），按次给出日期与目标 |
+| `plan_list` | 列出已有计划 |
+| `plan_progress` | 完成率、该练没打卡的、接下来几次 |
+| `plan_mark` | 打卡 `done` / `skipped`，可带实际完成（低风险，不必二次确认） |
+
+> 计划是**结构化 JSON** 而不是一份 md：能算完成率、能打卡、能被主动教练读了去提醒。
+> 完成率只按训练课算——早期版本把休息日算进分子导致虚高，测试抓出来已修。
 
 > 提醒由 Durable Object 的持久化调度器执行，Worker 不在线也会到点触发；
 > 一次性提醒推完自动清理。**Telegram / 飞书能主动推**；网页版没有主动推送通道，
@@ -124,6 +137,14 @@ Agent 本体在 `worker/src/sport-agent.ts`（Think harness）。三层构成：
 
 > 注意：单次**输出**上限是 50k token，跟上下文压缩是两件事。
 > 问得极长时先撞的是输出上限（回答被截断），那个只能靠分段提问解决。
+
+## 可观测性与故障处理
+
+- **用量按天记账**（DO SQLite `metrics_day`）：轮数、失败数、输入/输出 token、工具调用数。
+  `/status` 里会带一行，也可以直接问它「你花了多少」（`usage_stats`）。
+- **失败不静默**：turn 出错走 `onChatError`，会把「模型服务不可用/限流/没答上来」推回原通道；
+  网关 429/5xx/网络抖自动重试 3 次，配了 `VISION_ENDPOINT_ALT` 就在失败后自动切过去。
+- **健康检查**：`GET /health` 一次看清网关、GitHub PAT 配额和配置开关（见运维文档）。
 
 ## 行为准则（写在 `rules` 只读块里）
 
