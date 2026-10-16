@@ -10,6 +10,10 @@ import { z } from "zod";
 import type { Env } from "./env";
 import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
 import { analyzeSignals } from "./proactive";
+import {
+  NOTES_PATH, NOTES_SEED, PROFILE_PATH, PROFILE_SEED,
+  profileShared, repoProfileProvider,
+} from "./profile";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
@@ -428,10 +432,23 @@ export class SportDbAgent extends Think<Env> {
     }
   }
 
-  configureContext() {    // 不传 provider → 自动落 durable per-agent SQLite，且经 set_context 可写。
-    // user_profile：认得“人”（目标/伤病/偏好）；coaching_notes：记得“事”（弱项/执行/下次提醒）。
+  configureContext() {
     // rules：只读 block（inline provider），装 persona + 数据/改库铁律 + 工具边界——
     // 注意：配了 block 后 getSystemPrompt 会被框架忽略，所以铁律必须放在这里。
+    //
+    // user_profile / coaching_notes：长期记忆。默认存在**数据仓**里
+    // （profile/*.md），这样 TG、飞书、网页版读的是同一份画像；设
+    // PROFILE_SHARED=false 则回退成各通道独立的本机 SQLite（老行为）。
+    const self = this;
+    const sql: SqlTag = (s, ...a) =>
+      (self.sql(s as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
+    const shared = profileShared(this.env);
+    const repoBlock = (label: string, path: string, seed: string) => ({
+      label,
+      description: undefined as string | undefined,
+      maxTokens: 1500,
+      provider: repoProfileProvider(this.env, path, sql, seed),
+    });
     return [
       {
         label: "rules",
@@ -439,16 +456,26 @@ export class SportDbAgent extends Think<Env> {
         maxTokens: 2000,
         provider: { get: async () => RULES_BLOCK },
       },
-      {
-        label: "user_profile",
-        description: "跑者长期画像：目标距离、伤病史、作息偏好、装备。用户提到相关事实时用 set_context 更新；给计划前先看这里。",
-        maxTokens: 1500,
-      },
-      {
-        label: "coaching_notes",
-        description: "教练观察备忘：用户弱项、本次建议的执行情况、下次要提醒的事。每次有效建议后更新一条。",
-        maxTokens: 1500,
-      },
+      shared
+        ? {
+          ...repoBlock("user_profile", PROFILE_PATH, PROFILE_SEED),
+          description: "跑者长期画像（跨通道共享，存在数据仓 profile/user_profile.md）：目标赛事与日期、周可训练天数、伤病史、作息偏好、装备。用户提到这类长期事实时用 set_context 更新；给计划前先看这里。",
+        }
+        : {
+          label: "user_profile",
+          description: "跑者长期画像：目标距离、伤病史、作息偏好、装备。用户提到相关事实时用 set_context 更新；给计划前先看这里。",
+          maxTokens: 1500,
+        },
+      shared
+        ? {
+          ...repoBlock("coaching_notes", NOTES_PATH, NOTES_SEED),
+          description: "教练观察备忘（跨通道共享，存在数据仓 profile/coaching_notes.md）：用户弱项、上次建议的执行情况、下次要提醒的事。每次有效建议后更新一条。",
+        }
+        : {
+          label: "coaching_notes",
+          description: "教练观察备忘：用户弱项、本次建议的执行情况、下次要提醒的事。每次有效建议后更新一条。",
+          maxTokens: 1500,
+        },
     ];
   }
 

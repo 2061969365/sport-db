@@ -25,5 +25,7 @@ export interface Env {
   VISION_ENDPOINT_ALT?: string;
   VISION_MODEL_ALT?: string;
   ALT_API_KEY?: string;
+  /** 可选：长期画像是否跨通道共享（默认 true；设 "false" 则各通道独立本机存储）。 */
+  PROFILE_SHARED?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;
 }
