@@ -38,10 +38,22 @@ review/                     识别置信度不足、待人工确认的项
 reports/daily/YYYY-MM-DD.md 每晚自动生成的日报
 data.db                     由 CSV 编译出的 SQLite（构建产物，供网页直读）
 
-worker/src/server.ts        入口：TG/飞书 webhook、/api/chat、静态兜底
-worker/src/sport-agent.ts   Agent 本体：人设/规则、12 个工具、记忆、压缩
-worker/src/github.ts        GitHub 即数据库：CSV 读写、缓存、工具实现
+profile/user_profile.md     长期画像（跨通道共享：TG/网页读到同一份）
+profile/coaching_notes.md   教练备忘（同上）
+plans/*.json                结构化训练计划（可打卡、可算完成率）
+state/reminders.json        提醒备份（换账号后自动恢复；按会话属主隔离）
+
+worker/src/server.ts        入口：TG/飞书 webhook、/api/chat、/health
+worker/src/sport-agent.ts   Agent 本体：人设/规则、28 个工具、记忆、压缩、兜底
+worker/src/github.ts        GitHub 即数据库：CSV 读写、缓存、数据工具
 worker/src/photo.ts         截图收图链路：下载 → 入库 → Vision 识别 → 路由
+worker/src/web.ts           联网：AnySearch 搜索/正文抽取、天气、抓网页
+worker/src/proactive.ts     主动教练：信号判断（纯函数）
+worker/src/plan.ts          训练计划状态机
+worker/src/profile.ts       跨通道共享画像
+worker/src/state.ts         状态备份（提醒）+ 启动恢复
+worker/src/metrics.ts       用量记账
+worker/tests/               62 条行为回归（CI 自动跑）
 
 scripts/import_mi.py        小米导出 → CSV
 scripts/download_gpx.py     轨迹批量下载
