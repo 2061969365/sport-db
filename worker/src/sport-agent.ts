@@ -528,7 +528,7 @@ export class SportDbAgent extends Think<Env> {
         execute: async (args: { city?: string; days?: number }) => toolWeather(env, args),
       }),
       web_search: tool({
-        description: "联网检索外部信息（比赛信息、路线、装备参数、训练方法）。结果会标明来源（全网搜索或维基百科）；若工具说没搜到，就如实说不确定，绝不许编造搜索结果。",
+        description: "联网全网搜索（AnySearch）。比赛信息、路线、装备参数、训练方法等外部资料用它；结果会标明来源，工具说没搜到就如实讲，绝不编造。",
         inputSchema: z.object({
           query: z.string(),
           limit: z.number().int().min(1).max(8).default(5),
@@ -536,7 +536,7 @@ export class SportDbAgent extends Think<Env> {
         execute: async (args: { query?: string; limit?: number }) => toolWebSearch(env, args),
       }),
       fetch_url: tool({
-        description: "抓取指定网页并转成纯文本（curl 的安全替代：只 http/https、禁内网、限大小）。已知具体网址时用它读内容。",
+        description: "读指定网页正文（AnySearch 抽取，能读 JS 页面；只 http/https、禁内网、限大小）。已知具体网址时用它看内容。",
         inputSchema: z.object({
           url: z.string(),
           max_chars: z.number().int().min(500).max(8000).default(4000),

@@ -1,7 +1,10 @@
 // 联网与时间工具：当前时间、天气、网页搜索、抓网页（curl 的安全替代）。
-// 全部免 Key（open-meteo 天气/地理编码、DuckDuckGo 搜索）；可选升级：
-//   TAVILY_API_KEY  → 用 Tavily 搜索（返回干净 JSON，比解析 HTML 稳）
-//   HOME_CITY       → 默认城市（不填就让模型问用户）
+// 搜索首选 AnySearch（https://api.anysearch.com/v1/search，支持匿名，配了
+// ANYSEARCH_API_KEY 走凭据额度）；不可用时降级 Tavily → DDG → 维基百科。
+// 抓网页首选 AnySearch /v1/extract（正文抽取，能处理 JS 页面），失败再自己拉 HTML。
+//   ANYSEARCH_API_KEY  → 可选，配了用凭据身份（额度更高/更稳）
+//   TAVILY_API_KEY     → 可选，AnySearch 不可用时的备选
+//   HOME_CITY          → 天气默认城市（不填就让模型问用户）
 import type { Env } from "./env";
 
 const UA = "Mozilla/5.0 (compatible; sport-db-bot/1.0)";
@@ -174,6 +177,10 @@ export async function toolWebSearch(
   limit = Math.min(8, Math.max(1, limit));
   const notes: string[] = [];
 
+  const any = await searchAnySearch(env, q, limit);
+  if (typeof any === "string") return any;
+  notes.push(any.reason);
+
   if (env.TAVILY_API_KEY) {
     const got = await searchTavily(env, q, limit);
     if (typeof got === "string") return got;
@@ -186,12 +193,74 @@ export async function toolWebSearch(
 
   const wiki = await searchWikipedia(q, limit);
   if (typeof wiki === "string") {
-    return wiki + `\n（说明：通用搜索被反爬拦了，上面是维基百科的结果，不是全网搜索；`
-      + `要全网搜索请让管理员配置 TAVILY_API_KEY。${notes.join("；")}）`;
+    return wiki + `\n（说明：全网搜索都没通，上面是维基百科的结果，不是全网搜索；`
+      + `请把这点告诉用户。${notes.join("；")}）`;
   }
   notes.push(wiki.reason);
   return `失败：联网搜索没成功（${notes.join("；")}）。`
     + "不要编造搜索结果，就用你已有知识回答，并如实告诉用户“这次没联网搜到”。";
+}
+
+const AS_BASE = (env: Env) => (env.ANYSEARCH_BASE_URL || "https://api.anysearch.com").replace(/\/$/, "");
+
+function asHeaders(env: Env): Record<string, string> {
+  const h: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": UA,
+    "x-anysearch-client": "sport-db/1.0",
+  };
+  if (env.ANYSEARCH_API_KEY) h.authorization = `Bearer ${env.ANYSEARCH_API_KEY}`;
+  return h;
+}
+
+type AsEnvelope<T> = { code?: number; message?: string; data?: T };
+
+/** AnySearch 全网搜索（匿名即可用；返回真结果，实测从 Cloudflare 出口可达）。 */
+async function searchAnySearch(env: Env, q: string, limit: number): Promise<string | SearchMiss> {
+  const t = withTimeout(20_000);
+  try {
+    const r = await fetch(`${AS_BASE(env)}/v1/search`, {
+      method: "POST",
+      headers: asHeaders(env),
+      body: JSON.stringify({ query: q, max_results: limit }),
+      signal: t.signal,
+    });
+    if (!r.ok) return { reason: `AnySearch ${r.status}` };
+    const j = (await r.json()) as AsEnvelope<{
+      results?: { title?: string; url?: string; snippet?: string; content?: string }[];
+    }>;
+    if (j.code !== 0) return { reason: `AnySearch code=${j.code} ${j.message || ""}`.trim() };
+    const rows = (j.data?.results ?? []).filter((x) => x.title || x.url);
+    if (!rows.length) return { reason: "AnySearch 没返回结果" };
+    return `“${q}”结果（AnySearch 全网搜索）：\n`
+      + rows.map((x) => `- ${x.title}\n  ${x.url}\n  ${(x.snippet || x.content || "").slice(0, 300)}`).join("\n")
+      + "\n（引用时标明来源；搜到的是外部资料，和用户自己的数据要分清）";
+  } catch (e) {
+    return { reason: `AnySearch 异常 ${(e as Error).message}` };
+  } finally {
+    t.done();
+  }
+}
+
+/** AnySearch 正文抽取：比裸 HTML 干净，且能处理 JS 渲染页面。 */
+async function extractAnySearch(env: Env, url: string): Promise<{ title: string; content: string } | null> {
+  const t = withTimeout(20_000);
+  try {
+    const r = await fetch(`${AS_BASE(env)}/v1/extract`, {
+      method: "POST",
+      headers: asHeaders(env),
+      body: JSON.stringify({ url }),
+      signal: t.signal,
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as AsEnvelope<{ title?: string; content?: string }>;
+    if (j.code !== 0 || !j.data?.content) return null;
+    return { title: j.data.title || "", content: j.data.content };
+  } catch {
+    return null;
+  } finally {
+    t.done();
+  }
 }
 
 /** Tavily 搜索（需 key）。成功返回文本，未配置/无结果返回 null。 */
@@ -306,6 +375,14 @@ export async function toolFetchUrl(
   let mc = Math.trunc(Number(args.max_chars) || 4000);
   if (!Number.isFinite(mc)) mc = 4000;
   mc = Math.min(8000, Math.max(500, mc));
+
+  // 首选 AnySearch 正文抽取（干净、能处理 JS 页面）；失败再自己拉 HTML 剥标签。
+  const ex = await extractAnySearch(env, u.toString());
+  if (ex) {
+    const body = ex.content.slice(0, mc);
+    return `${ex.title ? ex.title + "｜" : ""}${u.href}（AnySearch 抽取，共 ${ex.content.length} 字符，已给前 ${body.length}）：\n${body}`
+      + (body.length >= mc ? "\n…（截断，需要更多可提高 max_chars）" : "");
+  }
 
   // 手动跟最多 3 跳，每跳都重新校验（防用跳转绕过内网限制）
   let cur = u;

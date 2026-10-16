@@ -17,5 +17,9 @@ export interface Env {
   HOME_LON?: string;
   /** 可选：配了就用 Tavily 搜索（返回 JSON，比解析 HTML 稳）。 */
   TAVILY_API_KEY?: string;
+  /** 可选：AnySearch 凭据（不配走匿名，同样能用但额度低）。 */
+  ANYSEARCH_API_KEY?: string;
+  /** 可选：AnySearch 网关地址覆盖（默认 https://api.anysearch.com）。 */
+  ANYSEARCH_BASE_URL?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;
 }
