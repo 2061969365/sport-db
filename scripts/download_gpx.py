@@ -44,6 +44,11 @@ def looks_like_gpx(head: bytes) -> bool:
     return b"<gpx" in low or (low.startswith(b"<?xml") and b"gpx" in low)
 
 
+def redact_url(url: str) -> str:
+    """去掉查询串（Signature/Expires/GalaxyAccessKeyId 都是凭据），只留主机+路径。"""
+    return url.split("?", 1)[0] if url else url
+
+
 def fetch(url: str, timeout: int) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (sport-db gpx-rescue)"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -112,6 +117,9 @@ def main() -> int:
                     "url", "rel_path", "bytes", "status", "attempts", "error"])
         for n, r in enumerate(rows, start=1 + args.offset):
             url = (r.get("GPX") or "").strip()
+            # 记日志前先脱敏：GPX 直链带 Signature/Expires/AccessKeyId（有效期约一年），
+            # 本仓是公开仓，写进日志等于把私有轨迹的钥匙公开。只留 主机+路径。
+            url = redact_url(url)
             key = (r.get("Key") or "unknown").strip() or "unknown"
             try:
                 ts = int(r.get("Time") or 0)

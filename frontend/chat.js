@@ -1,10 +1,9 @@
-/* 运动库 SportDB — 独立聊天页（task-9）
- * 不依赖 app.js（app.js 顶层读写首页 DOM，聊天页独立加载更稳）；
- * 数据摘要逻辑与 app.js / worker/worker.js 对齐：
- *   CSV 列名与 scripts/import_mi.py 一致（date,type,distance_m,duration_s,
- *   avg_pace_s,avg_hr,start_utc...），摘要口径与 worker.js summarize() 一致。
- * 调模型约定与 worker.js askModel 一致：POST VISION_ENDPOINT
- *   (/v1/chat/completions，免 Key，不带 Authorization，不传 max_tokens)。
+/* 运动库 SportDB — 聊天页
+ * 不依赖 app.js（app.js 顶层读写首页 DOM，聊天页独立加载更稳）。
+ * 问答走 Worker 的 Agent：POST {bot}/api/chat {session,key,text}，
+ * 工具/记忆/规则全在服务端，本页只负责收发与展示（不接触任何模型密钥）。
+ * 页面上的「近30天摘要」卡片是本地读 CSV 的纯展示，不参与请求。
+ * 服务端按 session 独立记忆；清空记录时会换新 session，等于另起话题。
  */
 'use strict';
 

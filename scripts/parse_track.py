@@ -4,7 +4,7 @@
 Stdlib only (xml.etree / math / argparse / json / csv). No third-party deps
 so GitHub Actions can run it without pip install.
 
-Design doc: docs/2026-10-14-sport-db-design.md section 4.2 + 5.
+Design doc: docs/archive/2026-10-14-design.md section 4.2 + 5.
 
   * gpx: <trkpt lat lon><ele><time> + <extensions> heart-rate,
          distance via Haversine, duration from first/last <time>.
