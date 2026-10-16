@@ -96,6 +96,46 @@ curl -X POST "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook" \
 daily ≥ 14000 的卫生下限）。早期写死 806/14082 的断言会在正常入库后自杀 —— 
 你那张截图入库变成 807 行时 sync 连挂两次，就是这么来的。
 
+## 换 Cloudflare 账号 / 换域名部署
+
+代码里**没有任何账号绑定**（`wrangler.toml` 只有 worker 名、DO 绑定、vars），
+换账号就是把同一份代码重新部署一遍，约 10 分钟：
+
+```bash
+cd sport-db/worker
+npx wrangler login          # 用新账号登录（或设 CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID）
+npx wrangler deploy         # 新账号上创建 worker；DO 迁移 v1 自动生效
+# 域名变成 https://sport-db-bot.<新账号子域>.workers.dev
+
+# 重设密钥（值不变：它们属于 Telegram 和 GitHub，跟 Cloudflare 账号无关）
+npx wrangler secret put TG_BOT_TOKEN
+npx wrangler secret put TG_SECRET
+npx wrangler secret put GH_PAT
+# 可选：ANYSEARCH_API_KEY / TAVILY_API_KEY
+```
+
+然后：
+
+1. **重指 Telegram webhook**（`TG_SECRET` 没换的话 `secret_token` 照旧）：
+   见上方 `setWebhook`，把 url 换成新域名。
+   webhook 同一时间只能指向一个地址，所以新旧不会同时收消息——记得把旧 worker
+   `npx wrangler delete` 收掉（`--name sport-db-bot` 加旧账号登录）。
+2. **改两处硬编码 URL**：`frontend/chat.js` 的 `BOT_DEFAULT`（网页版默认 Bot 地址；
+   你也可以不改，在页面「Bot 服务设置」里填新地址，存在本机 localStorage），
+   以及本文档里的示例 URL。
+3. **可选**：新账号的 `workers.dev` 子域不同，`/health`、`/api/chat` 冒烟跑一遍。
+
+### 会丢什么、不会丢什么（重要）
+
+| 东西 | 换账号后 |
+|---|---|
+| 运动记录 / 轨迹 / 图片 / 待确认 / 日报 | **都在**（在 GitHub 仓库里） |
+| 长期画像 `profile/*.md`、训练计划 `plans/*.json` | **都在**（刻意放仓里就是为了这个） |
+| 对话历史、已设的提醒、用量统计、去重键 | **会丢**（存在旧账号的 Durable Object 里，不跨账号迁移） |
+
+也就是说：换账号后画像和计划照旧，但"聊天记忆"和"提醒"要重新来一遍
+（提醒重新设一次即可）。免费额度是按账号算的，新账号是全新的。
+
 ## 健康检查
 
 ```bash
