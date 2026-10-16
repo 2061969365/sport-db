@@ -13,6 +13,9 @@ import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import {
+  REMINDERS_PATH, readStateJson, rearmPlan, writeStateJson, type ReminderState,
+} from "./state";
+import {
   NOTES_PATH, NOTES_SEED, PROFILE_PATH, PROFILE_SEED,
   profileShared, repoProfileProvider,
 } from "./profile";
@@ -265,7 +268,74 @@ export class SportDbAgent extends Think<Env> {
     const id = String(s?.id || "");
     const whenText = typeof target === "string" ? target : target.toISOString();
     this.sql`INSERT OR REPLACE INTO reminders(id, when_spec, text, kind, at) VALUES (${id}, ${whenText}, ${body}, ${kind}, ${Date.now()})`;
+    // 落仓备份：换账号/DO 重建后能自动恢复（内容无隐私代价）
+    await this.persistReminders();
     return `已设定提醒（id=${id}）：${kind === "cron" ? `按周期 ${whenText}` : whenText} 推送「${body}」。`;
+  }
+
+  /** 把提醒列表写进 state/reminders.json（失败不影响提醒本身）。 */
+  private async persistReminders(): Promise<void> {
+    try {
+      this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
+      const rows = this.sql`SELECT id, when_spec, text, kind FROM reminders ORDER BY at DESC LIMIT 100` as
+        { id: string; when_spec: string; text: string; kind: string }[];
+      const items: ReminderState[] = rows.map((r) => ({
+        id: r.id,
+        when: r.when_spec,
+        kind: r.kind === "cron" ? "cron" : "once",
+        text: r.text,
+      }));
+      await writeStateJson(this.env, REMINDERS_PATH, { updated_at: Date.now(), reminders: items },
+        `bot: 提醒备份（${items.length} 条）`);
+    } catch (e) {
+      console.error("[persist-reminders-fail]", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /**
+   * 启动时从仓里恢复提醒（换 Cloudflare 账号 / DO 重建后，定时任务不该凭空消失）。
+   * 由框架在 DO 首次激活时调用。
+   */
+  async onStart(): Promise<void> {
+    try {
+      const file = await readStateJson<{ reminders?: ReminderState[] }>(this.env, REMINDERS_PATH);
+      const items = Array.isArray(file?.reminders) ? file!.reminders! : [];
+      if (!items.length) return;
+      const { arm, drop, keep } = rearmPlan(items, Date.now());
+      this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
+      const existing = this.sql`SELECT id FROM reminders` as { id: string }[];
+      const known = new Set(existing.map((r) => r.id));
+      const pending = new Set<string>();
+      try {
+        for (const s of await this.listSchedules()) {
+          const p = (s as { payload?: { id?: string } }).payload;
+          if (p?.id) pending.add(String(p.id));
+        }
+      } catch { /* 拿不到就算了，下面幂等 */ }
+
+      let changed = false;
+      for (const it of arm) {
+        if (pending.has(it.id)) continue;
+        const when = it.kind === "cron" ? it.when : new Date(it.when);
+        if (it.kind === "once" && Number.isNaN((when as Date).getTime())) continue;
+        const s = await this.schedule(when, "fireReminder", { id: it.id, text: it.text, once: it.kind === "once" },
+          { idempotent: it.kind !== "once" });
+        const sid = String((s as { id?: string })?.id || it.id);
+        this.sql`INSERT OR REPLACE INTO reminders(id, when_spec, text, kind, at) VALUES (${it.id}, ${it.when}, ${it.text}, ${it.kind}, ${Date.now()})`;
+        void sid;
+        known.add(it.id);
+        changed = true;
+      }
+      for (const it of drop) {
+        this.sql`DELETE FROM reminders WHERE id = ${it.id}`;
+        changed = true;
+      }
+      void keep;
+      if (changed) await this.persistReminders();
+      console.log(`[reminder-restore] 恢复 ${arm.length} 条，清理 ${drop.length} 条`);
+    } catch (e) {
+      console.error("[reminder-restore-fail]", e instanceof Error ? e.message : String(e));
+    }
   }
 
   /** 列出/取消提醒。 */
@@ -284,7 +354,19 @@ export class SportDbAgent extends Think<Env> {
     if (!rid) return "失败：要给 id（先 list_reminders 查）。";
     this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
     this.sql`DELETE FROM reminders WHERE id = ${rid}`;
-    await this.cancelSchedule(rid).catch(() => null);
+    // 调度器里的 id 可能和本地 id 不同（恢复时重挂过），从 payload 里找一遍
+    try {
+      for (const s of await this.listSchedules()) {
+        const p = (s as { payload?: { id?: string } }).payload;
+        const sid = String((s as { id?: string }).id || "");
+        if (sid === rid || (p?.id && String(p.id) === rid)) {
+          await this.cancelSchedule(sid).catch(() => null);
+        }
+      }
+    } catch {
+      await this.cancelSchedule(rid).catch(() => null);
+    }
+    await this.persistReminders();
     return `已取消提醒 ${rid}。`;
   }
 

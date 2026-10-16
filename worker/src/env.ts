@@ -27,5 +27,12 @@ export interface Env {
   ALT_API_KEY?: string;
   /** 可选：长期画像是否跨通道共享（默认 true；设 "false" 则各通道独立本机存储）。 */
   PROFILE_SHARED?: string;
+  /**
+   * 可选：状态备份改走独立（通常私有）仓 —— 换账号后提醒能自动恢复，
+   * 以后要备份聊天记录也走这里，不会把私人对话放进公开仓。
+   * 需要同时配 STATE_REPO（owner/repo）与 STATE_PAT。
+   */
+  STATE_REPO?: string;
+  STATE_PAT?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;
 }
