@@ -25,7 +25,7 @@ test("铁律：失败必须如实说，不许把失败讲成没有数据", () =>
   assert.match(SRC, /绝不许编|不许编造|不编数据/, "防幻觉约束被删了");
 });
 
-test("工具集：28 个工具都注册了（少一个说明改坏了）", () => {
+test("工具集：29 个工具都注册了（少一个说明改坏了）", () => {
   const names = [
     "get_summary", "query_workouts", "stats_workouts", "trends", "records",
     "compare_periods", "streaks", "update_workout", "delete_workout",
@@ -34,6 +34,7 @@ test("工具集：28 个工具都注册了（少一个说明改坏了）", () =>
     "list_repo_dir", "read_repo_file", "write_plan",
     "set_reminder", "list_reminders", "cancel_reminder", "coach_check",
     "plan_save", "plan_list", "plan_progress", "plan_mark", "usage_stats",
+    "chat_backup",
   ];
   for (const n of names) {
     assert.ok(new RegExp(`\\b${n}:\\s*tool\\(`).test(SRC), `工具 ${n} 没注册`);

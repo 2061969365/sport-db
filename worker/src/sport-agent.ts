@@ -13,7 +13,9 @@ import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import {
-  REMINDERS_PATH, mergeReminders, readStateJson, rearmPlan, writeStateJson, type ReminderState,
+  CHAT_EXPORT_MIN_GAP_MS, REMINDERS_PATH, chatBackupEnabled, chatPath, formatTranscript,
+  mergeReminders, readStateJson, rearmPlan, shouldExportChat, writeStateJson, writeStateText,
+  type ReminderState,
 } from "./state";
 import {
   NOTES_PATH, NOTES_SEED, PROFILE_PATH, PROFILE_SEED,
@@ -530,6 +532,44 @@ export class SportDbAgent extends Think<Env> {
   }
 
   /**
+   * 对话备份：把当天的对话导出到**私有仓**（公开仓永远不写聊天）。
+   * 节流 5 分钟，避免每句话都提交一次 git；没有配私有仓就静默跳过。
+   */
+  private async maybeExportChat(force = false): Promise<string> {
+    if (!chatBackupEnabled(this.env)) {
+      return "未启用：需要在私有仓上配 STATE_REPO + STATE_PAT（公开数据仓不会写聊天记录）。";
+    }
+    this.sql`CREATE TABLE IF NOT EXISTS chat_export(slot TEXT PRIMARY KEY, at INTEGER, chars INTEGER)`;
+    const last = this.sql`SELECT at FROM chat_export WHERE slot = 'last'` as { at: number }[];
+    const lastAt = last[0]?.at || 0;
+    if (!shouldExportChat(lastAt, Date.now(), force)) {
+      const mins = Math.ceil((CHAT_EXPORT_MIN_GAP_MS - (Date.now() - lastAt)) / 60000);
+      return `刚备份过（${Math.max(0, mins)} 分钟后再自动备份）。`;
+    }
+    try {
+      const msgs = await this.getMessages();
+      const items = msgs.map((m) => {
+        const parts = (m as { parts?: { type?: string; text?: string }[] }).parts;
+        const text = Array.isArray(parts)
+          ? parts.filter((p) => String(p?.type || "").startsWith("text")).map((p) => p.text ?? "").join("")
+          : "";
+        if (text.trim()) return { role: String((m as { role?: string }).role || ""), text };
+        return { role: "", text: "" };
+      }).filter((x) => x.text);
+      if (!items.length) return "这次没有可备份的内容。";
+      const day = bjToday();
+      const md = formatTranscript(items, day);
+      const ok = await writeStateText(this.env, chatPath(day),
+        md, `bot: 对话备份 ${day}（${items.length} 条）`);
+      if (!ok) return "备份失败（私有仓写入没成功，看 Worker 日志）。";
+      this.sql`INSERT OR REPLACE INTO chat_export(slot, at, chars) VALUES ('last', ${Date.now()}, ${md.length})`;
+      return `已备份到私有仓 ${chatPath(day)}（${items.length} 条消息，${md.length} 字符）。`;
+    } catch (e) {
+      return `备份异常：${(e as Error).message}`;
+    }
+  }
+
+  /**
    * turn 跑完（消息已落库、turn 锁已释放）后把答复推回原通道。
    * 这是异步链路的关键：webhook/HTTP 请求早就返回了，长 turn 由 DO 队列跑完，
    * 结果在这里送达 —— 解决了「重计划跑到 80 秒被掐断、用户什么都收不到」。
@@ -565,6 +605,12 @@ export class SportDbAgent extends Think<Env> {
       } else {
         this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
         this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${text}, ${Date.now()})`;
+      }
+      // 对话备份（私有仓才写；节流 5 分钟，失败不影响回复）
+      try {
+        await this.maybeExportChat();
+      } catch (e) {
+        console.error("[chat-export-fail]", e instanceof Error ? e.message : String(e));
       }
     } catch (e) {
       // hook 里抛错会波及框架的收尾记账，这里必须吞掉并留日志。
@@ -891,6 +937,11 @@ export class SportDbAgent extends Think<Env> {
         description: "看这个 agent 自己的用量：对话轮数、失败次数、token 消耗、工具调用次数。用户问「你花了多少」「你用得多不多」时用它。",
         inputSchema: z.object({ days: z.number().int().min(1).max(30).default(7) }),
         execute: async ({ days }: { days?: number }) => self.usageReport(days ?? 7),
+      }),
+      chat_backup: tool({
+        description: "把当前对话备份到私有仓（只存对话文本）。用户说「备份一下我们的聊天」「把对话存起来」时用它。未配私有仓会说明怎么开。",
+        inputSchema: z.object({ force: z.boolean().default(true) }),
+        execute: async ({ force }: { force?: boolean }) => self.maybeExportChat(force !== false),
       }),
       plan_save: tool({
         description: "把排好的训练计划存成结构化计划（可打卡、可看进度）。两步：先不带 confirmed 调一次拿预览，用户确认后再带 confirmed=true。计划必须按次给出日期。",

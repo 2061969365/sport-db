@@ -135,3 +135,86 @@ export function rearmPlan(
 }
 
 export const REMINDERS_PATH = "state/reminders.json";
+
+/** 写纯文本状态文件（聊天导出用 .md，不是 JSON）。同样带 sha 乐观锁。 */
+export async function writeStateText(env: Env, path: string, text: string, message: string): Promise<boolean> {
+  const loc = stateLoc(env);
+  if (!loc) return false;
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 8192)));
+  }
+  const b64 = btoa(bin);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const cur = await fetch(`${API}/${loc.repo}/contents/${path}?ref=main`, { headers: headers(loc) });
+      let sha = "";
+      if (cur.ok) {
+        const j = (await cur.json()) as { sha?: string };
+        sha = j.sha || "";
+      }
+      const put = await fetch(`${API}/${loc.repo}/contents/${path}`, {
+        method: "PUT",
+        headers: headers(loc),
+        body: JSON.stringify({ message, content: b64, branch: "main", ...(sha ? { sha } : {}) }),
+      });
+      if (put.status === 409 || put.status === 422) continue;
+      if (!put.ok) {
+        console.error(`[state-text-fail] ${path} ${put.status}`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.error("[state-text-error]", e instanceof Error ? e.message : String(e));
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * 聊天备份的硬闸门：**只有**配了独立仓（STATE_REPO + STATE_PAT，通常是私有仓）才允许导出。
+ * 公开数据仓里绝不落聊天记录 —— 这是设计红线，不是可配置项。
+ */
+export function chatBackupEnabled(env: Env): boolean {
+  const loc = stateLoc(env);
+  return !!loc && loc.dedicated;
+}
+
+export function chatPath(day: string): string {
+  return `state/chat/${String(day).slice(0, 10)}.md`;
+}
+
+/** 距上次导出不足这个间隔就跳过，免得每句话都提交一次 git。 */
+export const CHAT_EXPORT_MIN_GAP_MS = 5 * 60_000;
+
+export function shouldExportChat(lastAt: number, now: number, force = false): boolean {
+  if (force) return true;
+  if (!lastAt) return true;
+  return now - lastAt >= CHAT_EXPORT_MIN_GAP_MS;
+}
+
+export interface TranscriptItem {
+  role: string;
+  text: string;
+  at?: number;
+}
+
+/** 把一天的对话渲染成 markdown（只留人话，工具调用与内部推理不进备份）。 */
+export function formatTranscript(items: TranscriptItem[], day: string, maxChars = 80_000): string {
+  const head = `# ${day} 对话记录\n\n> 自动备份（私有仓）。只记录对话文本，不含工具调用与内部推理。\n`;
+  const lines: string[] = [];
+  for (const it of items) {
+    const text = String(it.text || "").trim();
+    if (!text) continue;
+    const who = it.role === "user" ? "🧑 我" : "🤖 教练";
+    const ts = it.at ? ` _${new Date(it.at + 8 * 36e5).toISOString().slice(11, 16)}_` : "";
+    lines.push(`### ${who}${ts}\n\n${text}\n`);
+  }
+  const body = lines.join("\n");
+  const out = head + "\n" + body;
+  if (out.length <= maxChars) return out;
+  // 太长就留最近的（更早的内容在之前的导出里）
+  return head + "\n…（更早的内容已省略）\n\n" + body.slice(-maxChars);
+}
