@@ -244,7 +244,8 @@ async function searchAnySearch(env: Env, q: string, limit: number): Promise<stri
 
 /** AnySearch 正文抽取：比裸 HTML 干净，且能处理 JS 渲染页面。 */
 async function extractAnySearch(env: Env, url: string): Promise<{ title: string; content: string } | null> {
-  const t = withTimeout(20_000);
+  // 重型页面抽取可能十几秒，给到 30s（turn 已是异步，慢点没关系）
+  const t = withTimeout(30_000);
   try {
     const r = await fetch(`${AS_BASE(env)}/v1/extract`, {
       method: "POST",
@@ -255,7 +256,12 @@ async function extractAnySearch(env: Env, url: string): Promise<{ title: string;
     if (!r.ok) return null;
     const j = (await r.json()) as AsEnvelope<{ title?: string; content?: string }>;
     if (j.code !== 0 || !j.data?.content) return null;
-    return { title: j.data.title || "", content: j.data.content };
+    // 正文里的图片 markdown 对教练场景是噪音，清掉并压掉多余空行
+    const content = j.data.content
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    return { title: j.data.title || "", content };
   } catch {
     return null;
   } finally {

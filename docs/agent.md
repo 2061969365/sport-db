@@ -31,13 +31,16 @@ Agent 本体在 `worker/src/sport-agent.ts`（Think harness）。三层构成：
 |---|---|---|
 | `current_time` | 当前北京时间 + 星期 + ISO 周，可带偏移天数算「下周六」 | 无 |
 | `weather` | 1~7 天日预报（温度/降水概率/风速），安排户外训练前调 | open-meteo，免 Key |
-| `web_search` | 联网检索：Tavily → DuckDuckGo → 维基百科 逐级降级 | Tavily 需 Key，其余免 Key |
-| `fetch_url` | 抓指定网页并转纯文本（curl 的安全替代：限 http(s)、禁内网） | 无 |
+| `web_search` | 全网搜索，首选 **AnySearch**；不可用时降级 Tavily → DDG → 维基 | AnySearch 匿名可用 |
+| `fetch_url` | 读网页正文，首选 **AnySearch `/v1/extract`**（能读 JS 页面），失败再自己抓 HTML 剥标签 | AnySearch 匿名可用 |
 
-> **搜索的现实**：实测从 Cloudflare 出口发起时，DuckDuckGo 返回反爬挑战页、
-> Mojeek 返回验证码 —— 免 Key 的通用搜索基本被拦，只有 Wikimedia API 通。
-> 要真正的全网搜索得配 `TAVILY_API_KEY`（免费额度够个人用）。
-> 无论走哪级都会标明来源；没搜到就让它如实说「没联网搜到」，**绝不许编**。
+> **搜索已接 AnySearch**（`POST https://api.anysearch.com/v1/search`）：匿名即可用，
+> 实测从 Cloudflare 出口可达、返回真实中文结果（含政府/官网来源）。
+> 想用凭据额度（更稳更高配额）就 `npx wrangler secret put ANYSEARCH_API_KEY`。
+>
+> 降级链仍有意义：AnySearch 挂了 → Tavily（若配了 Key）→ DuckDuckGo → 维基百科。
+> 实测 DDG/Mojeek 对 Cloudflare 出口返反爬页，属于已知兜底而非主路。
+> 无论走哪级都标明来源；没搜到就如实说「没联网搜到」，**绝不许编**。
 
 **仓库文件**（只读 + 受限写）
 

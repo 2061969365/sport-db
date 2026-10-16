@@ -31,7 +31,8 @@ npx wrangler secret put GH_PAT         # 细粒度 PAT，只给该仓 Contents �
 可选增强（不配也能跑）：
 
 ```bash
-npx wrangler secret put TAVILY_API_KEY  # 配了才有真正的全网搜索；不配只有维基兜底
+npx wrangler secret put ANYSEARCH_API_KEY  # 可选：AnySearch 凭据（不配走匿名，也能搜）
+npx wrangler secret put TAVILY_API_KEY     # 可选：AnySearch 不可用时的备选搜索
 ```
 
 ### 两个坑（都真踩过）
@@ -106,7 +107,7 @@ daily ≥ 14000 的卫生下限）。早期写死 806/14082 的断言会在正�
 | 回「模型接口 NNN」 | `VISION_ENDPOINT` 不可达或模型名不对 |
 | 回答像失忆 | 发 `/status` 看水位；涨太高发 `/new` |
 | 长问题（计划类）没回复 | 正常情况下 TG 会显示「正在输入」然后推答复；若始终没有，看 Worker 日志里的 `[onChatResponse-fail]` |
-| 搜索总说「没联网搜到」 | 免 Key 通用搜索被反爬拦（DDG/Mojeek 都拦），配 `TAVILY_API_KEY` 才有全网搜索 |
+| 搜索总说「没联网搜到」 | 看 Worker 日志里 `[web_search]` 的降级原因；正常主路是 AnySearch，全挂才到维基 |
 | 天气工具说不知道城市 | 让用户说一次城市，或设 `HOME_CITY` var |
 | 答复开头粘一串「收到…我来帮你查」 | 模型在工具间隙输出了旁白。代码只取最后一次工具调用之后的文本；若又出现，检查 `notify.ts` 的 `finalReplyText` 分片判断 |
 | 改数没走两步确认 | 检查 `rules` 块是否完整（改 prompt 时最容易漏） |
