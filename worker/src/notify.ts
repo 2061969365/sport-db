@@ -8,7 +8,7 @@ export function clip(text: string, n = 3500): string {
   return units.length <= n ? text : units.slice(0, n).join("");
 }
 
-/** 从 turn 结果 / UIMessage / runTurn 返回值里取纯文本。 */
+/** 从 turn 结果 / UIMessage / runTurn 返回值里取纯文本（含中间旁白）。 */
 export function messageText(result: unknown): string {
   const msg = (result as { message?: { content?: unknown; parts?: { type?: string; text?: string }[] } })?.message;
   if (!msg) return "";
@@ -17,6 +17,31 @@ export function messageText(result: unknown): string {
     return msg.parts.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("");
   }
   return "";
+}
+
+/**
+ * 只取「最终答复」：多步 turn 里模型会在工具调用之间插旁白
+ * （实测计划类回答开头会粘出「收到…我来帮你排…刚看到你的近况…」一串碎片），
+ * 这里丢掉最后一次工具调用之前的文本，只留收尾的正式答复。
+ */
+export function finalReplyText(result: unknown): string {
+  const msg = (result as { message?: { content?: unknown; parts?: { type?: string; text?: string }[] } })?.message;
+  if (!msg) return "";
+  if (typeof msg.content === "string") return msg.content;
+  const parts = Array.isArray(msg.parts) ? msg.parts : [];
+  if (!parts.length) return "";
+  const typeOf = (p: { type?: string }) => String(p?.type || "");
+  const textOf = (p: { type?: string; text?: string }) => (typeOf(p).startsWith("text") ? p.text ?? "" : "");
+  let lastTool = -1;
+  parts.forEach((p, i) => {
+    const t = typeOf(p);
+    if (t && !t.startsWith("text") && t !== "reasoning" && t !== "source-url" && t !== "step-start") {
+      lastTool = i;
+    }
+  });
+  const tail = parts.slice(lastTool + 1).map(textOf).join("");
+  if (tail.trim()) return tail;
+  return parts.map(textOf).join("");
 }
 
 export function tgApi(env: Env, method: string, payload: unknown) {

@@ -8,7 +8,7 @@ import { tool } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
-import { feishuSend, messageText, tgSend, tgTyping } from "./notify";
+import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
@@ -69,6 +69,8 @@ const RULES_BLOCK =
   + "⑤输出计划要能直接执行：分周期/分天，每天写清距离或时长、配速区间（用他库里的真实配速换算）、强度意图，"
   + "并写清休息日与减量周；给依据（心率/跑量/恢复），不要泛泛而谈。"
   + "数据不足就先要信息（周可训练天数、目标赛事与日期、伤病），别硬编一份通用模板。"
+  + "【表达纪律】只有在最终答复里说话：调工具前后不要输出「收到/我来帮你查/正在看数据」这类旁白，"
+  + "用户看到的只有你最后那条答复，中间的话会变成一串碎片粘在开头。"
 
 export class SportDbAgent extends Think<Env> {
   // 内置 workspace 的 bash 工具对本项目无用且危险，直接关闭；
@@ -180,7 +182,7 @@ export class SportDbAgent extends Think<Env> {
       const channel = tv[0]?.channel || "";
       const chatId = tv[0]?.chat_id || "";
 
-      let text = messageText(result).trim();
+      let text = finalReplyText(result).trim();
       if (result?.status !== "completed" || !text) {
         text = result?.status === "aborted"
           ? "这次被中断了（可能你发了 /new），有需要再问一次。"
