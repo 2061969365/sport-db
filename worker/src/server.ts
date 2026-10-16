@@ -1,51 +1,28 @@
-// 入口：Telegram webhook / 飞书事件 → 取对应 Agent 实例 → runTurn(wait) → 回平台。
-// Think 默认的 WebSocket 聊天协议同时保留（routeAgentRequest兜底），供 PWA 接入。
+// 入口：Telegram webhook / 飞书事件 / 网页版 API → 取对应 Agent 实例 → 提交 turn → 原通道回消息。
+// 关键：turn 一律「异步提交 + 完成时回调推送」——重问题（比如要一份训练计划）会跑几十秒到
+// 几分钟，同步等答复会撞平台超时（实测 80.7s 断连，用户什么都收不到）。所以：
+//   /tg        → submitMessages 后立刻回 200，turn 跑完由 onChatResponse 推回 TG
+//   /api/chat  → 先等 70s（快问题当场拿答复）；超时就回 202 + 轮询令牌
+// Think 默认的 WebSocket 聊天协议同时保留（routeAgentRequest 兜底）。
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
 import { ingestPhoto, pickImage } from "./photo";
+import { clip, messageText, tgSend } from "./notify";
 import type { Env } from "./env";
 
 export { SportDbAgent };
 
-function tgApi(env: Env, method: string, payload: unknown) {
-  return fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-/** 按码点截断（slice 会切散 emoji/代理对），留 3500 给 TG 4096 上限。 */
-function clip(text: string, n = 3500): string {
-  const units = Array.from(text);
-  return units.length <= n ? text : units.slice(0, n).join("");
-}
-
-async function tgSend(env: Env, chatId: number | string, text: string): Promise<void> {
-  await tgApi(env, "sendMessage", { chat_id: chatId, text: clip(text) });
-}
-
-function turnText(result: unknown): string {
-  const msg = (result as { message?: { content?: unknown; parts?: { type?: string; text?: string }[] } })?.message;
-  if (!msg) return "";
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.parts)) {
-    return msg.parts.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("");
-  }
-  return "";
-}
-
-async function askAgent(env: Env, instance: string, input: string): Promise<string> {
-  // runTurn(wait) 同步等答复；重推幂等靠入口的 claimUpdate（update_id 去重），
-  // 这里不再假设“同值复写无害”。
+/** 提交一个纯文本 turn（不等待），返回提交 id。 */
+async function submitTurn(
+  env: Env, instance: string, channel: string, target: string, text: string, idemKey: string,
+): Promise<string> {
   const agent = (await getAgentByName(env.SportDbAgent, instance)) as unknown as SportDbAgent;
-  const result = await agent.runTurn({ input, mode: "wait" });
-  const text = turnText(result).trim();
-  if (result.status !== "completed" || !text) {
-    const err = (result as { error?: string }).error;
-    throw new Error(err ? `turn失败：${String(err).slice(0, 200)}` : `turn未完成(status=${result.status ?? "?"})`);
-  }
-  return clip(text);
+  await agent.setReplyTarget(channel, target);
+  const res = await agent.submitMessages(
+    [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }] as never,
+    { idempotencyKey: idemKey },
+  );
+  return res?.submissionId || "";
 }
 
 function feishuText(message: unknown): string {
@@ -143,11 +120,13 @@ export default {
           if (!caption) {
             await tgSend(env, chatId, line);
           } else {
-            const follow = await askAgent(env, `tg-${chatId}`,
+            // 先同步回入库结果（快），再异步提交附言（可能很长，交给 onChatResponse 推）
+            await tgSend(env, chatId, line);
+            await submitTurn(env, `tg-${chatId}`, "tg", String(chatId),
               `[用户发了一张运动截图并附言：${caption}]\n`
               + `[截图识别结果：${JSON.stringify(rec)}]\n`
-              + `[入库情况：${line}]\n请先报入库情况，再回答附言。`);
-            await tgSend(env, chatId, follow);
+              + `[入库情况：${line}]\n请针对附言回答，别再重复报入库情况。`,
+              `tg-${update.update_id ?? `${chatId}-${mid}`}`);
           }
         } catch (e) {
           await tgSend(env, chatId, `这张图处理失败（${(e as Error).message}），换张清晰的再发一次。`);
@@ -159,8 +138,9 @@ export default {
         return new Response("ok");
       }
       try {
-        const reply = await askAgent(env, `tg-${chatId}`, text);
-        await tgSend(env, chatId, reply);
+        // 异步提交：长 turn 跑完由 onChatResponse 推回 TG，webhook 立刻 200。
+        await submitTurn(env, `tg-${chatId}`, "tg", String(chatId), text,
+          `tg-${update.update_id ?? `${chatId}-${msg.message_id ?? Date.now()}`}`);
       } catch (e) {
         await tgSend(env, chatId, `抱歉，刚才处理失败（${(e as Error).message}），请稍后重试。`);
       }
@@ -193,13 +173,12 @@ export default {
             const msgId = (ev?.message as { message_id?: string })?.message_id ?? `${Date.now()}`;
             const first = await agent0.claimUpdate(`fs-${chatId}-${msgId}`).catch(() => true);
             if (!first) return new Response("ok-duplicate", { status: 200 });
-            const reply = await askAgent(env, `fs-${chatId}`, text);
-            const token = await feishuToken(env);
-            await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-              body: JSON.stringify({ receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: reply }) }),
-            });
+            // 同样异步：跑完由 onChatResponse 经飞书 API 推回去（飞书未配置时静默无回复，属未验证路径）。
+            await agent0.setReplyTarget("feishu", chatId);
+            await agent0.submitMessages(
+              [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }] as never,
+              { idempotencyKey: `fs-${chatId}-${msgId}` },
+            );
           } catch (e) {
             console.error(`[feishu-reply-fail chat=${chatId}]`, (e as Error).message);
             /* 飞书回失败不抛，避免重试风暴（已打日志） */
@@ -240,10 +219,49 @@ export default {
         if (!(await agent.claimUpdate(`pwa-${key}`))) {
           return Response.json({ error: "重复提交（请用新 key 重试）" }, { status: 409, headers: cors });
         }
-        const reply = await askAgent(env, `pwa-${session}`, text);
-        return Response.json({ reply }, { headers: cors });
+        // 快问题当场给答复；重问题（计划类）等在 70s 以内，超时回 202 让前端轮询。
+        await agent.setReplyTarget("pwa", session);
+        const since = Date.now();
+        const sub = await agent.submitMessages(
+          [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }] as never,
+          { idempotencyKey: `pwa-${key}` },
+        );
+        const done = await agent.waitForSubmission(sub.submissionId, { timeoutMs: 70_000 }).catch(() => null);
+        if (done?.status === "completed") {
+          const reply = (await agent.latestReply(since)).trim();
+          if (reply) return Response.json({ reply }, { headers: cors });
+          // 落库动作可能比 hook 早一点点，交给前端轮询
+        }
+        if (done?.status === "error") {
+          return Response.json(
+            { error: `处理失败（${String(done.error || "").slice(0, 200) || "未知原因"}）` },
+            { status: 500, headers: cors },
+          );
+        }
+        return Response.json({ pending: true, since, submissionId: sub.submissionId }, { status: 202, headers: cors });
       } catch (e) {
         return Response.json({ error: `处理失败（${(e as Error).message}），请稍后重试` }, { status: 500, headers: cors });
+      }
+    }
+
+    // ---------------- 网页版轮询：长 turn 完成后来这里取答复 ----------------
+    if (url.pathname === "/api/chat/result" && request.method === "GET") {
+      const cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      };
+      const session = String(url.searchParams.get("session") || "");
+      const since = Number(url.searchParams.get("since") || 0) || 0;
+      if (!/^[A-Za-z0-9-]{8,64}$/.test(session)) {
+        return Response.json({ error: "session 不对" }, { status: 400, headers: cors });
+      }
+      try {
+        const agent = (await getAgentByName(env.SportDbAgent, `pwa-${session}`)) as unknown as SportDbAgent;
+        const reply = await agent.latestReply(since);
+        return Response.json(reply ? { reply } : { pending: true }, { headers: cors });
+      } catch (e) {
+        return Response.json({ error: `查询失败（${(e as Error).message}）` }, { status: 500, headers: cors });
       }
     }
 
@@ -251,13 +269,4 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function feishuToken(env: Env): Promise<string> {
-  const r = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ app_id: env.FEISHU_APP_ID, app_secret: env.FEISHU_APP_SECRET }),
-  });
-  const data = (await r.json()) as { code?: number; msg?: string; tenant_access_token?: string };
-  if (data.code !== 0) throw new Error(`飞书鉴权失败 code=${data.code} msg=${data.msg}`);
-  return data.tenant_access_token ?? "";
-}
+// 飞书回消息已移到 notify.ts（异步 onChatResponse 里推送）。

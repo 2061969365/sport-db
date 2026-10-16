@@ -8,6 +8,7 @@ import { tool } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
+import { feishuSend, messageText, tgSend, tgTyping } from "./notify";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
 import {
   WORKOUT_TYPES, buildProfile, loadWorkouts,
@@ -130,6 +131,74 @@ export class SportDbAgent extends Think<Env> {
     });
     session.compactAfter(320_000);
     return session;
+  }
+
+  /** 记住这条会话的回复去处：异步 turn 完成后由 onChatResponse 推回去。 */
+  @callable()
+  async setReplyTarget(channel: string, chatId: string): Promise<void> {
+    this.sql`CREATE TABLE IF NOT EXISTS reply_target (slot TEXT PRIMARY KEY, channel TEXT, chat_id TEXT, at INTEGER)`;
+    this.sql`INSERT OR REPLACE INTO reply_target(slot, channel, chat_id, at) VALUES ('current', ${channel}, ${chatId}, ${Date.now()})`;
+  }
+
+  /** 网页版轮询用：取 since 之后的最新回复。 */
+  @callable()
+  async latestReply(since: number): Promise<string> {
+    this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+    const rows = this.sql`SELECT text, at FROM pwa_reply WHERE slot = 'latest'` as { text: string; at: number }[];
+    if (!rows.length || rows[0].at <= (Number(since) || 0)) return "";
+    return rows[0].text || "";
+  }
+
+  /** 每一步开始时刷新 TG「正在输入」：长 turn（计划类）期间让用户看到还在跑。 */
+  async onStepFinish(): Promise<void> {
+    try {
+      const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
+        { channel?: string; chat_id?: string }[];
+      if (tv[0]?.channel === "tg" && tv[0]?.chat_id) {
+        await tgTyping(this.env, tv[0].chat_id);
+      }
+    } catch { /* 指示丢了无所谓 */ }
+  }
+
+  /**
+   * turn 跑完（消息已落库、turn 锁已释放）后把答复推回原通道。
+   * 这是异步链路的关键：webhook/HTTP 请求早就返回了，长 turn 由 DO 队列跑完，
+   * 结果在这里送达 —— 解决了「重计划跑到 80 秒被掐断、用户什么都收不到」。
+   * 重启后 hook 可能被重放（recovered），用 requestId 去重避免重复推送。
+   */
+  async onChatResponse(result: { message?: unknown; requestId?: string; status?: string; error?: string }): Promise<void> {
+    try {
+      const reqId = String(result?.requestId || "") || `t${Date.now()}`;
+      this.sql`CREATE TABLE IF NOT EXISTS notified (id TEXT PRIMARY KEY, at INTEGER)`;
+      const seen = this.sql`SELECT id FROM notified WHERE id = ${reqId}` as { id: string }[];
+      if (seen.length) return;
+      this.sql`INSERT OR REPLACE INTO notified(id, at) VALUES (${reqId}, ${Date.now()})`;
+      this.sql`DELETE FROM notified WHERE at < ${Date.now() - 3 * 864e5}`;
+
+      const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
+        { channel?: string; chat_id?: string }[];
+      const channel = tv[0]?.channel || "";
+      const chatId = tv[0]?.chat_id || "";
+
+      let text = messageText(result).trim();
+      if (result?.status !== "completed" || !text) {
+        text = result?.status === "aborted"
+          ? "这次被中断了（可能你发了 /new），有需要再问一次。"
+          : `这次没处理成功（${String(result?.error || result?.status || "未知原因").slice(0, 160)}），换个问法或稍后再试。`;
+      }
+      if (!text) return;
+      if (channel === "tg" && chatId) {
+        await tgSend(this.env, chatId, text);
+      } else if (channel === "feishu" && chatId) {
+        await feishuSend(this.env, chatId, text);
+      } else {
+        this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+        this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${text}, ${Date.now()})`;
+      }
+    } catch (e) {
+      // hook 里抛错会波及框架的收尾记账，这里必须吞掉并留日志。
+      console.error("[onChatResponse-fail]", e instanceof Error ? e.message : String(e));
+    }
   }
 
   configureContext() {    // 不传 provider → 自动落 durable per-agent SQLite，且经 set_context 可写。

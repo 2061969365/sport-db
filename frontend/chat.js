@@ -170,14 +170,42 @@ async function buildSummary30d() {
 }
 
 /* ================= 经 Worker 走 Agent（工具+记忆+规则全套，不再直调网关） ================= */
-async function askBot(botBase, session, key, question) {
-  const r = await fetch(`${String(botBase).replace(/\/$/, '')}/api/chat`, {
+function botBaseOf(botBase) {
+  return String(botBase).replace(/\/$/, '');
+}
+
+/** 重问题（计划类）服务端会回 202：拿 since 轮询，最长等 6 分钟。 */
+async function pollReply(base, session, since, isAlive) {
+  const deadline = Date.now() + 360000;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 4000));
+    if (!isAlive()) throw new Error('已取消发送');
+    let data = null;
+    try {
+      const r = await fetch(`${base}/api/chat/result?session=${encodeURIComponent(session)}&since=${since}`);
+      data = await r.json();
+      if (!r.ok) throw new Error((data && data.error) || `轮询 HTTP ${r.status}`);
+    } catch (err) {
+      if (Date.now() > deadline) throw err;
+      continue; // 网络抖动继续轮询
+    }
+    if (data && data.reply) return String(data.reply);
+    if (Date.now() > deadline) throw new Error('等太久了还没算完，去 Telegram 里问可能更快');
+  }
+}
+
+async function askBot(botBase, session, key, question, isAlive) {
+  const base = botBaseOf(botBase);
+  const r = await fetch(`${base}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session, key, text: question }),
   });
   let data = null;
   try { data = await r.json(); } catch { /* fallthrough */ }
+  if (r.status === 202 && data && data.pending) {
+    return pollReply(base, session, data.since, isAlive || (() => true));
+  }
   if (!r.ok) throw new Error((data && data.error) || `Bot 服务 HTTP ${r.status}`);
   if (!data || !data.reply) throw new Error('Bot 返回为空');
   return String(data.reply).slice(0, REPLY_CLIP);
@@ -195,6 +223,7 @@ const hintEl = document.getElementById('cfg-hint');
 
 let history = loadHistory();
 let sending = false;
+let sendToken = 0; // 每次发送自增：轮询中的旧请求据此判断自己已过期
 
 (function initSettings() {
   const cfg = loadConfig();
@@ -276,6 +305,7 @@ async function send(question, isRetry) {
   if (!question || sending) return;
   const cfg = loadConfig();
   sending = true;
+  sendToken++; // 新一轮：让还在轮询的旧请求自行放弃
   sendBtn.disabled = true;
   sendBtn.textContent = '发送中…';
   try {
@@ -284,13 +314,14 @@ async function send(question, isRetry) {
       saveHistory(history);
       renderAll();
     }
-    const thinking = bubble('bot', '思考中…', 'thinking');
+    const thinking = bubble('bot', '思考中…（复杂问题要跑一会儿，可以切走）', 'thinking');
     logEl.appendChild(thinking);
     logEl.scrollTop = logEl.scrollHeight;
 
     // 摘要卡照常刷新（纯本地展示，不再拼进请求，画像由服务端算）
     buildSummary30d().then((s) => { summaryEl.textContent = s; }).catch(() => {});
-    const reply = await askBot(cfg.bot, cfg.session, newKey(), question);
+    const myToken = sendToken;
+    const reply = await askBot(cfg.bot, cfg.session, newKey(), question, () => myToken === sendToken);
     thinking.remove();
     history.push({ role: 'assistant', content: reply, ts: Date.now() });
     saveHistory(history);
