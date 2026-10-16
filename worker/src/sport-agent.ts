@@ -142,20 +142,26 @@ export class SportDbAgent extends Think<Env> {
   }
 
   /** 提醒到点：由调度器调用，把话推到当前通道。 */
-  async fireReminder(payload: { text?: string; once?: boolean; id?: string }): Promise<void> {
+  async fireReminder(payload: { text?: string; once?: boolean }): Promise<void> {
     const text = String(payload?.text || "").trim() || "该训练了。";
+    const body = `⏰ 提醒：${text}`;
     try {
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
       const channel = tv[0]?.channel || "";
       const chatId = tv[0]?.chat_id || "";
-      const body = `⏰ 提醒：${text}`;
       if (channel === "tg" && chatId) await tgSend(this.env, chatId, body);
       else if (channel === "feishu" && chatId) await feishuSend(this.env, chatId, body);
-      if (payload?.once && payload?.id) {
-        this.sql`DELETE FROM reminders WHERE id = ${payload.id}`;
+      // 网页版没有主动推送：写进 latest，用户下次打开/轮询时能看到
+      this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+      this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${body}, ${Date.now()})`;
+      this.sql`CREATE TABLE IF NOT EXISTS reminders(id TEXT PRIMARY KEY, when_spec TEXT, text TEXT, kind TEXT, at INTEGER)`;
+      if (payload?.once) {
+        this.sql`DELETE FROM reminders WHERE text = ${text} AND kind = 'once'`;
       }
-      this.sql`INSERT OR REPLACE INTO reminder_log(id, text, at) VALUES (${payload?.id || "?"}, ${text}, ${Date.now()})`;
+      this.sql`CREATE TABLE IF NOT EXISTS reminder_log(id TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+      this.sql`INSERT OR REPLACE INTO reminder_log(id, text, at) VALUES (${`${text}-${Date.now()}`}, ${body}, ${Date.now()})`;
+      console.log(`[reminder-fired channel=${channel}] ${text}`);
     } catch (e) {
       console.error("[fireReminder-fail]", e instanceof Error ? e.message : String(e));
     }
