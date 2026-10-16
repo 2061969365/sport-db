@@ -43,11 +43,18 @@ GitHub 仓库当数据库，Cloudflare Worker 上的 Agent 当大脑，Telegram 
 
 1. TG 收到消息 → Worker 校验 `TG_SECRET` → 取会话对应的 Agent 实例；
 2. `claimUpdate()` 认领这条 update（重复推送直接丢弃，幂等）；
-3. Agent 把规则块 + 记忆块 + 历史拼成 prompt → 调模型；
-4. 模型决定调工具 → 工具从 CSV 读数据（走 DO 缓存，300s 内同 turn 只读一次）；
-5. 工具结果回给模型 → 生成回答 → 截断到 3500 码点 → 回 TG；
-6. 用户若要改数：`update_workout` 先返回预览（**不写**），用户说「确认」后
+3. **异步提交**：`submitMessages()` 入队，webhook 立刻回 200
+   —— 重问题（要一份训练计划）会跑几十秒到几分钟，同步等会撞平台 80 秒断连；
+4. Agent 把规则块 + 记忆块 + 历史拼成 prompt → 调模型；
+5. 模型决定调工具 → 工具从 CSV 读数据（走 DO 缓存，300s 内同 turn 只读一次）；
+6. 需要外部信息时调时间/天气/搜索/抓网页工具，要留存就写 `plans/`；
+7. turn 跑完 → `onChatResponse` 只取「最后一次工具调用之后的文本」（丢掉工具间隙旁白）
+   → 按记录的通道推回 TG/飞书，或写进 latest 供网页轮询；
+8. 用户若要改数：`update_workout` 先返回预览（**不写**），用户说「确认」后
    再调一次带 `confirmed=true` 才真正写回 GitHub（带 sha 乐观锁，冲突重试）。
+
+提醒走 Durable Object 的持久化调度器（`schedule()` → 到点 `fireReminder` → 推同一通道），
+不依赖 Worker 常驻。
 
 ## 关键设计取舍
 
