@@ -65,6 +65,23 @@ export async function tgTyping(env: Env, chatId: number | string): Promise<void>
   await tgApi(env, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => null);
 }
 
+/** 长回复按行切成多条（体检报告可能超过单条上限）。 */
+export function splitForTg(text: string, per = 3500): string[] {
+  if (text.length <= per) return [text];
+  const out: string[] = [];
+  let buf = "";
+  for (const line of text.split("\n")) {
+    if ((buf + line).length + 1 > per) {
+      if (buf) out.push(buf);
+      buf = line;
+    } else {
+      buf = buf ? `${buf}\n${line}` : line;
+    }
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
 /** 飞书回消息（先在回调里取 tenant_access_token，再按 chat_id 推）。未配置则静默跳过。 */
 export async function feishuSend(env: Env, chatId: string, text: string): Promise<void> {
   if (!env.FEISHU_APP_ID || !env.FEISHU_APP_SECRET) return;

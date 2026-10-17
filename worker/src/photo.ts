@@ -5,6 +5,17 @@
 import type { Env } from "./env";
 import { WORKOUT_TYPES, appendRow, ghPutFile, putBinaryFile, toWorkoutRow } from "./github";
 import type { VisionRec } from "./github";
+import { loadCfg } from "./modelcfg";
+
+/** 收图用的运行时模型配置（/model 切了模型，收图也跟着走）。 */
+async function runtimeModelCfg(env: Env): Promise<{ endpoint: string; model: string }> {
+  try {
+    const loaded = await loadCfg(env);
+    return { endpoint: loaded.cfg.endpoint, model: loaded.cfg.model };
+  } catch {
+    return { endpoint: env.VISION_ENDPOINT, model: env.VISION_MODEL };
+  }
+}
 
 export const REVIEW_THRESHOLD = 0.8;
 const MAX_BYTES = 12 * 1024 * 1024;
@@ -64,11 +75,12 @@ export async function downloadTgFile(env: Env, fileId: string): Promise<{ bytes:
   return { bytes: buf, mime };
 }
 
-/** 调 vision（https 图片地址），返回解析 JSON。 */
-export async function recognizePhoto(env: Env, imgUrl: string): Promise<VisionRec> {
+/** 调 vision（https 图片地址），返回解析 JSON。模型/网关走运行时配置（/model 可切）。 */
+export async function recognizePhoto(env: Env, imgUrl: string, cfg?: { endpoint: string; model: string }): Promise<VisionRec> {
+  const ep = cfg?.endpoint || env.VISION_ENDPOINT;
   // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
   const body: Record<string, unknown> = {
-    model: env.VISION_MODEL || "deepseek-v4.1-flash-free",
+    model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
     reasoning_effort: "xhigh",
     messages: [{
       role: "user",
@@ -78,7 +90,7 @@ export async function recognizePhoto(env: Env, imgUrl: string): Promise<VisionRe
       ],
     }],
   };
-  const r = await fetch(env.VISION_ENDPOINT, {
+  const r = await fetch(ep, {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
     body: JSON.stringify(body),
@@ -132,7 +144,7 @@ export async function ingestPhoto(
   const imgUrl = `https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}?v=${sha}`;
   let rec: VisionRec;
   try {
-    rec = await recognizePhoto(env, imgUrl);
+    rec = await recognizePhoto(env, imgUrl, await runtimeModelCfg(env));
   } catch (e) {
     // vision 挂了也不能让图变孤儿：进 review，人工看图补录
     const ts0 = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);

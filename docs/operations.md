@@ -200,8 +200,24 @@ chat.completions —— **删了这行会立刻全线报错**。
 已验：`mimo-v2.6-flash-free`（当前）、`deepseek-v4.1-flash-free`（备选）。
 `jev-1.13-free` / `beam-free` 不支持该协议（400 ModelProtocolUnsupported）。
 
-改完 `VISION_MODEL` → `npx wrangler deploy` → 冒烟问一句「我近30天跑了多少」，
-看是否给出**真实数字**（而不是「我看不到你的数据」）。
+**现在不用手工验了**：对话框里发 `/model test` 就跑这三项；`/model <模型名>`
+切换时也会自动体检，不通就拒绝落盘。
+
+### 运行时切换（推荐做法）
+
+模型配置存在数据仓 `config/model.json`，用对话框命令改，无需改代码或重新部署：
+
+```
+/model                      看当前配置
+/model list                 列免费模型
+/model <模型名>              切模型（先体检）
+/model url <域名>            切网关（自动补 /v1/chat/completions）
+/model streaming on|off     流式开关
+/model reset                回 wrangler.toml 默认值
+```
+
+各通道最多 30 秒后跟上（每个 DO 缓存 30 秒）。只有想改**默认值**（`/model reset`
+的落点）时才需要动 `wrangler.toml` + 重新部署。
 
 ## 健康检查
 

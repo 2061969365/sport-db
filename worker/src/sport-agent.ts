@@ -14,6 +14,10 @@ import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, type ChatCompletionLike } from "./gateway";
 import {
+  defaultCfg, formatCfg, listGatewayModels, loadCfg, normalizeEndpoint, parseModelCommand,
+  probeCfg, resetCfg, saveCfg, validModelId, type ModelCfg,
+} from "./modelcfg";
+import {
   CHAT_EXPORT_MIN_GAP_MS, REMINDERS_PATH, chatBackupEnabled, chatPath, formatTranscript,
   mergeReminders, readStateJson, rearmPlan, shouldExportChat, writeStateJson, writeStateText,
   type ReminderState,
@@ -35,13 +39,14 @@ import {
 const COACH_SYS =
   "你是 sport-db 运动库的教练助手。详细指令见 rules 上下文块。";
 
-/** 压缩用摘要：同网关同模型直调，4000 token 上限（推理预留，见实测）。 */
-async function summarizeText(env: Env, prompt: string): Promise<string> {
-  const r = await fetch(env.VISION_ENDPOINT, {
+/** 压缩用摘要：同网关直调（非流式），4000 token 上限（推理预留，见实测）。 */
+async function summarizeText(env: Env, prompt: string, cfg?: ModelCfg): Promise<string> {
+  const ep = cfg?.endpoint || env.VISION_ENDPOINT;
+  const r = await fetch(ep, {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
     body: JSON.stringify({
-      model: env.VISION_MODEL || "deepseek-v4.1-flash-free",
+      model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
       reasoning_effort: "xhigh",
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
@@ -96,22 +101,47 @@ export class SportDbAgent extends Think<Env> {
   // 其余 workspace 文件工具用 rules block 约束（数据只在 GitHub 三个工具里）。
   workspaceBash = false;
 
-  getModel() {
-    // apius2 是免 Key 的 OpenAI-compatible 网关：用哑 key 占位，
-    // 自定义 fetch 会剥掉 Authorization 头再发出去。
+  /** 运行时模型配置（来自仓里 config/model.json，30 秒缓存）。用 /model 命令可改。 */
+  private cfgCache?: { cfg: ModelCfg; at: number };
+
+  /** 取当前生效的模型配置（TTL 内直接用缓存，避免每轮都读 GitHub）。 */
+  private async currentCfg(force = false): Promise<ModelCfg> {
+    if (!force && this.cfgCache && Date.now() - this.cfgCache.at < 30_000) return this.cfgCache.cfg;
+    try {
+      const sql = this.sqlFn();
+      const loaded = await loadCfg(this.env, sql, force);
+      this.cfgCache = { cfg: loaded.cfg, at: Date.now() };
+      return loaded.cfg;
+    } catch (e) {
+      console.error("[cfg-load-fail]", e instanceof Error ? e.message : String(e));
+      return this.cfgCache?.cfg || defaultCfg(this.env);
+    }
+  }
+
+  /** this.sql 的包装（必须以方法形式调用，摘出来会丢 ctx）。 */
+  private sqlFn(): SqlTag {
+    const self = this;
+    return ((s: TemplateStringsArray, ...a: unknown[]) =>
+      (self.sql(s, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>)) as SqlTag;
+  }
+
+  async onStart(): Promise<void> {
+    await this.currentCfg(true).catch(() => null);
+    await this.restoreReminders().catch(() => null);
+  }
+
+  /** 构建模型实例（配置参数化，/model 切换后立即生效）。 */
+  private buildModel(cfg: ModelCfg) {
+    // 免 Key 的 OpenAI-compatible 网关：用哑 key 占位，自定义 fetch 会剥掉 Authorization。
     //
     // 这一层同时负责「别让 agent 死在一个网关上」：
     //   1. 429/5xx/网络抖动 → 退避重试（最多 2 次）；
-    //   2. 仍失败且配了备用网关（VISION_ENDPOINT_ALT/VISION_MODEL_ALT）→ 就地改写
-    //      请求体里的 model 并换 URL 重发一次，用户无感；
-    //   3. 全挂 → 抛出去，由 onChatError 明确告诉用户「模型服务不可用」，
-    //      绝不静默失联。
+    //   2. 网关流式坏了（见 gateway.ts）→ 非流式 + 合成 SSE；
+    //   3. 配了备用网关时全挂可切换；全挂 → 抛出去由 onChatError 明确告知用户。
     const env = this.env;
     const fallbackArmed = () => !!(env.VISION_ENDPOINT_ALT && env.VISION_MODEL_ALT);
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-    // 网关流式坏了（见 gateway.ts）：默认走「非流式 + 合成 SSE」。
-    // 等网关修好，把 MODEL_STREAMING 设成 "on" 就恢复原生流式。
-    const nativeStreaming = String(env.MODEL_STREAMING || "off").toLowerCase() === "on";
+    const nativeStreaming = cfg.streaming;
 
     const raw: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -223,27 +253,116 @@ export class SportDbAgent extends Think<Env> {
     }) as typeof fetch;
 
     const provider = createOpenAI({
-      baseURL: `${this.env.VISION_ENDPOINT.replace(/\/chat\/completions\/?$/, "")}`,
+      baseURL: `${cfg.endpoint.replace(/\/chat\/completions\/?$/, "")}`,
       apiKey: "sportdb-no-key",
       fetch: raw,
     });
     // 必须用 .chat()：provider(model) 默认走 Responses API（/v1/responses），
     // 而本网关的 Responses 事件流缺字段（没有 sequence_number），SDK 校验会直接失败
     // （报 invalid_union / response.created）。我们的网关是 chat.completions 形状的。
-    return provider.chat(this.env.VISION_MODEL || "deepseek-v4.1-flash-free");
+    return provider.chat(cfg.model);
+  }
+
+  getModel() {
+    // Think 每轮取一次；用配置缓存（30 秒 TTL），/model 改完下一轮即生效。
+    return this.buildModel(this.cfgCache?.cfg || defaultCfg(this.env));
   }
 
   getSystemPrompt(): string {
     return COACH_SYS;
   }
 
-  beforeTurn() {
+  async beforeTurn() {
+    // 异步刷新模型配置：别的通道用 /model 改过，这里最多 30 秒后跟上。
+    const cfg = await this.currentCfg();
     // 思考档 xhigh：经 AI SDK providerOptions 透传给 OpenAI-compatible 网关。
-    // 注：实测当前网关收下该参数但用量无变化（档位实际由网关/模型侧决定），
-    // 留在这里等网关生效，不影响现有行为。
+    // 注：实测网关收下该参数但用量无变化（档位实际由网关/模型侧决定）。
     // 输出 token 不设限：推理模型先烧 token 再答，上限会直接腰斩长回复。
-    // 真要控成本应该换档位/换模型，而不是砍上限。
-    return { providerOptions: { openai: { reasoningEffort: "xhigh" as const } } };
+    return {
+      model: this.buildModel(cfg),
+      providerOptions: { openai: { reasoningEffort: "xhigh" as const } },
+    };
+  }
+
+  /**
+   * /model 命令的后端：查看 / 切换模型与网关，全部在 TG 里完成。
+   * 切换前**必须体检通过**——今天就是因为没验，切到坏模型把 bot 切死过一次。
+   */
+  @callable()
+  async modelCommand(raw: string): Promise<string> {
+    const cmd = parseModelCommand(raw);
+    const sql = this.sqlFn();
+    const probeImg = `https://raw.githubusercontent.com/${this.env.REPO}/main/images/2026/10/15-tg68.jpg`;
+
+    if (cmd.action === "help") {
+      return "用法：\n"
+        + "/model — 看当前模型与网关\n"
+        + "/model list — 列网关上的免费模型\n"
+        + "/model test — 三项体检（对话/工具/读图）\n"
+        + "/model <模型名> — 切模型（会先体检）\n"
+        + "/model url <地址> — 切网关（可只写域名）\n"
+        + "/model streaming on|off — 原生流式开关\n"
+        + "/model reset — 恢复 wrangler.toml 默认值";
+    }
+
+    if (cmd.action === "list") {
+      const cur = await this.currentCfg();
+      const r = await listGatewayModels(cur);
+      if (!r.ok) return `列模型失败：${r.error}`;
+      return `网关上的免费模型（共 ${r.models.length} 个）：\n` + r.models.map((m) => `· ${m}`).join("\n")
+        + `\n\n换成某个：/model <模型名>`;
+    }
+
+    if (cmd.action === "test") {
+      const cur = await this.currentCfg(true);
+      const r = await probeCfg(cur, probeImg);
+      return `体检（${cur.model}）：\n` + r.lines.join("\n") + (r.ok ? "\n\n结论：可用。" : "\n\n结论：有问题，别切过去。");
+    }
+
+    if (cmd.action === "reset") {
+      const cfg = await resetCfg(this.env, sql);
+      this.cfgCache = { cfg, at: Date.now() };
+      return `已恢复默认：${cfg.model}\n网关：${cfg.endpoint}`;
+    }
+
+    if (cmd.action === "show") {
+      const loaded = await loadCfg(this.env, sql, true);
+      this.cfgCache = { cfg: loaded.cfg, at: Date.now() };
+      return formatCfg(loaded);
+    }
+
+    if (cmd.action === "streaming") {
+      const loaded = await saveCfg(this.env, sql, { streaming: cmd.on }, "tg:/model");
+      this.cfgCache = { cfg: loaded.cfg, at: Date.now() };
+      return `流式已设为「${cmd.on ? "原生流式" : "非流式+合成SSE"}」。\n`
+        + (cmd.on ? "⚠️ 网关流式目前是坏的，开原生可能报错；出问题就 /model streaming off。" : "这是当前的稳妥设置。");
+    }
+
+    // 切换：先构成目标配置，体检过了再落盘
+    if (cmd.action === "set-url") {
+      const ep = normalizeEndpoint(cmd.endpoint);
+      if (!ep) return "失败：网关地址不合法。例：/model url https://apius2.fastfaster.kdns.fr";
+      const cur = await this.currentCfg(true);
+      const probe = await probeCfg({ ...cur, endpoint: ep }, probeImg);
+      if (!probe.ok) {
+        return `没换：新网关没通过体检，换了会不可用。\n${probe.lines.join("\n")}`;
+      }
+      const loaded = await saveCfg(this.env, sql, { endpoint: ep }, "tg:/model url");
+      this.cfgCache = { cfg: loaded.cfg, at: Date.now() };
+      return `网关已切换 ✅\n${formatCfg(loaded)}\n\n${probe.lines.join("\n")}`;
+    }
+
+    const model = cmd.model.trim();
+    if (!validModelId(model)) return `失败：模型名不合法（${model}）。`;
+    const cur = await this.currentCfg(true);
+    const probe = await probeCfg({ ...cur, model }, probeImg);
+    if (!probe.ok) {
+      return `没换：模型「${model}」没通过体检，换了它会答不上来。\n${probe.lines.join("\n")}\n\n`
+        + `可用清单：/model list`;
+    }
+    const loaded = await saveCfg(this.env, sql, { model }, "tg:/model");
+    this.cfgCache = { cfg: loaded.cfg, at: Date.now() };
+    return `模型已切换到 ${model} ✅\n${formatCfg(loaded)}\n\n${probe.lines.join("\n")}`;
   }
 
   @callable()
@@ -267,7 +386,7 @@ export class SportDbAgent extends Think<Env> {
     // 上下文满了走压缩，不直接报错：32 万 token（400k 窗口的 80%）触发，
     // 太早压没用；中间压成摘要，最近 ~2 万 token 原文保留；失败打日志跳过，不挡对话。
     session.onCompaction(createCompactFunction({
-      summarize: (prompt) => summarizeText(this.env, prompt),
+      summarize: (prompt) => summarizeText(this.env, prompt, this.cfgCache?.cfg),
     }));
     session.onCompactionError((e) => {
       console.error("[compaction-fail]", e instanceof Error ? e.message : String(e));
@@ -364,9 +483,9 @@ export class SportDbAgent extends Think<Env> {
 
   /**
    * 启动时从仓里恢复提醒（换 Cloudflare 账号 / DO 重建后，定时任务不该凭空消失）。
-   * 由框架在 DO 首次激活时调用。
+   * 由 onStart() 调用。
    */
-  async onStart(): Promise<void> {
+  private async restoreReminders(): Promise<void> {
     try {
       const file = await readStateJson<{ reminders?: ReminderState[] }>(this.env, REMINDERS_PATH);
       const items = Array.isArray(file?.reminders) ? file!.reminders! : [];

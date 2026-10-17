@@ -8,7 +8,7 @@ import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
 import { ingestPhoto, pickImage } from "./photo";
 import { ghHealth } from "./github";
-import { clip, messageText, tgSend } from "./notify";
+import { clip, messageText, splitForTg, tgSend } from "./notify";
 import type { Env } from "./env";
 
 export { SportDbAgent };
@@ -144,7 +144,19 @@ export default {
           + "发图记账：运动截图直接发（文件方式最清晰），自动识别入库\n"
           + "改数：跟我说哪条改成多少，我先出预览，你说确认才写\n"
           + "补录：如“昨天跑了5km帮我记上”；删除同理，先预览后执行\n"
-          + "指令：/status 看上下文水位，/new 另起话题（画像保留）");
+          + "指令：/status 上下文水位 · /new 另起话题 · /model 换模型或网关");
+        return new Response("ok");
+      }
+      // /model：运行时切换模型与网关，全部在对话框里完成（含切换前体检）
+      // 注意 TG 会把命令发成 /model@botname，得把 @bot名 摘掉再解析
+      if (/^\/model(@\w+)?(\s|$)/.test(text)) {
+        try {
+          const agent = (await getAgentByName(env.SportDbAgent, `tg-${chatId}`)) as unknown as SportDbAgent;
+          const out = await agent.modelCommand(text.replace(/^\/model(@\w+)?/, "/model"));
+          for (const piece of splitForTg(out)) await tgSend(env, chatId, piece);
+        } catch (e) {
+          await tgSend(env, chatId, `换模型失败（${(e as Error).message}）。`);
+        }
         return new Response("ok");
       }
       if (text === "/status" || text === "水位" || text === "上下文") {
@@ -273,6 +285,11 @@ export default {
         }
         if (!(await agent.claimUpdate(`pwa-${key}`))) {
           return Response.json({ error: "重复提交（请用新 key 重试）" }, { status: 409, headers: cors });
+        }
+        // /model 之类的本地指令直接处理，不进模型（TG 与网页共用同一套）。
+        if (/^\/model(@\w+)?(\s|$)/.test(text) || /^\/(模型)(\s|$)/.test(text)) {
+          const out = await agent.modelCommand(text.replace(/^\/模型/, "/model").replace(/^\/model(@\w+)?/, "/model"));
+          return Response.json({ reply: out, pending: false }, { headers: cors });
         }
         // 快问题当场给答复；重问题（计划类）等在 70s 以内，超时回 202 让前端轮询。
         await agent.setReplyTarget("pwa", session);
