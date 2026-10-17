@@ -1,0 +1,7 @@
+{
+ "endpoint": "https://apius2.fastfaster.kdns.fr/v1/chat/completions",
+ "model": "mimo-v2.6-flash-free",
+ "streaming": false,
+ "savedAt": 1792224315559,
+ "by": "tg:/model"
+}
