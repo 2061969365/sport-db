@@ -168,6 +168,41 @@ npx wrangler secret put GH_PAT
 两者都在上面的私有仓里：换账号后新 worker 一启动就会**自动重挂提醒**，
 对话历史则以文件形式留档（不会自动灌回新 DO 的会话记忆——需要的话说一声）。
 
+## 模型选择与网关适配（换模型必读）
+
+当前生产模型：`mimo-v2.6-flash-free`（`wrangler.toml` 的 `VISION_MODEL`）。
+同一个 var 同时管**对话 / 截图识别 / 上下文压缩摘要**，所以换模型必须三项都验。
+
+### 两个坑，都真踩过
+
+**1. 必须用 `provider.chat()`，不能用 `provider(model)`。**
+AI SDK v7 的 OpenAI provider 默认走 **Responses API**（请求发到 `/v1/responses`），
+而本网关的 Responses 事件流不完整（缺 `sequence_number`），SDK 直接报
+`invalid_union / Type validation failed`。`getModel()` 里已显式 `.chat()` 走
+chat.completions —— **删了这行会立刻全线报错**。
+
+**2. 网关的流式通道是坏的（2026-10-17 实测）。**
+流式请求结尾会被塞一个 Responses 格式的
+`{"type":"response.failed","response":{"error":{"code":"upstream_truncated"}}}`，
+缺终止语义 → SDK 类型校验失败；**十个免费模型全一样**，非流式则完全正常。
+
+应对：`src/gateway.ts` 做协议适配 —— 要求流式的请求实际**用非流式发出**，
+再把 JSON 结果合成合法的 chat.completions SSE 交回 SDK。用户侧无感
+（本项目本来就是 turn 跑完才推送，不逐字输出）。
+开关：var `MODEL_STREAMING`，默认 `"off"` 走适配层；网关修好后设 `"on"` 恢复原生流式。
+
+### 换模型前的三项体检
+
+1. **流式结尾干净**：出现 `[DONE]` 且没有 `response.failed`；
+2. **工具调用**：`finish_reason=tool_calls`；
+3. **读图**：拿仓里真实运动截图，看能否读出 distance/duration。
+
+已验：`mimo-v2.6-flash-free`（当前）、`deepseek-v4.1-flash-free`（备选）。
+`jev-1.13-free` / `beam-free` 不支持该协议（400 ModelProtocolUnsupported）。
+
+改完 `VISION_MODEL` → `npx wrangler deploy` → 冒烟问一句「我近30天跑了多少」，
+看是否给出**真实数字**（而不是「我看不到你的数据」）。
+
 ## 健康检查
 
 ```bash

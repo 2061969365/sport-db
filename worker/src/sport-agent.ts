@@ -12,6 +12,7 @@ import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
 import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
+import { gatewayError, nonStreamToSse, type ChatCompletionLike } from "./gateway";
 import {
   CHAT_EXPORT_MIN_GAP_MS, REMINDERS_PATH, chatBackupEnabled, chatPath, formatTranscript,
   mergeReminders, readStateJson, rearmPlan, shouldExportChat, writeStateJson, writeStateText,
@@ -40,7 +41,7 @@ async function summarizeText(env: Env, prompt: string): Promise<string> {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
     body: JSON.stringify({
-      model: env.VISION_MODEL || "muse-spark-1.3-contributor-free",
+      model: env.VISION_MODEL || "deepseek-v4.1-flash-free",
       reasoning_effort: "xhigh",
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
@@ -108,6 +109,9 @@ export class SportDbAgent extends Think<Env> {
     const env = this.env;
     const fallbackArmed = () => !!(env.VISION_ENDPOINT_ALT && env.VISION_MODEL_ALT);
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    // 网关流式坏了（见 gateway.ts）：默认走「非流式 + 合成 SSE」。
+    // 等网关修好，把 MODEL_STREAMING 设成 "on" 就恢复原生流式。
+    const nativeStreaming = String(env.MODEL_STREAMING || "off").toLowerCase() === "on";
 
     const raw: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -115,18 +119,76 @@ export class SportDbAgent extends Think<Env> {
       headers.delete("authorization"); // 免 Key 网关：别把占位 key 发出去
       const bodyText = typeof init?.body === "string" ? init.body : null;
 
+      // 请求体预处理：需要合成 SSE 时，把 stream 关掉
+      let sendBody = bodyText;
+      let synthSse = false;
+      let wantUsage = false;
+      if (bodyText) {
+        try {
+          const b = JSON.parse(bodyText) as Record<string, unknown>;
+          if (b.stream === true) {
+            wantUsage = !!b.stream_options;
+            if (!nativeStreaming) {
+              synthSse = true;
+              b.stream = false;
+              delete b.stream_options;
+              sendBody = JSON.stringify(b);
+            }
+          }
+        } catch { /* 非 JSON 体就原样发 */ }
+      }
+
       const send = async (targetUrl: string, body: string | null, extra?: Record<string, string>) => {
         const h = new Headers(headers);
         if (extra) for (const [k, v] of Object.entries(extra)) h.set(k, v);
+        try {
+          const b = body ? JSON.parse(body) : null;
+          console.log("[model-req]", targetUrl.replace("https://apius2.fastfaster.kdns.fr", ""),
+            JSON.stringify({
+              keys: b ? Object.keys(b).join(",") : "-",
+              tools: (b?.tools || []).length,
+              msgs: (b?.messages || []).length,
+              kb: b ? Math.round(JSON.stringify(b).length / 1024) : 0,
+              effort: b?.reasoning_effort, stream: b?.stream, synth: synthSse,
+            }));
+        } catch { /* 记录失败无所谓 */ }
         return fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
+      };
+
+      /** 非流式结果 → 合成 SSE。返回 null 表示响应体不可用（交给上层按失败处理）。 */
+      const synthesize = async (r: Response): Promise<Response | null> => {
+        let json: ChatCompletionLike;
+        try {
+          json = (await r.json()) as ChatCompletionLike;
+        } catch {
+          return null;
+        }
+        const sse = nonStreamToSse(json, wantUsage);
+        if (!sse) {
+          lastErr = new Error(`网关返回异常：${gatewayError(json)}`);
+          return null;
+        }
+        return new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream; charset=utf-8" },
+        });
       };
 
       let lastErr: unknown = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const r = await send(url, bodyText);
+          const r = await send(url, sendBody);
           if (r.status === 429 || r.status >= 500) {
             lastErr = new Error(`网关 ${r.status}`);
+            if (attempt < 2) {
+              await sleep(800 * (attempt + 1));
+              continue;
+            }
+            break;
+          }
+          if (synthSse) {
+            const made = await synthesize(r);
+            if (made) return made;
             if (attempt < 2) {
               await sleep(800 * (attempt + 1));
               continue;
@@ -165,7 +227,10 @@ export class SportDbAgent extends Think<Env> {
       apiKey: "sportdb-no-key",
       fetch: raw,
     });
-    return provider(this.env.VISION_MODEL || "muse-spark-1.3-contributor-free");
+    // 必须用 .chat()：provider(model) 默认走 Responses API（/v1/responses），
+    // 而本网关的 Responses 事件流缺字段（没有 sequence_number），SDK 校验会直接失败
+    // （报 invalid_union / response.created）。我们的网关是 chat.completions 形状的。
+    return provider.chat(this.env.VISION_MODEL || "deepseek-v4.1-flash-free");
   }
 
   getSystemPrompt(): string {

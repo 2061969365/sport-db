@@ -34,5 +34,10 @@ export interface Env {
    */
   STATE_REPO?: string;
   STATE_PAT?: string;
+  /**
+   * 网关流式是否可用：默认 "off"（走非流式 + 合成 SSE，绕过网关流式中断的毛病）；
+   * 哪天网关修好了，设成 "on" 就恢复原生流式。
+   */
+  MODEL_STREAMING?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;
 }

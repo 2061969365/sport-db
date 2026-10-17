@@ -20,9 +20,13 @@ new_sqlite_classes = ["SportDbAgent"]
 # 公开仓库 2061969365/sport-db，分支 main。
 # Bot 从 GitHub Contents API 读写 data/workouts/<年>.csv + data/daily/<年>.csv。
 REPO = "2061969365/sport-db"
-# 免 Key 网关（不设 max_tokens）。默认模型按任务要求：
+# 免 Key 网关。模型 2026-10-17 换：上一个 muse-spark-1.3-contributor-free 被官方下线
+# （410 ModelDeprecated），机器人整个坏掉。
+# 选 deepseek-v4.1-flash-free：实测流式/工具/读图三项全通，且真实 SDK 请求能跑通。
+# （mimo-v2.6-flash-free 裸测也全通，但在真实 SDK 请求下网关会回 Responses API 格式导致
+#  解析失败，见 docs/operations.md 的「模型选择」一节。）
 VISION_ENDPOINT = "https://apius2.fastfaster.kdns.fr/v1/chat/completions"
-VISION_MODEL = "muse-spark-1.3-contributor-free"
+VISION_MODEL = "mimo-v2.6-flash-free"
 # 天气工具默认城市（留空 / 删掉则让用户每次说城市）。也可改用 HOME_LAT/HOME_LON。
 # HOME_CITY = "上海"
 

@@ -68,7 +68,7 @@ export async function downloadTgFile(env: Env, fileId: string): Promise<{ bytes:
 export async function recognizePhoto(env: Env, imgUrl: string): Promise<VisionRec> {
   // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
   const body: Record<string, unknown> = {
-    model: env.VISION_MODEL || "muse-spark-1.3-contributor-free",
+    model: env.VISION_MODEL || "deepseek-v4.1-flash-free",
     reasoning_effort: "xhigh",
     messages: [{
       role: "user",
