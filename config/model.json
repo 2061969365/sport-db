@@ -1,7 +1,7 @@
 {
  "endpoint": "https://apius2.fastfaster.kdns.fr/v1/chat/completions",
- "model": "deepseek-v4.1-flash-free",
+ "model": "mimo-v2.6-flash-free",
  "streaming": false,
- "savedAt": 1792224340832,
+ "savedAt": 1792224361380,
  "by": "tg:/model"
 }
