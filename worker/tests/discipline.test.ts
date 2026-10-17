@@ -25,11 +25,11 @@ test("铁律：失败必须如实说，不许把失败讲成没有数据", () =>
   assert.match(SRC, /绝不许编|不许编造|不编数据/, "防幻觉约束被删了");
 });
 
-test("工具集：29 个工具都注册了（少一个说明改坏了）", () => {
+test("工具集：30 个工具都注册了（少一个说明改坏了）", () => {
   const names = [
     "get_summary", "query_workouts", "stats_workouts", "trends", "records",
     "compare_periods", "streaks", "update_workout", "delete_workout",
-    "append_workout", "list_review", "confirm_review",
+    "append_workout", "list_review", "confirm_review", "retry_review",
     "current_time", "weather", "web_search", "fetch_url",
     "list_repo_dir", "read_repo_file", "write_plan",
     "set_reminder", "list_reminders", "cancel_reminder", "coach_check",

@@ -442,8 +442,7 @@ export async function toolListReview(env: Env): Promise<string> {
   return JSON.stringify({ total: out.length, items: out });
 }
 
-/** confirm_review：把某条 review 确认入库（写行+删 review 文件），两阶段同样要 confirmed。 */
-export async function toolConfirmReview(
+/** confirm_review：把某条 review 确认入库（写行+删 review 文件），两阶段同样要 confirmed。 */export async function toolConfirmReview(
   env: Env, path: string, confirmed: boolean, actor: string, sql?: SqlTag,
 ): Promise<string> {
   if (!env.GH_PAT) return "失败：写库未授权（Worker 缺 GH_PAT）。";

@@ -13,6 +13,7 @@ import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, type ChatCompletionLike } from "./gateway";
+import { retryReview } from "./photo.ts";
 import {
   defaultCfg, formatCfg, listGatewayModels, loadCfg, normalizeEndpoint, parseModelCommand,
   probeCfg, resetCfg, saveCfg, validModelId, type ModelCfg,
@@ -1000,6 +1001,20 @@ export class SportDbAgent extends Think<Env> {
         description: "列出待确认的截图识别项（review/）。用户问有没有没入库的图、或要确认之前没看清的图时调它。",
         inputSchema: z.object({}),
         execute: async () => toolListReview(env),
+      }),
+      retry_review: tool({
+        description: "对 review 里某条**重新识别**（原图还在，当时的失败多半是一次性抖动，"
+          + "比如图刚提交、网关还没抓到）。用户说「再试一次识图」「重试那条」时用它。"
+          + "先不带 confirmed 出预览，用户明确确认后再 confirmed=true 写库。",
+        inputSchema: z.object({
+          file: z.string().describe("review/ 下的文件名或完整路径，先调 list_review 拿"),
+          confirmed: z.boolean().default(false).describe("是否已获用户明确确认（写库必须 true）"),
+        }),
+        execute: async ({ file, confirmed }: { file: string; confirmed?: boolean }) => {
+          const raw = String(file || "").trim();
+          const path = raw.startsWith("review/") ? raw : `review/${raw}`;
+          return retryReview(env, path, !!confirmed, `agent:${this.name}`);
+        },
       }),
       confirm_review: tool({
         description: "把某条 review 确认入库：先不带confirmed调一次拿预览念给用户，用户明确说确认后，再用相同path带confirmed=true调一次；写入后自动删 review 文件。",

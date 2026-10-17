@@ -3,9 +3,9 @@
 // （?v=sha 破缓存）→ confidence 路由：≥0.8 追加 workouts 当年 CSV；
 // 低的进 review。附言由调用方再跑一轮 agent 一并回答。
 import type { Env } from "./env";
-import { WORKOUT_TYPES, appendRow, ghPutFile, putBinaryFile, toWorkoutRow } from "./github";
-import type { VisionRec } from "./github";
-import { loadCfg } from "./modelcfg";
+import { WORKOUT_TYPES, appendRow, ghDeleteFile, ghGetFile, ghPutFile, putBinaryFile, toWorkoutRow } from "./github.ts";
+import type { VisionRec } from "./github.ts";
+import { loadCfg } from "./modelcfg.ts";
 
 /** 收图用的运行时模型配置（/model 切了模型，收图也跟着走）。 */
 async function runtimeModelCfg(env: Env): Promise<{ endpoint: string; model: string }> {
@@ -75,29 +75,65 @@ export async function downloadTgFile(env: Env, fileId: string): Promise<{ bytes:
   return { bytes: buf, mime };
 }
 
-/** 调 vision（https 图片地址），返回解析 JSON。模型/网关走运行时配置（/model 可切）。 */
-export async function recognizePhoto(env: Env, imgUrl: string, cfg?: { endpoint: string; model: string }): Promise<VisionRec> {
+/** 等图片公网可访问再交给 vision。
+ *  踩过的坑：图刚 commit 完就调 vision，raw.githubusercontent.com 还没生效，
+ *  网关那边抓不到图 → 模型回「我看不到截图」→ 明明识别服务没坏却记成失败。
+ *  这里先自己确认能拿到 200，最多等 ~20 秒。 */
+export async function waitForImage(env: Env, url: string, tries = 7, gapMs = 3000): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { method: "HEAD", headers: { "User-Agent": "sport-db/1.0" } });
+      if (r.ok) return true;
+      // 某些 CDN 不认 HEAD：退化成只取前一小段
+      const g = await fetch(url, { headers: { "User-Agent": "sport-db/1.0", Range: "bytes=0-64" } });
+      if (g.ok || g.status === 206) return true;
+    } catch { /* 继续等 */ }
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, gapMs));
+  }
+  return false;
+}
+
+/** 调 vision（https 图片地址），返回解析 JSON。模型/网关走运行时配置（/model 可切）。
+ *  无 JSON（多半是图没抓到 / 网关抖动）就重试，别把一次性抖动记成"识别失败"。 */
+export async function recognizePhoto(
+  env: Env, imgUrl: string, cfg?: { endpoint: string; model: string }, tries = 3,
+): Promise<VisionRec> {
   const ep = cfg?.endpoint || env.VISION_ENDPOINT;
-  // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
-  const body: Record<string, unknown> = {
-    model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
-    reasoning_effort: "xhigh",
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: VISION_PROMPT },
-        { type: "image_url", image_url: { url: imgUrl } },
-      ],
-    }],
-  };
-  const r = await fetch(ep, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(`模型接口 ${r.status}`);
-  const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
-  return parseVisionJson(j.choices?.[0]?.message?.content ?? "");
+  let lastErr: unknown = null;
+  for (let i = 0; i < tries; i++) {
+    // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
+    const body: Record<string, unknown> = {
+      model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
+      reasoning_effort: "xhigh",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: VISION_PROMPT },
+          { type: "image_url", image_url: { url: imgUrl } },
+        ],
+      }],
+    };
+    try {
+      const r = await fetch(ep, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        lastErr = new Error(`模型接口 ${r.status}`);
+      } else {
+        const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
+        return parseVisionJson(j.choices?.[0]?.message?.content ?? "");
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+    // 重试前：等图真能访问（第一轮尤其常见——刚提交完 CDN 还没生效）
+    if (i < tries - 1) {
+      await waitForImage(env, imgUrl, 2, 2500);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 /** 抠 JSON（容忍围栏/废话），补全字段并钳制 confidence。 */
@@ -129,6 +165,56 @@ export function parseVisionJson(raw: string): VisionRec {
 /** parseStart/toWorkoutRow 已收归 github.ts（confirm_review 共用），此处不再重复实现。 */
 
 /**
+ * 重试识别一条 review。
+ * 存在的意义：vision 失败往往是一次性抖动（比如图刚提交、raw CDN 还没生效，
+ * 网关抓不到图 → 模型说"我看不到截图"）。原图还在，就该能重试，而不是让用户重传。
+ */
+export async function retryReview(
+  env: Env, path: string, confirmed: boolean, actor: string,
+): Promise<string> {
+  if (!env.GH_PAT) return "失败：写库未授权（Worker 缺 GH_PAT）。";
+  if (!path.startsWith("review/") || !path.endsWith(".json")) {
+    return "失败：path 必须是 review/ 下的 json（先调 list_review 拿路径）。";
+  }
+  const cur = await ghGetFile(env, path).catch(() => null);
+  if (!cur?.text) return `失败：${path} 不存在或已处理。`;
+  let meta: { image?: string } = {};
+  try {
+    meta = JSON.parse(cur.text) as { image?: string };
+  } catch {
+    return `失败：${path} 不是合法 JSON，请人工处理。`;
+  }
+  const image = String(meta.image || "");
+  if (!image) return `失败：这条记录里没有原图路径，只能人工补录。`;
+
+  const url = `https://raw.githubusercontent.com/${env.REPO}/main/${image}`;
+  const reachable = await waitForImage(env, url, 3, 2000);
+  if (!reachable) return `失败：原图 ${image} 现在也读不到，稍后再试或人工补录。`;
+
+  let rec: VisionRec;
+  try {
+    rec = await recognizePhoto(env, url, await runtimeModelCfg(env), 2);
+  } catch (e) {
+    return `重试仍然失败：${(e as Error).message}。原图和 review 都没动。`;
+  }
+  const row = toWorkoutRow(rec, image);
+  if (!confirmed) {
+    return `重新识别成功，预览（尚未写入）：${row.date} ${rec.type} `
+      + `${rec.distance_km}km/${rec.duration_s}s，心率 ${rec.avg_hr ?? "?"}，confidence ${rec.confidence}。`
+      + `\n原图 ${image}。用户确认后，再用相同 path 带 confirmed=true 重试一次。`;
+  }
+  if (rec.confidence < REVIEW_THRESHOLD) {
+    return `识别出来了但置信度只有 ${rec.confidence}（低于 ${REVIEW_THRESHOLD}），没入库。`
+      + `数据：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s。`
+      + `确认无误的话，用 append_workout 补录。`;
+  }
+  await appendRow(env, row, actor);
+  await ghDeleteFile(env, path, cur.sha, `bot: 重试识别后入库 ${row.date} ${rec.type} via ${actor}`);
+  return `已重新识别并入库：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s`
+    + `（id=${row.id}），review 文件已删。`;
+}
+
+/**
  * 收图主流程（调用方在 server.ts 里接 history/附言）。
  * 返回给用户的回复文本；抛错由调用方转统一文案。
  */
@@ -142,6 +228,8 @@ export async function ingestPhoto(
   const imgPath = `images/${y}/${m}/${d}-tg${mid}.jpg`;
   const sha = await putBinaryFile(env, imgPath, bytes, `bot: TG收图 ${imgPath}`);
   const imgUrl = `https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}?v=${sha}`;
+  // 先等图能公网访问（否则网关抓不到图，模型会说"我看不到截图"）
+  await waitForImage(env, imgUrl, 10, 2500);
   let rec: VisionRec;
   try {
     rec = await recognizePhoto(env, imgUrl, await runtimeModelCfg(env));
