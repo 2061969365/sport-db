@@ -1,7 +1,7 @@
 // 网关适配层：非流式结果 → 合法 SSE。网关流式坏了（见 gateway.ts 注释），这层是命门。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gatewayError, nonStreamToSse } from "../src/gateway.ts";
+import { gatewayError, nonStreamToSse, sseFromResponse } from "../src/gateway.ts";
 
 const parseSse = (sse) => sse.split("\n\n").filter((s) => s.startsWith("data: "))
   .map((s) => s.replace(/^data: /, "")).filter((s) => s !== "[DONE]").map((s) => JSON.parse(s));
@@ -66,4 +66,29 @@ test("空回复也要能合成合法流（不能崩）", () => {
   const frames = parseSse(sse);
   assert.equal(frames[0].choices[0].delta.role, "assistant");
   assert.equal(frames.at(-1).choices[0].finish_reason, "stop");
+});
+
+test("sseFromResponse：只读一次 body，且能拿到 SSE", async () => {
+  const r = Response.json({ id: "a", model: "m", choices: [{ finish_reason: "stop", message: { content: "你好" } }] });
+  const got = await sseFromResponse(r);
+  assert.ok(got.res, "应成功");
+  const txt = await got.res.text();
+  assert.match(txt, /你好/);
+  assert.match(txt, /\[DONE\]/);
+  // 再读一次必须失败：证明 body 只被消费一次（否则会出 "stream locked"）
+  await assert.rejects(() => r.text());
+});
+
+test("sseFromResponse：网关回错误体时给出原因而不是抛异常", async () => {
+  const r = Response.json({ response: { error: { message: "Upstream response was not valid JSON" } } });
+  const got = await sseFromResponse(r);
+  assert.equal(got.res, undefined);
+  assert.match(String(got.error), /not valid JSON/);
+});
+
+test("sseFromResponse：非 JSON 响应也不崩", async () => {
+  const r = new Response("<html>502</html>", { status: 200 });
+  const got = await sseFromResponse(r);
+  assert.equal(got.res, undefined);
+  assert.match(String(got.error), /不是 JSON/);
 });

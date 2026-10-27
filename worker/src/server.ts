@@ -9,6 +9,7 @@ import { SportDbAgent } from "./sport-agent";
 import { ingestPhoto, pickImage } from "./photo";
 import { ghHealth } from "./github";
 import { clip, messageText, splitForTg, tgSend } from "./notify";
+import { loadCfg } from "./modelcfg";
 import type { Env } from "./env";
 
 export { SportDbAgent };
@@ -58,18 +59,29 @@ export default {
         const ctl = new AbortController();
         const timer = setTimeout(() => ctl.abort(), 12_000);
         try {
-          const r = await fetch(`${env.VISION_ENDPOINT.replace(/\/chat\/completions\/?$/, "")}/chat/completions`, {
+          // 用运行时配置（/model 改过的）而不是 env 静态值，否则健康检查会"检查旧网关"。
+          const loaded = await loadCfg(env).catch(() => null);
+          const ep = loaded?.cfg.endpoint || env.VISION_ENDPOINT;
+          const model = loaded?.cfg.model || env.VISION_MODEL;
+          const r = await fetch(ep, {
             method: "POST",
             headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
             body: JSON.stringify({
               // 注意：该网关要求 max_tokens >= 16，写 8 会被 400 拒掉（踩过）
-              model: env.VISION_MODEL, max_tokens: 32,
+              model, max_tokens: 32,
               messages: [{ role: "user", content: "ping" }],
             }),
             signal: ctl.signal,
           });
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          return `主网关 OK（${env.VISION_MODEL}）`;
+          const host = (() => {
+            try {
+              return new URL(ep).host;
+            } catch {
+              return "?";
+            }
+          })();
+          return `主网关 OK（${model} @ ${host}）`;
         } finally {
           clearTimeout(timer);
         }

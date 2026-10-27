@@ -81,3 +81,24 @@ export function gatewayError(json: unknown): string {
   const msg = j?.error?.message || j?.response?.error?.message || j?.message;
   return String(msg || "响应里没有 choices").slice(0, 200);
 }
+
+/**
+ * 把一次**非流式**响应转成 SSE Response。
+ * 只读一次 body（踩过：先 synthesize 再 r.clone().json() → "ReadableStream is locked"）。
+ * 返回 error 时调用方应重试或切备用网关。
+ */
+export async function sseFromResponse(
+  r: Response, includeUsage = false,
+): Promise<{ res?: Response; error?: string }> {
+  let json: ChatCompletionLike;
+  try {
+    json = (await r.json()) as ChatCompletionLike;
+  } catch {
+    return { error: `网关响应不是 JSON（HTTP ${r.status}）` };
+  }
+  const sse = nonStreamToSse(json, includeUsage);
+  if (!sse) return { error: gatewayError(json) };
+  return {
+    res: new Response(sse, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } }),
+  };
+}

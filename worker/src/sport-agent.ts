@@ -12,7 +12,7 @@ import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
 import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
-import { gatewayError, nonStreamToSse, type ChatCompletionLike } from "./gateway";
+import { gatewayError, nonStreamToSse, sseFromResponse, type ChatCompletionLike } from "./gateway";
 import { retryReview } from "./photo.ts";
 import {
   defaultCfg, formatCfg, listGatewayModels, loadCfg, normalizeEndpoint, parseModelCommand,
@@ -188,31 +188,25 @@ export class SportDbAgent extends Think<Env> {
 
       /** 非流式结果 → 合成 SSE。返回 null 表示响应体不可用（交给上层按失败处理）。 */
       const synthesize = async (r: Response): Promise<Response | null> => {
-        let json: ChatCompletionLike;
-        try {
-          json = (await r.json()) as ChatCompletionLike;
-        } catch {
-          return null;
-        }
-        const sse = nonStreamToSse(json, wantUsage);
-        if (!sse) {
-          lastErr = new Error(`网关返回异常：${gatewayError(json)}`);
-          return null;
-        }
-        return new Response(sse, {
-          status: 200,
-          headers: { "content-type": "text/event-stream; charset=utf-8" },
-        });
+        const got = await sseFromResponse(r, wantUsage);
+        if (got.res) return got.res;
+        lastErr = new Error(`网关返回异常：${got.error}`);
+        return null;
       };
 
       let lastErr: unknown = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // 免费网关会限流（"Free usage limit reached"）：这种情况要等更久再试，
+      // 按故障的 0.8s 重试是白费——实测等几秒就能过。
+      const quotaLike = () => /usage limit|rate limit|quota|too many|429/i.test(String((lastErr as Error)?.message || ""));
+      const backoff = (attempt: number) => sleep(quotaLike() ? 4000 * (attempt + 1) : 800 * (attempt + 1));
+      const ATTEMPTS = 4;
+      for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
         try {
           const r = await send(url, sendBody);
           if (r.status === 429 || r.status >= 500) {
             lastErr = new Error(`网关 ${r.status}`);
-            if (attempt < 2) {
-              await sleep(800 * (attempt + 1));
+            if (attempt < ATTEMPTS - 1) {
+              await backoff(attempt);
               continue;
             }
             break;
@@ -220,8 +214,8 @@ export class SportDbAgent extends Think<Env> {
           if (synthSse) {
             const made = await synthesize(r);
             if (made) return made;
-            if (attempt < 2) {
-              await sleep(800 * (attempt + 1));
+            if (attempt < ATTEMPTS - 1) {
+              await backoff(attempt);
               continue;
             }
             break;
@@ -229,23 +223,28 @@ export class SportDbAgent extends Think<Env> {
           return r;
         } catch (e) {
           lastErr = e;
-          if (attempt < 2) {
-            await sleep(800 * (attempt + 1));
+          if (attempt < ATTEMPTS - 1) {
+            await backoff(attempt);
             continue;
           }
         }
       }
 
-      // 主网关彻底不可用：有备用就换过去（改写 model 字段）
-      if (fallbackArmed() && bodyText) {
+      // 主网关彻底不可用：有备用就换过去（改写 model 字段）。
+      // 注意：必须用 sendBody（已把 stream 关掉的那个），并且同样走合成 SSE，
+      // 否则备用网关也会踩同一个"流式断流"的坑。
+      if (fallbackArmed() && sendBody) {
         try {
           const altUrl = `${String(env.VISION_ENDPOINT_ALT).replace(/\/chat\/completions\/?$/, "")}/chat/completions`;
-          const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+          const parsed = JSON.parse(sendBody) as Record<string, unknown>;
           parsed.model = env.VISION_MODEL_ALT;
           const h: Record<string, string> = {};
           if (env.ALT_API_KEY) h.authorization = `Bearer ${env.ALT_API_KEY}`;
           console.error("[model-fallback]", String(lastErr).slice(0, 120));
-          return await send(altUrl, JSON.stringify(parsed), h);
+          const r = await send(altUrl, JSON.stringify(parsed), h);
+          if (!synthSse) return r;
+          const made = await synthesize(r);
+          if (made) return made;
         } catch (e) {
           lastErr = e;
         }

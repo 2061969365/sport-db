@@ -170,7 +170,26 @@ npx wrangler secret put GH_PAT
 
 ## 模型选择与网关适配（换模型必读）
 
-当前生产模型：`mimo-v2.6-flash-free`（`wrangler.toml` 的 `VISION_MODEL`）。
+当前生产配置（2026-10-27）：
+
+| 项 | 值 |
+|---|---|
+| 主网关 | `https://zen.uflash.ccwu.cc/v1/chat/completions` |
+| 模型 | `mimo-v2.6-flash-free` |
+| 备用网关 | `https://apius2.fastfaster.kdns.fr/v1/chat/completions`（`VISION_ENDPOINT_ALT`） |
+| 流式 | 关（`MODEL_STREAMING` 未设 = off，走非流式+合成 SSE） |
+
+运行时配置在数据仓 `config/model.json`，`/model` 命令可改；`wrangler.toml` 只是默认值
+（`/model reset` 的落点），两边保持一致。
+
+**网关额度这件事（重要）**：这两个都是免费网关，会限流。
+- `apius2` 在 2026-10-27 已对免费模型返回 `429 Free usage limit reached`（等于不可用）；
+- `zen` 可用，但**间歇性**限流，表现可能是 `429`，也可能是
+  `Upstream response was not valid JSON` 这种畸形报错（同一个额度问题的不同马甲）。
+
+所以重试策略按"限流"处理：`usage limit / rate limit / quota / 429` 命中时退避
+4s→8s→12s（共 4 次尝试），普通故障仍用 0.8s→1.6s。重试仍失败才切备用网关。
+
 同一个 var 同时管**对话 / 截图识别 / 上下文压缩摘要**，所以换模型必须三项都验。
 
 ### 两个坑，都真踩过
