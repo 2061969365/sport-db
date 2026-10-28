@@ -6,7 +6,7 @@
 // Think 默认的 WebSocket 聊天协议同时保留（routeAgentRequest 兜底）。
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
-import { ingestPhoto, pickImage } from "./photo";
+import { ingestPhoto, pickImage, saveTgPhoto, writeReviewItem } from "./photo";
 import { PAUSED_REPLY, isPaused } from "./pause";
 import { sseText } from "./gateway";
 import { UA_BROWSER } from "./photo";
@@ -17,14 +17,26 @@ import type { Env } from "./env";
 
 export { SportDbAgent };
 
-/** 提交一个纯文本 turn（不等待），返回提交 id。 */
+/** 提交一个 turn（不等待），返回提交 id。
+ *  image：可选的图片 data URL —— 作为 UIMessage 的 file 部件交给模型，
+ *  模型在本轮里直接"看"图，不需要我们再单独打一次上网关的识图请求。 */
 async function submitTurn(
   env: Env, instance: string, channel: string, target: string, text: string, idemKey: string,
+  image?: { dataUrl: string; mediaType?: string },
 ): Promise<string> {
   const agent = (await getAgentByName(env.SportDbAgent, instance)) as unknown as SportDbAgent;
   await agent.setReplyTarget(channel, target);
+  const parts: Record<string, unknown>[] = [{ type: "text", text }];
+  if (image?.dataUrl) {
+    parts.push({
+      type: "file",
+      mediaType: image.mediaType || "image/jpeg",
+      filename: "workout-screenshot.jpg",
+      url: image.dataUrl,
+    });
+  }
   const res = await agent.submitMessages(
-    [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }] as never,
+    [{ id: crypto.randomUUID(), role: "user", parts }] as never,
     { idempotencyKey: idemKey },
   );
   return res?.submissionId || "";
@@ -207,17 +219,27 @@ export default {
       if (picked) {
         const caption = (msg.caption || "").trim();
         try {
-          const { rec, line } = await ingestPhoto(env, picked.fileId, picked.isOrig, mid, `tg:${chatId}`);
-          if (!caption) {
-            await tgSend(env, chatId, line);
-          } else {
-            // 先同步回入库结果（快），再异步提交附言（可能很长，交给 onChatResponse 推）
-            await tgSend(env, chatId, line);
-            await submitTurn(env, `tg-${chatId}`, "tg", String(chatId),
-              `[用户发了一张运动截图并附言：${caption}]\n`
-              + `[截图识别结果：${JSON.stringify(rec)}]\n`
-              + `[入库情况：${line}]\n请针对附言回答，别再重复报入库情况。`,
-              `tg-${update.update_id ?? `${chatId}-${mid}`}`);
+          // 只存图，不自己调识图接口：图片作为消息部件交给模型，让它在对话里直接看。
+          const saved = await saveTgPhoto(env, picked.fileId, picked.isOrig, mid);
+          const guide =
+            `[用户发来一张运动截图，已存档为 ${saved.imgPath}，图片就在这条消息里]\n`
+            + "请先看清图上的数据（类型/距离/时长/配速/心率/日期），再按规则入库：\n"
+            + "1) 用 append_workout 入库，date 用图上日期，source 写 image，note 里带上图片路径；\n"
+            + "2) 任何一项看不清或不确定就别猜：把不确定的字段留空，并在回复里说明；\n"
+            + "3) 图上不是运动记录（聊天/广告/无关图片）就直接告诉我不入库；\n"
+            + "4) 同一次训练已经有记录（同日同距离）就别重复写，提醒我一声；\n"
+            + "5) 回复用一两句话报清楚：入库了什么、哪些没把握。";
+          const text = caption ? `${guide}\n\n[用户附言] ${caption}` : guide;
+          try {
+            await submitTurn(env, `tg-${chatId}`, "tg", String(chatId), text,
+              `tg-${update.update_id ?? `${chatId}-${mid}`}`, saved);
+          } catch (e) {
+            // 图已存好，只是这一轮没跑起来（多半是网关抖动）：
+            // 记进 review，后台会自动重新提交给模型读，用户不用重发。
+            await writeReviewItem(env, saved.imgPath, mid, `提交失败：${(e as Error).message}`, `tg:${chatId}`)
+              .catch(() => null);
+            await tgSend(env, chatId,
+              `图已存好，但这会儿没能识别（${(e as Error).message}）。我会在后台自动重试，成功就告诉你，不用重发。`);
           }
         } catch (e) {
           await tgSend(env, chatId, `这张图处理失败（${(e as Error).message}），换张清晰的再发一次。`);
@@ -294,7 +316,7 @@ export default {
       if (request.method !== "POST") {
         return new Response("method not allowed", { status: 405, headers: cors });
       }
-      let body: { session?: string; key?: string; text?: string } = {};
+      let body: { session?: string; key?: string; text?: string; image?: string } = {};
       try {
         body = await request.json();
       } catch {
@@ -303,8 +325,12 @@ export default {
       const session = String(body.session || "");
       const key = String(body.key || "");
       const text = String(body.text || "").trim().slice(0, 2000);
-      if (!/^[A-Za-z0-9-]{8,64}$/.test(session) || !/^[A-Za-z0-9-]{8,64}$/.test(key) || !text) {
-        return Response.json({ error: "参数不对（session/key/text）" }, { status: 400, headers: cors });
+      // image：data URL（data:image/jpeg;base64,...）。有图时 text 可以只给一句指令。
+      const image = String(body.image || "").trim();
+      const validImage = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image) && image.length < 8_000_000;
+      if (!/^[A-Za-z0-9-]{8,64}$/.test(session) || !/^[A-Za-z0-9-]{8,64}$/.test(key)
+        || (!text && !validImage)) {
+        return Response.json({ error: "参数不对（session/key/text 或 image）" }, { status: 400, headers: cors });
       }
       try {
         const agent = (await getAgentByName(env.SportDbAgent, `pwa-${session}`)) as unknown as SportDbAgent;
@@ -326,8 +352,13 @@ export default {
         // 快问题当场给答复；重问题（计划类）等在 70s 以内，超时回 202 让前端轮询。
         await agent.setReplyTarget("pwa", session);
         const since = Date.now();
+        const parts: Record<string, unknown>[] = [{ type: "text", text: text || "请读取这张图并按规则入库。" }];
+        if (validImage) {
+          const mediaType = image.slice(5, image.indexOf(";"));
+          parts.push({ type: "file", mediaType, filename: "upload.jpg", url: image });
+        }
         const sub = await agent.submitMessages(
-          [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }] as never,
+          [{ id: crypto.randomUUID(), role: "user", parts }] as never,
           { idempotencyKey: `pwa-${key}` },
         );
         const done = await agent.waitForSubmission(sub.submissionId, { timeoutMs: 70_000 }).catch(() => null);

@@ -14,7 +14,8 @@ import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, sseFromResponse, sseText, type ChatCompletionLike } from "./gateway";
-import { autoRetryReviews, retryReview, UA_BROWSER } from "./photo.ts";
+import { autoRetryReviews, imageDataUrl, retryReview, UA_BROWSER } from "./photo.ts";
+import { ghDeleteFile, ghGetFile } from "./github.ts";
 import {
   defaultCfg, formatCfg, listGatewayModels, loadCfg, normalizeEndpoint, parseModelCommand,
   probeCfg, resetCfg, saveCfg, validModelId, type ModelCfg,
@@ -143,7 +144,9 @@ export class SportDbAgent extends Think<Env> {
   }
 
   /**
-   * 每 15 分钟扫一遍 review 里"识别失败"的图，重试识别；成功就入库并通知原通道。
+   * 每 15 分钟扫一遍 review：
+   * - "提交失败"的（新链路：图交给模型读）→ 重新提交一次多模态消息给模型；
+   * - 老式"识图接口失败"的 → 走代码识图兜底。
    * 这样用户不用因为网关抖动而重发截图。
    */
   async visionRetry(): Promise<void> {
@@ -151,8 +154,32 @@ export class SportDbAgent extends Think<Env> {
     if (isPaused(env)) return;
     const results = await autoRetryReviews(env, 1).catch(() => []);
     for (const r of results) {
-      if (!r.ok) continue;
       const chat = String(r.chat || "");
+      if (!r.ok) {
+        // 待重新提交的：把图取回来，当消息部件再丢给模型
+        if (!/待重新提交/.test(r.text)) continue;
+        const meta = await ghGetFile(env, r.path).catch(() => null);
+        let imgPath = "";
+        try {
+          imgPath = String((JSON.parse(meta?.text || "{}") as { image?: string }).image || "");
+        } catch { /* 忽略 */ }
+        if (!imgPath) continue;
+        const dataUrl = await imageDataUrl(env, imgPath).catch(() => null);
+        if (!dataUrl) continue;
+        const ok = await this.submitMessages([{
+          id: crypto.randomUUID(),
+          role: "user",
+          parts: [
+            { type: "text", text: `[补录] 这张运动截图之前没识别成功（已存档为 ${imgPath}），请读取并入库；已有同日同距离记录就别重复写。` },
+            { type: "file", mediaType: "image/jpeg", filename: "retry.jpg", url: dataUrl },
+          ],
+        }] as never, { idempotencyKey: `retry-${r.path}` }).then(() => true).catch(() => false);
+        if (ok) {
+          const sha = (await ghGetFile(env, r.path).catch(() => null))?.sha || "";
+          if (sha) await ghDeleteFile(env, r.path, sha, `bot: 补录已重新提交 ${r.path}`).catch(() => null);
+        }
+        continue;
+      }
       if (chat.startsWith("tg:")) {
         await tgSend(env, chat.slice(3), `补上了 ✅ ${r.text}`);
       }

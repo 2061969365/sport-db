@@ -318,16 +318,81 @@ export async function autoRetryReviews(
       continue;
     }
     // 只重试"识别失败"的；置信度不足属于数据问题，重试没意义
-    if (!meta.error || !/vision|429|502|503|530|模型接口|没有 JSON/i.test(meta.error)) continue;
+    if (!meta.error || !/vision|429|502|503|530|模型接口|没有 JSON|提交失败/i.test(meta.error)) continue;
+    if (/提交失败/.test(meta.error)) {
+      // 新链路（图交给模型读）提交失败：这里不自己识图，交给调用方重新提交多模态消息
+      out.push({ path, ok: false, text: `待重新提交：${meta.error}`, chat: meta.chat });
+      continue;
+    }
     const text = await retryReview(env, path, true, "auto:vision-retry").catch((e) => `失败：${(e as Error).message}`);
     out.push({ path, ok: text.startsWith("已重新识别并入库"), text, chat: meta.chat });
   }
   return out;
 }
 
+/** 把仓库里的图读成 data URL（给"重新提交给模型读"用）。 */
+export async function imageDataUrl(env: Env, imgPath: string): Promise<string | null> {
+  try {
+    const r = await fetch(`https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}`, {
+      headers: { "User-Agent": UA_BROWSER },
+    });
+    if (!r.ok) return null;
+    const buf = new Uint8Array(await r.arrayBuffer());
+    let bin = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < buf.length; i += chunk) bin += String.fromCharCode(...buf.subarray(i, i + chunk));
+    const mediaType = buf[0] === 0x89 && buf[1] === 0x50 ? "image/png" : "image/jpeg";
+    return `data:${mediaType};base64,${btoa(bin)}`;
+  } catch {
+    return null;
+  }
+}
+
+/** 记一条 review（图已存、但没能入库时用），返回文件路径。 */
+export async function writeReviewItem(
+  env: Env, imgPath: string, mid: number | string, error: string, chat?: string,
+): Promise<string> {
+  const ts = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const path = `review/needs-review-tg${mid}-${ts}.json`;
+  await ghPutFile(env, path, JSON.stringify({
+    image: imgPath, error, ...(chat ? { chat } : {}),
+  }, null, 1), "", `bot: 收图待补录 ${path}`);
+  return path;
+}
+
 /**
- * 收图主流程（调用方在 server.ts 里接 history/附言）。
- * 返回给用户的回复文本；抛错由调用方转统一文案。
+ * 收图第一步（不识别）：下载 → 提交到仓 → 返回图片 data URL。
+ *
+ * 为什么不在这里识别：识图应该由**模型在本轮对话里直接看图**完成
+ * （图片作为 UIMessage 的 file 部件），而不是我们另发一次上网关的请求。
+ * 少一次请求 = 少一次限流机会，而且模型能结合上下文判断。
+ */
+export async function saveTgPhoto(
+  env: Env, fileId: string, isOrig: boolean, mid: number | string,
+): Promise<{ imgPath: string; dataUrl: string; mediaType: string }> {
+  if (!env.GH_PAT) throw new Error("未配 GH_PAT，收图入库不可用（问数不受影响）");
+  const { bytes } = await downloadTgFile(env, fileId);
+  const raw = new Uint8Array(bytes);
+  const day = bjNow().toISOString().slice(0, 10);
+  const [y, m, d] = day.split("-");
+  const mediaType = raw[0] === 0x89 && raw[1] === 0x50 ? "image/png" : "image/jpeg";
+  const ext = mediaType === "image/png" ? "png" : "jpg";
+  const imgPath = `images/${y}/${m}/${d}-tg${mid}.${ext}`;
+  await putBinaryFile(env, imgPath, bytes, `bot: TG收图 ${imgPath}`);
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < raw.length; i += chunk) {
+    bin += String.fromCharCode(...raw.subarray(i, i + chunk));
+  }
+  const b64 = btoa(bin);
+  return { imgPath, dataUrl: `data:${mediaType};base64,${b64}`, mediaType };
+}
+
+/**
+ * 收图主流程（旧路径：代码自己调识图接口）。
+ *
+ * ⚠️ 已不再被 server.ts 使用 —— 现在走「图片当消息部件交给模型读」。
+ * 保留是因为 retry_review / 后台补录 / 测试还在用它，且作为模型读图失败时的兜底。
  * chat：来源通道（如 "tg:123456"），写进 review 记录，后台重试成功后好通知回去。
  */
 export async function ingestPhoto(

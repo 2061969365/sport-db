@@ -200,15 +200,28 @@ AI SDK v7 的 OpenAI provider 默认走 **Responses API**（请求发到 `/v1/re
 `invalid_union / Type validation failed`。`getModel()` 里已显式 `.chat()` 走
 chat.completions —— **删了这行会立刻全线报错**。
 
-**2. 网关的流式通道是坏的（2026-10-17 实测）。**
-流式请求结尾会被塞一个 Responses 格式的
-`{"type":"response.failed","response":{"error":{"code":"upstream_truncated"}}}`，
-缺终止语义 → SDK 类型校验失败；**十个免费模型全一样**，非流式则完全正常。
+**2. 一切都要走流式（2026-10-28 修正了旧结论）。**
+旧结论说"流式坏了、非流式才正常"，那是被 `reasoning_effort: xhigh` 污染的：
+本网关**不支持 xhigh**（上游直接 400，流式里表现为 `upstream_truncated`）。
+改成 `high` 后流式可用，而且**非流式请求更容易被回 429/530**。
+所以现在对话、识图、摘要、模型体检、`/health` 全部走流式（`MODEL_STREAMING = "on"`）。
+`src/gateway.ts` 里保留了「非流式 → 合成 SSE」的适配器做兜底，把 `MODEL_STREAMING`
+设成 `"off"` 就能退回旧路径。
 
-应对：`src/gateway.ts` 做协议适配 —— 要求流式的请求实际**用非流式发出**，
-再把 JSON 结果合成合法的 chat.completions SSE 交回 SDK。用户侧无感
-（本项目本来就是 turn 跑完才推送，不逐字输出）。
-开关：var `MODEL_STREAMING`，默认 `"off"` 走适配层；网关修好后设 `"on"` 恢复原生流式。
+**3. 请求头必须像浏览器。**
+该网关在 Cloudflare 后面，对非浏览器客户端回 **403 error 1010**；
+`Authorization` 只检查"有没有"，值是假 key 也行（不带会走匿名小额度，更容易 429）。
+所以统一发 `User-Agent: Mozilla/...` + `Authorization: Bearer 1`。
+
+### 识图不再单独请求网关
+
+收图流程（2026-10-28 起）：**下载 → 存进仓 → 把图作为消息部件（file part）交给模型**。
+模型在当轮对话里直接看图、判断、再调 `append_workout` 入库。
+好处：少一次上网关的请求（免费网关额度极小），且模型能结合上下文判断。
+`ingestPhoto()`（代码自己调识图接口）保留为兜底与旧 review 补录用。
+
+写库去重：`appendRow` 按 `id` 去重（id = 截图时间+类型+距离），
+同一张图被处理两次不会写两行。
 
 ### 换模型前的三项体检
 
