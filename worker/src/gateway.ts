@@ -1,11 +1,15 @@
-// 网关兼容层：本网关的**流式通道**会中途断流（SSE 结尾塞一个 Responses 格式的
-// `upstream_truncated` 错误事件，缺终止语义），导致 AI SDK 报 invalid_union / 类型校验失败。
-// 实测（2026-10-17）所有免费模型流式都挂、非流式正常。
+// 网关兼容层。
 //
-// 解决：对「要求流式」的请求，实际用**非流式**发出去，再把 JSON 结果合成为一段
-// 合法的 chat.completions SSE 交回给 SDK。SDK 拿到的仍是流，用户拿到的仍是完整答复，
-// 只是不再逐字到达（本项目的回复本来就等 turn 结束才推送，无体验损失）。
-// 网关流式恢复后，把 MODEL_STREAMING 设为 "on" 即可走原生流式。
+// 2026-10-28 修正：之前"流式坏了"的结论是被 `reasoning_effort: xhigh` 污染的
+// （该上游不支持 xhigh，直接 400，流式里表现为 upstream_truncated）。
+// 改成 high 后流式可用，且**本网关对非流式请求更容易回 429/530**，
+// 所以现在对话、识图、摘要、体检**一律走流式**（MODEL_STREAMING=on）。
+//
+// 这里保留非流式→合成 SSE 的适配（`sseFromResponse`）作为兜底：哪天必须用非流式，
+// 打开 MODEL_STREAMING=off 就能退回旧路径。
+//
+// `sseText()` 则相反：把一段 SSE 正文收成纯文本，给"自己发流式请求"的地方用
+// （识图 / 摘要 / 体检），这样它们也能享受流式通道。
 
 export interface ChatCompletionLike {
   id?: string;
@@ -101,4 +105,41 @@ export async function sseFromResponse(
   return {
     res: new Response(sse, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } }),
   };
+}
+
+/**
+ * 把一段 SSE 正文收成纯文本（给"自己发流式请求"的地方用：识图 / 摘要 / 体检）。
+ *
+ * 兼容三种情况：
+ * ① 正常 SSE：逐条 data: {...}，累加 choices[0].delta.content
+ * ② 对方忽略 stream 直接回 JSON：按 message.content 取
+ * ③ 混着 reasoning_content：只取正文，思考过程不算答案
+ */
+export function sseText(raw: string): string {
+  const t = raw.trim();
+  if (!t) return "";
+  // ② 直接是 JSON
+  if (t.startsWith("{")) {
+    try {
+      const j = JSON.parse(t) as ChatCompletionLike;
+      const msg = j.choices?.[0]?.message;
+      if (msg && typeof msg.content === "string") return msg.content;
+    } catch { /* 继续按 SSE 解 */ }
+  }
+  let out = "";
+  for (const line of raw.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith(":") || !s.startsWith("data:")) continue; // ": keep-alive" 之类跳过
+    const payload = s.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    if (payload.startsWith("{")) {
+      try {
+        const j = JSON.parse(payload) as ChatCompletionLike;
+        const d = j.choices?.[0] as { delta?: { content?: string | null }; message?: { content?: string | null } };
+        const piece = d?.delta?.content ?? d?.message?.content;
+        if (typeof piece === "string") out += piece;
+      } catch { /* 坏行跳过，别整段失败 */ }
+    }
+  }
+  return out;
 }

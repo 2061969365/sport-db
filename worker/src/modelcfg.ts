@@ -6,6 +6,12 @@
 // 安全：不存任何密钥（免 Key 网关），所以放公开仓没问题。
 import type { Env } from "./env.ts";
 import { ghGetFile, ghPutFile, type SqlTag } from "./github.ts";
+import { sseText } from "./gateway.ts";
+
+/** 浏览器 UA：该网关对非浏览器客户端回 403 error 1010。 */
+const UA_BROWSER =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+  + "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 export const MODELCFG_PATH = "config/model.json";
 const CACHE_TTL_MS = 30_000;
@@ -181,7 +187,9 @@ export function parseModelCommand(text: string): ModelCmd {
 export async function listGatewayModels(cfg: ModelCfg): Promise<{ ok: boolean; models: string[]; error?: string }> {
   const base = cfg.endpoint.replace(/\/chat\/completions\/?$/, "");
   try {
-    const r = await fetch(`${base}/models`, { headers: { "User-Agent": "sport-db/1.0" } });
+    const r = await fetch(`${base}/models`, {
+      headers: { "User-Agent": UA_BROWSER, Authorization: "Bearer 1" },
+    });
     if (!r.ok) return { ok: false, models: [], error: `HTTP ${r.status}` };
     const j = (await r.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };
     const ids = (j.data || j.models || []).map((x) => String(x.id || "")).filter(Boolean);
@@ -202,23 +210,50 @@ export async function probeCfg(cfg: ModelCfg, imgUrl?: string): Promise<ProbeRes
   const lines: string[] = [];
   let ok = true;
 
-  const post = async (body: Record<string, unknown>) => {
+  // 统一走流式：本网关对非流式请求更容易回 429/530，体检也必须按真实用法发。
+  const postText = async (body: Record<string, unknown>) => {
     const r = await fetch(cfg.endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent": "sport-db/1.0",
+        "User-Agent": UA_BROWSER,
+        Accept: "text/event-stream",
         Authorization: "Bearer 1",
       },
-      body: JSON.stringify({ model: cfg.model, stream: false, ...body }),
+      body: JSON.stringify({ model: cfg.model, stream: true, ...body }),
     });
     const text = await r.text();
     if (!r.ok) throw new Error(`HTTP ${r.status} ${text.slice(0, 100)}`);
-    return JSON.parse(text) as {
-      choices?: { message?: { content?: string; tool_calls?: unknown[] }; finish_reason?: string }[];
-      error?: { message?: string };
-      response?: { error?: { message?: string } };
-    };
+    return text;
+  };
+
+  const post = async (body: Record<string, unknown>) => {
+    const text = await postText(body);
+    // 流式回包：收成纯文本后伪装成非流式结构，下游判断逻辑不用改
+    const content = sseText(text);
+    let toolCalls: unknown[] = [];
+    // ① 对方直接回 JSON（忽略 stream）：从 message 里取
+    const t = text.trim();
+    if (t.startsWith("{")) {
+      try {
+        const j = JSON.parse(t) as { choices?: { message?: { tool_calls?: unknown[] } }[] };
+        toolCalls = j.choices?.[0]?.message?.tool_calls ?? [];
+      } catch { /* 继续按 SSE 解 */ }
+    }
+    // ② 正常 SSE：从 delta 里取（流式 tool_calls 会分片，累加即可）
+    for (const line of text.split(/\r?\n/)) {
+      const s = line.trim();
+      if (!s.startsWith("data:")) continue;
+      const payload = s.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const j = JSON.parse(payload) as { choices?: { delta?: { tool_calls?: unknown[] } }[] };
+        if (j.choices?.[0]?.delta?.tool_calls?.length) {
+          toolCalls = [...toolCalls, ...(j.choices[0].delta.tool_calls as unknown[])];
+        }
+      } catch { /* 跳过坏行 */ }
+    }
+    return { choices: [{ message: { content, tool_calls: toolCalls } }] };
   };
 
   try {

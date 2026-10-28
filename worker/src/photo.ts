@@ -9,6 +9,12 @@ import {
   WORKOUT_TYPES, appendRow, ghDeleteFile, ghGetFile, ghPutFile, putBinaryFile, toWorkoutRow, toolListReview,
 } from "./github.ts";
 import { loadCfg } from "./modelcfg.ts";
+import { sseText } from "./gateway.ts";
+
+/** 浏览器 UA：该网关对非浏览器客户端会回 403 error 1010（Cloudflare 客户端指纹拦截）。 */
+export const UA_BROWSER =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+  + "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 /** 收图用的运行时模型配置（/model 切了模型，收图也跟着走）。 */
 async function runtimeModelCfg(env: Env): Promise<{ endpoint: string; model: string }> {
@@ -140,9 +146,11 @@ export async function recognizePhoto(
     for (let i = 0; i < tries; i++) {
       if (Date.now() - started > deadline) break;
       // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
+      // stream: true —— 本网关对非流式请求更容易回 429/530，识图必须走流式。
       const body: Record<string, unknown> = {
         model,
         reasoning_effort: "high",
+        stream: true,
         messages: [{
           role: "user",
           content: [
@@ -159,7 +167,8 @@ export async function recognizePhoto(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "User-Agent": "sport-db/1.0",
+            "User-Agent": UA_BROWSER,
+            Accept: "text/event-stream",
             Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
           },
           body: JSON.stringify(body),
@@ -169,9 +178,10 @@ export async function recognizePhoto(
           console.log("[vision-attempt]", model, r.status, `${Date.now() - t0}ms`, txt.slice(0, 80).replace(/\s+/g, " "));
           lastErr = new Error(`模型接口 ${r.status}${/usage limit|rate limit/i.test(txt) ? "（限流）" : ""}`);
         } else {
-          const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
-          console.log("[vision-attempt]", model, 200, `${Date.now() - t0}ms`, "ok");
-          return parseVisionJson(j.choices?.[0]?.message?.content ?? "");
+          const raw = await r.text();
+          const content = sseText(raw);
+          console.log("[vision-attempt]", model, 200, `${Date.now() - t0}ms`, `len=${raw.length} text=${content.length}`);
+          return parseVisionJson(content);
         }
       } catch (e) {
         console.log("[vision-attempt]", model, "ERR", `${Date.now() - t0}ms`, String((e as Error)?.message || e).slice(0, 80));

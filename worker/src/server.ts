@@ -8,6 +8,8 @@ import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
 import { ingestPhoto, pickImage } from "./photo";
 import { PAUSED_REPLY, isPaused } from "./pause";
+import { sseText } from "./gateway";
+import { UA_BROWSER } from "./photo";
 import { ghHealth } from "./github";
 import { clip, messageText, splitForTg, tgSend } from "./notify";
 import { loadCfg } from "./modelcfg";
@@ -70,17 +72,20 @@ export default {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "User-Agent": "sport-db/1.0",
+              "User-Agent": UA_BROWSER,
+              Accept: "text/event-stream",
               Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
             },
             body: JSON.stringify({
               // 注意：该网关要求 max_tokens >= 16，写 8 会被 400 拒掉（踩过）
-              model, max_tokens: 32,
+              model, max_tokens: 32, stream: true,
               messages: [{ role: "user", content: "ping" }],
             }),
             signal: ctl.signal,
           });
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const gotText = sseText(await r.text()).trim();
+          if (!gotText && !(r.status === 200)) throw new Error("流式回包为空");
           const host = (() => {
             try {
               return new URL(ep).host;

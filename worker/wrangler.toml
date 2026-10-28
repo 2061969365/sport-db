@@ -33,10 +33,9 @@ MODEL_STREAMING = "on"
 # 鉴权头：该网关只认"有没有 Authorization"，值无所谓（DSH 那边配的就是假 key "1"）。
 # 不带头会走匿名小额度，容易被限流，所以默认带上。
 VISION_API_KEY = "1"
-# 网关暂停：2026-10-28 起暂停（zen 额度/稳定性不可控，apius2 已 429）。
+# 网关暂停：2026-10-28 12:20 已解除（换回 zen，用户侧已解决限流问题）。
 # 置 "1" = 不调用模型：聊天回维护提示、截图只存不识别（进 review，恢复后自动补录）。
-# 选好新网关后删掉这行（或设 "0"）再 deploy 即恢复。
-GATEWAY_PAUSED = "1"
+GATEWAY_PAUSED = "0"
 # 备用网关：**已停用**（2026-10-27 起 apius2 对免费模型一律 429，配了只会白打一次请求）。
 # 要用就填这两项，代码里的兜底逻辑仍然保留。
 # VISION_ENDPOINT_ALT = "https://apius2.fastfaster.kdns.fr/v1/chat/completions"

@@ -140,3 +140,13 @@ test("写后失效：appendRow 之后缓存被清，再读会重新拉", async (
   assert.equal(stats.gets > before, true, "写后失效 → 下次读必须重新 GET");
   assert.match(store.text("data/workouts/2026.csv"), /manual-1/);
 });
+
+test("appendRow 按 id 去重：同一 id 写两次只留一行", async () => {
+  const { env, store, sql } = setup();
+  const r = { ...row(), id: "image-1792746646-outdoor_running-4010", date: "2026-10-23" };
+  await appendRow(env, r, "t1", sql);
+  await appendRow(env, { ...r, confidence: "0.95" }, "t2", sql);
+  const text = store.text("data/workouts/2026.csv");
+  const hits = text.split("\n").filter((l) => l.includes("image-1792746646-outdoor_running-4010"));
+  assert.equal(hits.length, 1, "重复 id 只能写一行");
+});

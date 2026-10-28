@@ -1,7 +1,28 @@
-// 网关适配层：非流式结果 → 合法 SSE。网关流式坏了（见 gateway.ts 注释），这层是命门。
+// 网关适配层：非流式结果 → 合法 SSE（兜底）；SSE 正文 → 纯文本（识图/摘要/体检用）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gatewayError, nonStreamToSse, sseFromResponse } from "../src/gateway.ts";
+import { gatewayError, nonStreamToSse, sseFromResponse, sseText } from "../src/gateway.ts";
+
+test("sseText：把流式分片收成完整文本", () => {
+  const sse = [
+    ": keep-alive",
+    'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+    'data: {"choices":[{"delta":{"content":"{\\"distance_km\\":"}}]}',
+    'data: {"choices":[{"delta":{"content":"52.54}"}}]}',
+    "data: [DONE]",
+  ].join("\n\n");
+  assert.equal(sseText(sse), '{"distance_km":52.54}');
+});
+
+test("sseText：对方忽略 stream 直接回 JSON 也能取到", () => {
+  assert.equal(sseText('{"choices":[{"message":{"content":"在的"}}]}'), "在的");
+});
+
+test("sseText：只取正文，不把 reasoning_content 混进来", () => {
+  const sse = 'data: {"choices":[{"delta":{"reasoning_content":"想一下","content":"答案"}}]}\n\n'
+    + "data: [DONE]";
+  assert.equal(sseText(sse), "答案");
+});
 
 const parseSse = (sse) => sse.split("\n\n").filter((s) => s.startsWith("data: "))
   .map((s) => s.replace(/^data: /, "")).filter((s) => s !== "[DONE]").map((s) => JSON.parse(s));

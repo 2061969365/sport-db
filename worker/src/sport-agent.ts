@@ -13,8 +13,8 @@ import { isPaused } from "./pause";
 import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
-import { gatewayError, nonStreamToSse, sseFromResponse, type ChatCompletionLike } from "./gateway";
-import { autoRetryReviews, retryReview } from "./photo.ts";
+import { gatewayError, nonStreamToSse, sseFromResponse, sseText, type ChatCompletionLike } from "./gateway";
+import { autoRetryReviews, retryReview, UA_BROWSER } from "./photo.ts";
 import {
   defaultCfg, formatCfg, listGatewayModels, loadCfg, normalizeEndpoint, parseModelCommand,
   probeCfg, resetCfg, saveCfg, validModelId, type ModelCfg,
@@ -41,26 +41,27 @@ import {
 const COACH_SYS =
   "你是 sport-db 运动库的教练助手。详细指令见 rules 上下文块。";
 
-/** 压缩用摘要：同网关直调（非流式），4000 token 上限（推理预留，见实测）。 */
+/** 压缩用摘要：同网关直调（流式，和对话保持一致），4000 token 上限（推理预留，见实测）。 */
 async function summarizeText(env: Env, prompt: string, cfg?: ModelCfg): Promise<string> {
   const ep = cfg?.endpoint || env.VISION_ENDPOINT;
   const r = await fetch(ep, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "sport-db/1.0",
+      "User-Agent": UA_BROWSER,
+      Accept: "text/event-stream",
       Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
     },
     body: JSON.stringify({
-      model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
+      model: cfg?.model || env.VISION_MODEL || "deepseek-v4.1-flash-free",
       reasoning_effort: "high",
+      stream: true,
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
     }),
   });
   if (!r.ok) throw new Error(`摘要模型接口 ${r.status}`);
-  const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
-  const text = (j.choices?.[0]?.message?.content || "").trim();
+  const text = sseText(await r.text()).trim();
   if (!text) throw new Error("摘要返回为空");
   return text;
 }

@@ -589,6 +589,12 @@ export async function appendRow(
     rows = parseCSV(cur.text);
     if (rows.length) header = Object.keys(rows[0]);
   }
+  // 按 id 去重：id 由「截图时间+类型+距离」构成，同一个 id 就是同一次训练。
+  // 不去重会重复写入——同一张图有两个 review 文件、或用户把同一张截图发两次，
+  // 都会造成重复行（2026-10-28 实测出现过）。
+  if (rows.some((r) => r.id === row.id)) {
+    return path;
+  }
   rows.push(Object.fromEntries(header.map((h) => [h, row[h] ?? ""])));
   const esc = (v: string) => (/[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
   const eol = cur?.text?.includes("\r\n") ? "\r\n" : "\n";
