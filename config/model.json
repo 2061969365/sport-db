@@ -1,7 +1,7 @@
 {
  "endpoint": "https://zen.uflash.ccwu.cc/v1/chat/completions",
- "model": "mimo-v2.6-flash-free",
+ "model": "deepseek-v4.1-flash-free",
  "streaming": false,
- "savedAt": 1793115567456,
- "by": "tg:/model url"
+ "savedAt": 1793150000000,
+ "by": "cli:model-switch"
 }
