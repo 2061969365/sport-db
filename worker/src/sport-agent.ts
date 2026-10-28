@@ -9,11 +9,12 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { Env } from "./env";
 import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
+import { isPaused } from "./pause";
 import { analyzeSignals, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, sseFromResponse, type ChatCompletionLike } from "./gateway";
-import { retryReview } from "./photo.ts";
+import { autoRetryReviews, retryReview } from "./photo.ts";
 import {
   defaultCfg, formatCfg, listGatewayModels, loadCfg, normalizeEndpoint, parseModelCommand,
   probeCfg, resetCfg, saveCfg, validModelId, type ModelCfg,
@@ -45,10 +46,14 @@ async function summarizeText(env: Env, prompt: string, cfg?: ModelCfg): Promise<
   const ep = cfg?.endpoint || env.VISION_ENDPOINT;
   const r = await fetch(ep, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "sport-db/1.0",
+      Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
+    },
     body: JSON.stringify({
       model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
-      reasoning_effort: "xhigh",
+      reasoning_effort: "high",
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
     }),
@@ -129,6 +134,30 @@ export class SportDbAgent extends Think<Env> {
   async onStart(): Promise<void> {
     await this.currentCfg(true).catch(() => null);
     await this.restoreReminders().catch(() => null);
+    // 收图失败的后台重试：免费网关会整站抽风，等它恢复后自动补录。
+    // 网关暂停期间不排这个任务（否则每 15 分钟白打一次网关）。
+    if (!isPaused(this.env)) {
+      await this.scheduleEvery(900, "visionRetry", { v: 1 }).catch(() => null);
+    }
+  }
+
+  /**
+   * 每 15 分钟扫一遍 review 里"识别失败"的图，重试识别；成功就入库并通知原通道。
+   * 这样用户不用因为网关抖动而重发截图。
+   */
+  async visionRetry(): Promise<void> {
+    const env = this.env;
+    if (isPaused(env)) return;
+    const results = await autoRetryReviews(env, 1).catch(() => []);
+    for (const r of results) {
+      if (!r.ok) continue;
+      const chat = String(r.chat || "");
+      if (chat.startsWith("tg:")) {
+        await tgSend(env, chat.slice(3), `补上了 ✅ ${r.text}`);
+      }
+      this.sql`CREATE TABLE IF NOT EXISTS vision_retry_log (path TEXT PRIMARY KEY, at INTEGER, ok INTEGER)`;
+      this.sql`INSERT OR REPLACE INTO vision_retry_log(path, at, ok) VALUES (${r.path}, ${Date.now()}, 1)`;
+    }
   }
 
   /** 构建模型实例（配置参数化，/model 切换后立即生效）。 */
@@ -147,7 +176,8 @@ export class SportDbAgent extends Think<Env> {
     const raw: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-      headers.delete("authorization"); // 免 Key 网关：别把占位 key 发出去
+      // 网关只认"有没有 Authorization"（值是假 key 也行）。不带就按匿名小额度算，容易被限流。
+      headers.set("authorization", `Bearer ${env.VISION_API_KEY || "1"}`);
       const bodyText = typeof init?.body === "string" ? init.body : null;
 
       // 请求体预处理：需要合成 SSE 时，把 stream 关掉
@@ -186,6 +216,20 @@ export class SportDbAgent extends Think<Env> {
         return fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
       };
 
+      // 请求节流：免费网关额度极小，一个 turn 里有多次工具步 = 多次模型请求，
+      // 连续轰会直接 429/530。这里按 DO 记账，保证两次请求至少隔 2.5 秒。
+      const CALL_GAP_MS = 2500;
+      const gateModelCall = async (): Promise<void> => {
+        try {
+          this.sql`CREATE TABLE IF NOT EXISTS model_gate (slot TEXT PRIMARY KEY, at INTEGER)`;
+          const rows = this.sql`SELECT at FROM model_gate WHERE slot = 'last'` as { at: number }[];
+          const last = rows[0]?.at || 0;
+          const wait = last + CALL_GAP_MS - Date.now();
+          if (wait > 0) await sleep(Math.min(wait, 20_000));
+          this.sql`INSERT OR REPLACE INTO model_gate(slot, at) VALUES ('last', ${Date.now()})`;
+        } catch { /* 记账失败不挡请求 */ }
+      };
+
       /** 非流式结果 → 合成 SSE。返回 null 表示响应体不可用（交给上层按失败处理）。 */
       const synthesize = async (r: Response): Promise<Response | null> => {
         const got = await sseFromResponse(r, wantUsage);
@@ -197,11 +241,20 @@ export class SportDbAgent extends Think<Env> {
       let lastErr: unknown = null;
       // 免费网关会限流（"Free usage limit reached"）：这种情况要等更久再试，
       // 按故障的 0.8s 重试是白费——实测等几秒就能过。
-      const quotaLike = () => /usage limit|rate limit|quota|too many|429/i.test(String((lastErr as Error)?.message || ""));
-      const backoff = (attempt: number) => sleep(quotaLike() ? 4000 * (attempt + 1) : 800 * (attempt + 1));
-      const ATTEMPTS = 4;
+      // 另外 zen 偶尔整站 530（Cloudflare 隧道故障 code 1033），几十秒后自愈，
+      // 所以隧道类错误也要退避重试。
+      const errText = () => String((lastErr as Error)?.message || "");
+      const quotaLike = () => /usage limit|rate limit|quota|too many|429/i.test(errText());
+      const tunnelLike = () => /53[0-9]|1033|tunnel|522|524|timeout|aborted/i.test(errText());
+      const backoff = (attempt: number) => {
+        // 额度类错误必须等得更久：免费网关额度很小，急着重试只会把窗口烧穿
+        const base = quotaLike() ? 8000 : tunnelLike() ? 3000 : 800;
+        return sleep(base * (attempt + 1));
+      };
+      const ATTEMPTS = 3;
       for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
         try {
+          await gateModelCall();
           const r = await send(url, sendBody);
           if (r.status === 429 || r.status >= 500) {
             lastErr = new Error(`网关 ${r.status}`);
@@ -275,12 +328,13 @@ export class SportDbAgent extends Think<Env> {
   async beforeTurn() {
     // 异步刷新模型配置：别的通道用 /model 改过，这里最多 30 秒后跟上。
     const cfg = await this.currentCfg();
-    // 思考档 xhigh：经 AI SDK providerOptions 透传给 OpenAI-compatible 网关。
-    // 注：实测网关收下该参数但用量无变化（档位实际由网关/模型侧决定）。
+    // 思考档 high：经 AI SDK providerOptions 透传给 OpenAI-compatible 网关。
+    // 注意：**xhigh 本网关不支持**（上游直接 400），high/medium/low 才有效。
+    // 这也是收图失败的真凶之一——vision 请求当时带的也是 xhigh。
     // 输出 token 不设限：推理模型先烧 token 再答，上限会直接腰斩长回复。
     return {
       model: this.buildModel(cfg),
-      providerOptions: { openai: { reasoningEffort: "xhigh" as const } },
+      providerOptions: { openai: { reasoningEffort: "high" as const } },
     };
   }
 

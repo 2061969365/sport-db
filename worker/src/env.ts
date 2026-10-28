@@ -39,5 +39,9 @@ export interface Env {
    * 哪天网关修好了，设成 "on" 就恢复原生流式。
    */
   MODEL_STREAMING?: string;
+  /** 网关鉴权值：该网关只认"有没有 Authorization"，值随意（默认 "1"）。 */
+  VISION_API_KEY?: string;
+  /** 网关暂停开关：设 "1" 时完全不调用网关（聊天回维护提示，图片只存不识别）。 */
+  GATEWAY_PAUSED?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;
 }

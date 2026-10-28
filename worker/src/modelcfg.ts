@@ -205,7 +205,11 @@ export async function probeCfg(cfg: ModelCfg, imgUrl?: string): Promise<ProbeRes
   const post = async (body: Record<string, unknown>) => {
     const r = await fetch(cfg.endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "sport-db/1.0",
+        Authorization: "Bearer 1",
+      },
       body: JSON.stringify({ model: cfg.model, stream: false, ...body }),
     });
     const text = await r.text();

@@ -3,8 +3,11 @@
 // （?v=sha 破缓存）→ confidence 路由：≥0.8 追加 workouts 当年 CSV；
 // 低的进 review。附言由调用方再跑一轮 agent 一并回答。
 import type { Env } from "./env";
-import { WORKOUT_TYPES, appendRow, ghDeleteFile, ghGetFile, ghPutFile, putBinaryFile, toWorkoutRow } from "./github.ts";
+import { isPaused } from "./pause.ts";
 import type { VisionRec } from "./github.ts";
+import {
+  WORKOUT_TYPES, appendRow, ghDeleteFile, ghGetFile, ghPutFile, putBinaryFile, toWorkoutRow, toolListReview,
+} from "./github.ts";
 import { loadCfg } from "./modelcfg.ts";
 
 /** 收图用的运行时模型配置（/model 切了模型，收图也跟着走）。 */
@@ -93,47 +96,106 @@ export async function waitForImage(env: Env, url: string, tries = 7, gapMs = 300
   return false;
 }
 
+/** 免费网关限流时按模型换着试：不同模型额度独立，一个 429 不代表全都不可用。
+ *  这几个都实测能读运动截图（2026-10-28 在 zen 网关上验过）。 */
+export const VISION_FALLBACK_MODELS = ["deepseek-v4.1-flash-free", "nemotron-3.5-super-vl-free"];
+
+export interface VisionOpts {
+  tries?: number;
+  /** 候选模型链，默认 [主模型, ...VISION_FALLBACK_MODELS] */
+  models?: string[];
+  /** 总时长上限：收图是在 TG webhook 里同步等的，不能拖太久 */
+  deadlineMs?: number;
+  /** 重试间隔（测试里调小） */
+  gapMs?: number;
+}
+
+/** 进程内节流：免费网关额度极小，连续请求必被限流。
+ *  同一 isolate 里两次识图之间至少间隔 3 秒。 */
+let lastVisionAt = 0;
+async function visionGate(minGapMs = 3000): Promise<void> {
+  const wait = lastVisionAt + minGapMs - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastVisionAt = Date.now();
+}
+
 /** 调 vision（https 图片地址），返回解析 JSON。模型/网关走运行时配置（/model 可切）。
- *  无 JSON（多半是图没抓到 / 网关抖动）就重试，别把一次性抖动记成"识别失败"。 */
+ *  韧性三层：①图没生效就等（waitForImage）②429 按限流退避 ③一个模型不行换下一个模型。 */
 export async function recognizePhoto(
-  env: Env, imgUrl: string, cfg?: { endpoint: string; model: string }, tries = 3,
+  env: Env, imgUrl: string, cfg?: { endpoint: string; model: string }, opts: VisionOpts = {},
 ): Promise<VisionRec> {
   const ep = cfg?.endpoint || env.VISION_ENDPOINT;
+  const tries = Math.max(1, opts.tries ?? 2);
+  const gap = opts.gapMs ?? 2500;
+  const deadline = opts.deadlineMs ?? 40_000;
+  const primary = cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free";
+  const models = (opts.models || [primary, ...VISION_FALLBACK_MODELS])
+    .filter((m, i, a) => m && a.indexOf(m) === i);
+  const started = Date.now();
   let lastErr: unknown = null;
-  for (let i = 0; i < tries; i++) {
-    // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
-    const body: Record<string, unknown> = {
-      model: cfg?.model || env.VISION_MODEL || "mimo-v2.6-flash-free",
-      reasoning_effort: "xhigh",
-      messages: [{
-        role: "user",
-        content: [
-          { type: "text", text: VISION_PROMPT },
-          { type: "image_url", image_url: { url: imgUrl } },
-        ],
-      }],
-    };
-    try {
-      const r = await fetch(ep, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) {
-        lastErr = new Error(`模型接口 ${r.status}`);
-      } else {
-        const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
-        return parseVisionJson(j.choices?.[0]?.message?.content ?? "");
+  const tried: string[] = [];
+
+  let quotaHit = false;
+  for (const model of models) {
+    for (let i = 0; i < tries; i++) {
+      if (Date.now() - started > deadline) break;
+      // max_tokens 不设限：推理模型先烧 token 再答，上限会腰斩长回复；成本靠档位控制。
+      const body: Record<string, unknown> = {
+        model,
+        reasoning_effort: "high",
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: VISION_PROMPT },
+            { type: "image_url", image_url: { url: imgUrl } },
+          ],
+        }],
+      };
+      if (!tried.includes(model)) tried.push(model);
+      const t0 = Date.now();
+      if (!opts.gapMs) await visionGate(); // 测试里传 gapMs 就跳过节流
+      try {
+        const r = await fetch(ep, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "sport-db/1.0",
+            Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
+          },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          console.log("[vision-attempt]", model, r.status, `${Date.now() - t0}ms`, txt.slice(0, 80).replace(/\s+/g, " "));
+          lastErr = new Error(`模型接口 ${r.status}${/usage limit|rate limit/i.test(txt) ? "（限流）" : ""}`);
+        } else {
+          const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
+          console.log("[vision-attempt]", model, 200, `${Date.now() - t0}ms`, "ok");
+          return parseVisionJson(j.choices?.[0]?.message?.content ?? "");
+        }
+      } catch (e) {
+        console.log("[vision-attempt]", model, "ERR", `${Date.now() - t0}ms`, String((e as Error)?.message || e).slice(0, 80));
+        lastErr = e;
       }
-    } catch (e) {
-      lastErr = e;
+      const quota = /429|限流|usage limit|rate limit|530|502|503/i.test(String((lastErr as Error)?.message || ""));
+      if (quota) {
+        // 额度类错误：**绝不能**换模型硬试。实测免费网关额度很小，
+        // 一个模型 429 后继续打别的模型，只会把窗口烧穿、连 530 一起出来。
+        // 正确做法：等一个窗口（~8 秒）后同模型再试一次；还不行就交给后台重试。
+        if (i === 0) {
+          await new Promise((res) => setTimeout(res, 8000));
+          continue;
+        }
+        quotaHit = true;
+        break;
+      }
+      if (i < tries - 1) await waitForImage(env, imgUrl, 2, gap);
     }
-    // 重试前：等图真能访问（第一轮尤其常见——刚提交完 CDN 还没生效）
-    if (i < tries - 1) {
-      await waitForImage(env, imgUrl, 2, 2500);
-    }
+    if (quotaHit) break; // 别再换模型了
+    if (Date.now() - started <= deadline) await waitForImage(env, imgUrl, 1, Math.min(gap, 2000));
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  const msg = String((lastErr as Error)?.message || lastErr || "未知错误");
+  throw new Error(`${msg}（试过：${tried.join(" / ")}）`);
 }
 
 /** 抠 JSON（容忍围栏/废话），补全字段并钳制 confidence。 */
@@ -193,7 +255,7 @@ export async function retryReview(
 
   let rec: VisionRec;
   try {
-    rec = await recognizePhoto(env, url, await runtimeModelCfg(env), 2);
+    rec = await recognizePhoto(env, url, await runtimeModelCfg(env), { tries: 2, deadlineMs: 60_000 });
   } catch (e) {
     return `重试仍然失败：${(e as Error).message}。原图和 review 都没动。`;
   }
@@ -215,11 +277,51 @@ export async function retryReview(
 }
 
 /**
+ * 后台自动重试：扫 review 里"vision 失败"的那些，重试识别；成功的自动入库。
+ * 为什么需要：免费网关会整站抽风（429/502/530），失败与否取决于"你上传那一刻它活着没"。
+ * 有了这个，用户不用重发图，网关恢复后自动补上。
+ * 返回每条的结果，交给调用方决定要不要通知用户。
+ */
+export async function autoRetryReviews(
+  env: Env, limit = 5,
+): Promise<{ path: string; ok: boolean; text: string; chat?: string }[]> {
+  if (!env.GH_PAT) return [];
+  if (isPaused(env)) return []; // 网关暂停中：别打网关
+  const listed = await toolListReview(env).catch(() => "");
+  let files: { path: string }[] = [];
+  try {
+    files = (JSON.parse(listed) as { items?: { path: string }[] }).items || [];
+  } catch {
+    return [];
+  }
+  const out: { path: string; ok: boolean; text: string; chat?: string }[] = [];
+  for (const f of files.slice(0, 20)) {
+    if (out.filter((x) => x.ok).length >= limit) break;
+    const path = f.path || "";
+    if (!path) continue;
+    const g = await ghGetFile(env, path).catch(() => null);
+    if (!g?.text) continue;
+    let meta: { error?: string; chat?: string; image?: string } = {};
+    try {
+      meta = JSON.parse(g.text) as { error?: string; chat?: string; image?: string };
+    } catch {
+      continue;
+    }
+    // 只重试"识别失败"的；置信度不足属于数据问题，重试没意义
+    if (!meta.error || !/vision|429|502|503|530|模型接口|没有 JSON/i.test(meta.error)) continue;
+    const text = await retryReview(env, path, true, "auto:vision-retry").catch((e) => `失败：${(e as Error).message}`);
+    out.push({ path, ok: text.startsWith("已重新识别并入库"), text, chat: meta.chat });
+  }
+  return out;
+}
+
+/**
  * 收图主流程（调用方在 server.ts 里接 history/附言）。
  * 返回给用户的回复文本；抛错由调用方转统一文案。
+ * chat：来源通道（如 "tg:123456"），写进 review 记录，后台重试成功后好通知回去。
  */
 export async function ingestPhoto(
-  env: Env, fileId: string, isOrig: boolean, mid: number | string,
+  env: Env, fileId: string, isOrig: boolean, mid: number | string, chat?: string,
 ): Promise<{ rec: VisionRec; line: string }> {
   if (!env.GH_PAT) throw new Error("未配 GH_PAT，收图入库不可用（问数不受影响）");
   const { bytes } = await downloadTgFile(env, fileId);
@@ -228,6 +330,21 @@ export async function ingestPhoto(
   const imgPath = `images/${y}/${m}/${d}-tg${mid}.jpg`;
   const sha = await putBinaryFile(env, imgPath, bytes, `bot: TG收图 ${imgPath}`);
   const imgUrl = `https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}?v=${sha}`;
+  // 网关暂停：图照存（不丢），但不调模型——直接进 review，恢复后自动补录。
+  if (isPaused(env)) {
+    const ts0 = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+    const rp0 = `review/needs-review-tg${mid}-${ts0}.json`;
+    await ghPutFile(env, rp0, JSON.stringify({
+      image: imgPath, error: "网关暂停中（待切换），恢复后自动重试", ...(chat ? { chat } : {}),
+    }, null, 1), "", `bot: TG收图（网关暂停）${rp0}`);
+    return {
+      rec: {
+        type: "free_training", distance_km: null, duration_s: null, avg_pace_s_per_km: null,
+        avg_hr: null, calories: null, steps: null, cadence: null, start_time: null, confidence: 0,
+      },
+      line: `收到图并已存好（网关暂停中，暂不识别）。恢复后我会自动补录并告诉你，不用重发。`,
+    };
+  }
   // 先等图能公网访问（否则网关抓不到图，模型会说"我看不到截图"）
   await waitForImage(env, imgUrl, 10, 2500);
   let rec: VisionRec;
@@ -238,12 +355,13 @@ export async function ingestPhoto(
     const ts0 = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);
     const rp0 = `review/needs-review-tg${mid}-${ts0}.json`;
     await ghPutFile(env, rp0, JSON.stringify({
-      image: imgPath, error: `vision调用失败：${(e as Error).message}`,
+      image: imgPath, error: `vision调用失败：${(e as Error).message}`, ...(chat ? { chat } : {}),
     }, null, 1), "",
       `bot: TG收图vision失败转人工 ${rp0}`);
     return {
       rec: { type: "free_training", distance_km: null, duration_s: null, avg_pace_s_per_km: null, avg_hr: null, calories: null, steps: null, cadence: null, start_time: null, confidence: 0 },
-      line: `识别服务暂时不可用（${(e as Error).message}），原图已存、已进 review，稍后人工补录，先别删原图。`,
+      line: `识别服务暂时不可用（${(e as Error).message}），原图已存、已进 review。`
+        + `我会在后台每 15 分钟自动重试识别，成功就直接入库并告诉你，不用你重新发。`,
     };
   }
   if (rec.confidence >= REVIEW_THRESHOLD) {

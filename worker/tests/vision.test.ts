@@ -58,7 +58,8 @@ test("recognizePhoto：第一轮看不到图、第二轮正常 → 应当成功�
     }
     return Response.json({ choices: [{ message: { content: '{"type":"outdoor_riding","distance_km":52.54,"duration_s":8872,"avg_hr":136,"confidence":0.98}' } }] });
   };
-  const rec = await recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined, 3);
+  const rec = await recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined,
+    { tries: 3, models: ["m"], gapMs: 1 });
   assert.equal(rec.distance_km, 52.54, "重试后应拿到真实数据");
   assert.equal(calls, 2);
 });
@@ -70,7 +71,9 @@ test("recognizePhoto：三轮都不行才抛错（错误信息带上最后一次
     calls++;
     return Response.json({ choices: [{ message: { content: "看不到图" } }] });
   };
-  await assert.rejects(() => recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined, 3), /没有 JSON/);
+  await assert.rejects(
+    () => recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined, { tries: 3, models: ["m"], gapMs: 1 }),
+    /没有 JSON/);
   assert.equal(calls, 3, "应该刚好试三轮");
 });
 
@@ -82,8 +85,38 @@ test("recognizePhoto：模型接口 500 也会重试", async () => {
     if (calls < 2) return new Response("boom", { status: 500 });
     return Response.json({ choices: [{ message: { content: '{"type":"outdoor_running","distance_km":4.01,"confidence":0.9}' } }] });
   };
-  const rec = await recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined, 3);
+  const rec = await recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined,
+    { tries: 3, models: ["m"], gapMs: 1 });
   assert.equal(rec.distance_km, 4.01);
+});
+
+test("recognizePhoto：主模型 429 → 自动换下一个模型（不同模型额度独立）", async () => {
+  const used = [];
+  globalThis.fetch = async (_u, init = {}) => {
+    if (init.method === "HEAD") return new Response(null, { status: 200 });
+    const body = JSON.parse(String(init.body || "{}"));
+    used.push(body.model);
+    if (body.model === "primary") {
+      return new Response('{"error":{"message":"Free usage limit reached"}}', { status: 429 });
+    }
+    return Response.json({ choices: [{ message: { content: '{"type":"outdoor_running","distance_km":5.01,"confidence":0.93}' } }] });
+  };
+  const rec = await recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined,
+    { tries: 1, models: ["primary", "backup-model"], gapMs: 1 });
+  assert.equal(rec.distance_km, 5.01);
+  assert.deepEqual(used, ["primary", "backup-model"], "应该换到备用模型");
+});
+
+test("recognizePhoto：全部模型都 429 → 报错里写清试过哪些", async () => {
+  globalThis.fetch = async (_u, init = {}) => {
+    if (init.method === "HEAD") return new Response(null, { status: 200 });
+    return new Response('{"error":{"message":"Free usage limit reached"}}', { status: 429 });
+  };
+  await assert.rejects(
+    () => recognizePhoto(makeEnv(), "https://img.example/a.jpg", undefined,
+      { tries: 1, models: ["a", "b"], gapMs: 1 }),
+    /429[\s\S]*试过：a \/ b/,
+  );
 });
 
 test("retryReview：路径必须限定在 review/，否则拒绝（防误删别的文件）", async () => {

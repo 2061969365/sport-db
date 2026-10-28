@@ -25,11 +25,22 @@ REPO = "2061969365/sport-db"
 # 即 /model reset 的落点；两边保持一致，免得重置后回到旧网关。
 # 换模型/网关前务必 /model test 或 /model <名>（会自动体检：对话/工具/读图）。
 VISION_ENDPOINT = "https://zen.uflash.ccwu.cc/v1/chat/completions"
-VISION_MODEL = "mimo-v2.6-flash-free"
-# 备用网关：主网关连不上/回异常时自动切过去（同一个模型名在两个网关都有）。
-# 实测 zen 会间歇性回 "Upstream response was not valid JSON"，所以必须配兜底。
-VISION_ENDPOINT_ALT = "https://apius2.fastfaster.kdns.fr/v1/chat/completions"
-VISION_MODEL_ALT = "mimo-v2.6-flash-free"
+VISION_MODEL = "deepseek-v4.1-flash-free"
+# 流式：打开（与 DSH 直连该网关的行为一致）。
+# 历史教训：之前判断"流式坏了"其实是 reasoning_effort=xhigh 不被上游支持造成的假象；
+# 改成 high 之后流式可用。若再遇到断流，把它设成 "off" 走非流式+合成 SSE。
+MODEL_STREAMING = "on"
+# 鉴权头：该网关只认"有没有 Authorization"，值无所谓（DSH 那边配的就是假 key "1"）。
+# 不带头会走匿名小额度，容易被限流，所以默认带上。
+VISION_API_KEY = "1"
+# 网关暂停：2026-10-28 起暂停（zen 额度/稳定性不可控，apius2 已 429）。
+# 置 "1" = 不调用模型：聊天回维护提示、截图只存不识别（进 review，恢复后自动补录）。
+# 选好新网关后删掉这行（或设 "0"）再 deploy 即恢复。
+GATEWAY_PAUSED = "1"
+# 备用网关：**已停用**（2026-10-27 起 apius2 对免费模型一律 429，配了只会白打一次请求）。
+# 要用就填这两项，代码里的兜底逻辑仍然保留。
+# VISION_ENDPOINT_ALT = "https://apius2.fastfaster.kdns.fr/v1/chat/completions"
+# VISION_MODEL_ALT = "deepseek-v4.1-flash-free"
 # 天气工具默认城市（留空 / 删掉则让用户每次说城市）。也可改用 HOME_LAT/HOME_LON。
 # HOME_CITY = "上海"
 

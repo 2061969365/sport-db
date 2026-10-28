@@ -7,6 +7,7 @@
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
 import { ingestPhoto, pickImage } from "./photo";
+import { PAUSED_REPLY, isPaused } from "./pause";
 import { ghHealth } from "./github";
 import { clip, messageText, splitForTg, tgSend } from "./notify";
 import { loadCfg } from "./modelcfg";
@@ -56,6 +57,8 @@ export default {
         }
       };
       const gateway = async () => {
+        // 暂停期间不真的打网关（否则健康检查自己就把额度烧了）
+        if (isPaused(env)) return "已暂停（待选新网关）";
         const ctl = new AbortController();
         const timer = setTimeout(() => ctl.abort(), 12_000);
         try {
@@ -65,7 +68,11 @@ export default {
           const model = loaded?.cfg.model || env.VISION_MODEL;
           const r = await fetch(ep, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "User-Agent": "sport-db/1.0" },
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": "sport-db/1.0",
+              Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
+            },
             body: JSON.stringify({
               // 注意：该网关要求 max_tokens >= 16，写 8 会被 400 拒掉（踩过）
               model, max_tokens: 32,
@@ -195,7 +202,7 @@ export default {
       if (picked) {
         const caption = (msg.caption || "").trim();
         try {
-          const { rec, line } = await ingestPhoto(env, picked.fileId, picked.isOrig, mid);
+          const { rec, line } = await ingestPhoto(env, picked.fileId, picked.isOrig, mid, `tg:${chatId}`);
           if (!caption) {
             await tgSend(env, chatId, line);
           } else {
@@ -214,6 +221,10 @@ export default {
       }
       if (!text) {
         await tgSend(env, chatId, "发我一句话吧，比如：总结一下我最近的运动情况");
+        return new Response("ok");
+      }
+      if (isPaused(env)) {
+        await tgSend(env, chatId, PAUSED_REPLY);
         return new Response("ok");
       }
       try {
@@ -302,6 +313,10 @@ export default {
         if (/^\/model(@\w+)?(\s|$)/.test(text) || /^\/(模型)(\s|$)/.test(text)) {
           const out = await agent.modelCommand(text.replace(/^\/模型/, "/model").replace(/^\/model(@\w+)?/, "/model"));
           return Response.json({ reply: out, pending: false }, { headers: cors });
+        }
+        // 网关暂停：只放行本地指令，其余直接回维护提示（不打模型）
+        if (isPaused(env)) {
+          return Response.json({ reply: PAUSED_REPLY, pending: false }, { headers: cors });
         }
         // 快问题当场给答复；重问题（计划类）等在 70s 以内，超时回 202 让前端轮询。
         await agent.setReplyTarget("pwa", session);
