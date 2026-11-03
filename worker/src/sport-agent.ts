@@ -143,13 +143,22 @@ const RULES_BLOCK =
   + "拿预览diff念给用户；用户明确说“确认”后，再用相同参数带 confirmed=true 调一次才写入。"
   + "一次只改用户明确说的字段，改完用中文报出改了哪条、旧值->新值；"
   + "白名单外的字段、找不到的记录，明说做不到或找不到，让用户确认，不擅自发挥。"
-  + "【工具边界】运动数据只许用 get_summary/query_workouts/stats_workouts/trends/records/compare_periods/streaks/update_workout/delete_workout/append_workout/list_review/confirm_review 十二个数据工具读写；"
-  + "另外有 current_time（时间）、weather（天气）、web_search（联网检索）、fetch_url（抓网页）、"
-  + "list_repo_dir / read_repo_file / write_plan（看/写仓库里的日报·计划文件）、"
-  + "set_reminder / list_reminders / cancel_reminder（定时提醒）这些工具可用，都是查外部信息或存计划的正路，不许假装用过。"
-  + "workspace 的内置文件工具（读写删改查 + bash）一律不许碰：数据不在那里，要用文件就走 list_repo_dir/read_repo_file/write_plan。"
-  + "【计划留存】给用户排好完整计划后，主动问一句要不要存进仓里；用户同意就用 write_plan 写到 plans/ 下（两步确认），"
-  + "以后他要「我的计划」就读出来，别凭记忆复述。"
+  + "【工具边界】共 30 个工具，名字必须原样用，别自己造、别假装用过：\n"
+  + "· 查数据（只读）：get_summary（分项画像）/ query_workouts（明细含 id）/ stats_workouts（统计）/ "
+  + "trends（趋势）/ records（个人纪录）/ compare_periods（时段对比）/ streaks（连续天数）/ "
+  + "coach_check（自查异常信号，用户问「我最近有什么问题」就用它）\n"
+  + "· 改数据（两步确认）：update_workout / delete_workout / append_workout\n"
+  + "· 收图审核：list_review / retry_review（重新识别失败的图）/ confirm_review（确认入库）\n"
+  + "· 计划：plan_save（存结构化计划，可打卡）/ plan_list / plan_progress / plan_mark（打卡）\n"
+  + "· 提醒：set_reminder / list_reminders / cancel_reminder\n"
+  + "· 外部与仓：current_time / weather / web_search / fetch_url / list_repo_dir / read_repo_file / "
+  + "write_plan（只写自由文本笔记）/ usage_stats（问用量）/ chat_backup（备份对话）\n"
+  + "运动数据只许用「查数据/改数据/收图审核」这三组读写；其他工具是查外部信息或存计划的，不许拿来改运动记录。"
+  + "workspace 的内置文件工具（读写删改查 + bash）一律不许碰：数据不在那里，要用文件就走 list_repo_dir/read_repo_file/write_plan。\n"
+  + "【计划怎么存】用户要排训练计划就用 plan_save：按天给出日期、类型（easy/long/tempo/interval/rest/race/other）"
+  + "和目标（如 6km @6'10\"/km），两步确认后写入。之后问进度用 plan_progress、练完用 plan_mark 打卡。"
+  + "**不要用 write_plan 存训练计划**——它只适合写说明、备忘这类自由文本；两者混用会导致计划查不到、打不了卡。"
+  + "用户说「我的计划」先 plan_list，别凭记忆复述。\n"
   + "【提醒】用户说「提醒我」「到点叫我」就用 set_reminder；时间先用 current_time 确认，"
   + "相对时间用 +2h/+1d，固定每天用 cron，**cron 一律按北京时间写（如每天 7 点 = `0 7 * * *`）**，工具会自动换算成 UTC 存储；list_reminders 里显示的 UTC 表达式不要当成设错，也绝对不要「顺手改成 0 7 * * *」。"
   + "【计划纪律】用户要训练计划/让他别受伤/问接下来怎么练时，按这个顺序做，不许跳步："
@@ -1054,7 +1063,7 @@ export class SportDbAgent extends Think<Env> {
       {
         label: "rules",
         description: "教练人设与数据/改库铁律，每轮必读并遵守。",
-        maxTokens: 2000,
+        maxTokens: 3200,
         provider: { get: async () => RULES_BLOCK },
       },
       shared
@@ -1342,7 +1351,7 @@ export class SportDbAgent extends Think<Env> {
           toolReadRepoFile(env, args.path || "", args.max_chars ?? 6000),
       }),
       write_plan: tool({
-        description: "把训练计划/长期笔记写进仓里的 plans/*.md（两步：先预览，用户确认后带 confirmed=true 再调一次）。只写 plans/，运动数据别用这个改。",
+        description: "把**自由文本**笔记写进仓里的 plans/*.md（两步：先预览，用户确认后带 confirmed=true 再调一次）。只用于说明/备忘，**训练计划请用 plan_save**（结构化、可打卡）；运动数据别用这个改。",
         inputSchema: z.object({
           path: z.string(),
           content: z.string(),
