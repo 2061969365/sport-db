@@ -468,9 +468,11 @@ export async function toolListReview(env: Env): Promise<string> {
       + `/${row.duration_s}s（confidence ${rec.confidence}），原图 ${image}。`
       + "用户明确说“确认”后，再用相同 path 带 confirmed=true 调一次；写入后自动删除这条 review。";
   }
-  await appendRow(env, row, actor, sql);
+  const res = await appendRow(env, row, actor, sql);
   await ghDeleteFile(env, path, cur.sha, `bot: review确认入库 ${row.date} ${row.type} via ${actor}`);
-  return `已入库：${row.date} ${row.type}（id=${row.id}），review 文件已删。`;
+  return res.written
+    ? `已入库：${row.date} ${row.type}（id=${row.id}），review 文件已删。`
+    : `库里已有同一条（id=${row.id}），没有重复写入；review 文件已删。`;
 }
 
 /** query_workouts 工具：改数前必须先查到 id。 */
@@ -580,7 +582,7 @@ export async function toolUpdateWorkout(
 /** append 的写核：读（或新建）年文件 → 追加一行 → 写回 → 清缓存。P2 会把 photo.ts 收图并过来。 */
 export async function appendRow(
   env: Env, row: Record<string, string>, actor: string, sql?: SqlTag,
-): Promise<string> {
+): Promise<{ path: string; written: boolean }> {
   const path = `data/workouts/${row.date.slice(0, 4)}.csv`;
   const cur = await ghGetFile(env, path).catch(() => null);
   let header = WORKOUT_COLS;
@@ -593,7 +595,7 @@ export async function appendRow(
   // 不去重会重复写入——同一张图有两个 review 文件、或用户把同一张截图发两次，
   // 都会造成重复行（2026-10-28 实测出现过）。
   if (rows.some((r) => r.id === row.id)) {
-    return path;
+    return { path, written: false };
   }
   rows.push(Object.fromEntries(header.map((h) => [h, row[h] ?? ""])));
   const esc = (v: string) => (/[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
@@ -603,7 +605,7 @@ export async function appendRow(
   await ghPutFile(env, path, next, cur?.sha || "",
     `bot: append ${row.id} via ${actor}`);
   invalidateCache(sql, path);
-  return path;
+  return { path, written: true };
 }
 
 /** delete_workout 工具（两阶段）：预览 → confirmed=true 才删。删后 git 可 revert。 */
@@ -705,8 +707,10 @@ export async function toolAppendWorkout(
     return `预览（尚未写入）：${date} ${wtype} ${distM ? distM / 1000 + "km" : "距离未知"}/${dur ? dur + "s" : "时长未知"}`
       + "（纯文字补录，无轨迹）。得到用户明确说“确认”后，再用完全相同参数带 confirmed=true 调一次。";
   }
-  const path = await appendRow(env, row, "think-agent", sql);
-  void path;
+  const res = await appendRow(env, row, "think-agent", sql);
+  if (!res.written) {
+    return `已存在同一条（id=${row.id}），没有重复写入。如果你要改数值，用 update_workout。`;
+  }
   return `已补录：${date} ${wtype} ${distM ? distM / 1000 + "km" : ""}${dur ? "/" + dur + "s" : ""}（id=${row.id}）。`;
 }
 

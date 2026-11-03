@@ -280,10 +280,11 @@ export async function retryReview(
       + `数据：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s。`
       + `确认无误的话，用 append_workout 补录。`;
   }
-  await appendRow(env, row, actor);
+  const res = await appendRow(env, row, actor);
   await ghDeleteFile(env, path, cur.sha, `bot: 重试识别后入库 ${row.date} ${rec.type} via ${actor}`);
-  return `已重新识别并入库：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s`
-    + `（id=${row.id}），review 文件已删。`;
+  return res.written
+    ? `已重新识别并入库：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s（id=${row.id}），review 文件已删。`
+    : `已重新识别，但库里已有同一条（id=${row.id}），没有重复写入；review 文件已删。`;
 }
 
 /**
@@ -441,8 +442,10 @@ export async function ingestPhoto(
   }
   if (rec.confidence >= REVIEW_THRESHOLD) {
     const row = toWorkoutRow(rec, imgPath);
-    await appendRow(env, row, `tg:${mid}`);
-    const line = `已入库：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s（confidence ${rec.confidence.toFixed(2)}）`;
+    const res = await appendRow(env, row, `tg:${mid}`);
+    const line = res.written
+      ? `已入库：${row.date} ${rec.type} ${rec.distance_km}km/${rec.duration_s}s（confidence ${rec.confidence.toFixed(2)}）`
+      : `这条库里已经有了（id=${row.id}），没有重复写入。`;
     return { rec, line };
   }
   const ts = bjNow().toISOString().replace(/[-:T]/g, "").slice(0, 14);
