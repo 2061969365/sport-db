@@ -1,7 +1,7 @@
 // 数据快照：模型每轮都能拿到真实数字，不用靠工具来回查、也不凭印象编。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bjHour, buildSnapshot } from "../src/proactive.ts";
+import { bjHour, buildSnapshot, shouldStaySilent } from "../src/proactive.ts";
 
 const NOW = Date.parse("2026-11-03T10:00:00+08:00");
 
@@ -75,4 +75,11 @@ test("快照：设备日报有就报，没有就不提（不许编）", () => {
   const without = buildSnapshot(rows, NOW);
   assert.doesNotMatch(without, /身体状态/);
   assert.doesNotMatch(without, /静息心率/);
+});
+
+test("模型可以选择不打扰：SILENT 判定", () => {
+  assert.equal(shouldStaySilent("SILENT"), true);
+  assert.equal(shouldStaySilent("  silent，今天没什么值得说的"), true);
+  assert.equal(shouldStaySilent("今天该休息。"), false);
+  assert.equal(shouldStaySilent(""), false);
 });

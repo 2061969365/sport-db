@@ -7,13 +7,14 @@ import { finalReplyText, clip } from "../src/notify.ts";
 
 const SRC = readFileSync(new URL("../src/sport-agent.ts", import.meta.url), "utf-8");
 
-test("铁律：两阶段确认、数据铁律、工具边界都还在 prompt 里", () => {
-  assert.match(SRC, /【改库铁律】/, "改库铁律被删了");
-  assert.match(SRC, /confirmed=true/, "两阶段确认的第二步说明没了");
-  assert.match(SRC, /【数据铁律】/, "数据铁律被删了");
-  assert.match(SRC, /【工具边界】/, "工具边界被删了");
-  assert.match(SRC, /【计划纪律】/, "计划纪律被删了");
-  assert.match(SRC, /current_time/, "计划纪律依赖的 current_time 说明没了");
+test("底线还在：预览确认、不编数字、安全优先、工具边界", () => {
+  // 人设可以放松，这四条是职业底线，删了就会出事
+  assert.match(SRC, /先给预览/, "改数据的预览要求没了");
+  assert.match(SRC, /等他说确认再写/, "两阶段确认没了");
+  assert.match(SRC, /绝不编/, "防幻觉约束没了");
+  assert.match(SRC, /疼、晕、胸闷、夜间心悸永远压过任何训练计划/, "安全优先被删了");
+  assert.match(SRC, /【工具边界】/, "工具清单没了");
+  assert.match(SRC, /current_time/, "相对日期依赖的 current_time 说明没了");
 });
 
 test("铁律：仍然明确禁止用 workspace 内置文件工具", () => {
@@ -22,7 +23,7 @@ test("铁律：仍然明确禁止用 workspace 内置文件工具", () => {
 });
 
 test("铁律：失败必须如实说，不许把失败讲成没有数据", () => {
-  assert.match(SRC, /绝不许编|不许编造|不编数据/, "防幻觉约束被删了");
+  assert.match(SRC, /绝不编|不许编造|不编数据|查不到就说查不到/, "防幻觉约束被删了");
 });
 
 test("工具集：30 个工具都注册了（少一个说明改坏了）", () => {

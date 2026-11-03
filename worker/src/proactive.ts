@@ -53,6 +53,14 @@ function agg(rows: Row[]) {
   };
 }
 
+/**
+ * 主动消息的"闭嘴"约定：模型如果判断现在不值得打扰，只回 SILENT。
+ * 抽成函数是为了能测——这条路径以前根本不存在（模型没有拒绝发言的权利）。
+ */
+export function shouldStaySilent(text: string): boolean {
+  return /^\s*SILENT\b/i.test(String(text || ""));
+}
+
 /** 设备日报摘要（来自 data/daily/*.csv，没有就是 undefined）。 */
 export interface DailySummary {
   sleepDate?: string;

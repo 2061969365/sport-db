@@ -45,6 +45,6 @@ test("规则块不能被 maxTokens 截断", () => {
 
 test("计划只走 plan_save，write_plan 只写自由文本", () => {
   const rules = rulesText();
-  assert.match(rules, /不要用 write_plan 存训练计划/, "计划与笔记的分工没写进规则");
+  assert.match(rules, /别拿它存训练计划|不要用 write_plan 存训练计划/, "计划与笔记的分工没写进规则");
   assert.match(SRC, /训练计划请用 plan_save/, "write_plan 的工具描述没说清分工");
 });
