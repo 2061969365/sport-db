@@ -61,14 +61,32 @@ async function cachedGetFile(
       const hit = sql`SELECT text, sha, updated_at FROM csv_cache WHERE path = ${path}` as
         { text: string; sha: string; updated_at: number }[];
       if (hit.length && Date.now() - hit[0].updated_at < CACHE_TTL_MS) {
-        // 空文本 = 之前确认过不存在（否定缓存，CSV 不可能真空）。
+        // 空文本 = 之前确认过 404（CSV 不可能真空）。
         if (!hit[0].text) return null;
         return { text: hit[0].text, sha: hit[0].sha || "" };
       }
     } catch { /* 缓存坏了就当 miss */ }
   }
-  const g = await ghGetFile(env, path).catch(() => null);
-  if (sql) {
+
+  let g: { text: string; sha: string } | null = null;
+  let failed = false;
+  try {
+    g = await ghGetFile(env, path);
+  } catch (e) {
+    // 关键：**只有 404 才允许否定缓存**。429/5xx/超时若被当成"不存在"写进空缓存，
+    // 整整一年的数据会静默消失（快照/统计全错）。失败时优先用旧缓存。
+    failed = true;
+    console.error("[gh-cache-read-fail]", path, (e instanceof Error ? e.message : String(e)).slice(0, 120));
+    if (sql) {
+      try {
+        ensureCache(sql);
+        const stale = sql`SELECT text, sha FROM csv_cache WHERE path = ${path}` as
+          { text: string; sha: string }[];
+        if (stale.length && stale[0].text) return { text: stale[0].text, sha: stale[0].sha || "" };
+      } catch { /* 忽略 */ }
+    }
+  }
+  if (sql && !failed) {
     try {
       ensureCache(sql);
       sql`INSERT OR REPLACE INTO csv_cache(path, text, sha, updated_at) VALUES (${path}, ${g?.text ?? ""}, ${g?.sha ?? ""}, ${Date.now()})`;
@@ -250,6 +268,71 @@ export async function loadWorkouts(env: Env, sql?: SqlTag): Promise<Row[]> {
     for (const r of parseCSV(text)) out.push({ ...r, _year: String(year) });
   }
   return out;
+}
+
+/**
+ * 设备日报摘要（睡眠、静息心率）。
+ *
+ * data/daily/YYYY.csv 是"一天多行、key 区分指标"的结构：
+ *   date,tag,key,...,value_json
+ * 睡眠在 tag=daily_report key=sleep 的 value_json.segment_details[].duration（分钟）；
+ * 静息心率在 key=heart_rate 的 value_json.avg_rhr。
+ * 没有数据就返回 null，让模型说"没有"，而不是瞎猜。
+ */
+export async function loadDailySummary(
+  env: Env, sql?: SqlTag, now = Date.now(),
+): Promise<{
+  sleepDate?: string; sleepMin?: number; sleepScore?: number;
+  sleep7AvgMin?: number; rhrLast?: number; rhr7Avg?: number;
+} | null> {
+  const today = new Date(now + 8 * 3600_000).toISOString().slice(0, 10);
+  const year = today.slice(0, 4);
+  const g = await cachedGetFile(env, sql, `data/daily/${year}.csv`).catch(() => null);
+  if (!g?.text) return null;
+
+  const sleeps = new Map<string, { min: number; score: number }>();
+  const rhrs = new Map<string, number>();
+  for (const r of parseCSV(g.text)) {
+    const date = r.date || "";
+    if (!date || date > today) continue;
+    if (r.tag !== "daily_report") continue;
+    let v: Record<string, unknown>;
+    try { v = JSON.parse(r.value_json || "{}"); } catch { continue; }
+    if (r.key === "sleep") {
+      const segs = Array.isArray(v.segment_details) ? v.segment_details as Record<string, unknown>[] : [];
+      const min = segs.reduce((a, s) => a + (Number(s.duration) || 0), 0);
+      if (min > 0) sleeps.set(date, { min, score: Number(v.sleep_score) || 0 });
+    } else if (r.key === "heart_rate") {
+      const v2 = Number(v.avg_rhr);
+      if (v2 > 0) rhrs.set(date, v2);
+    }
+  }
+  if (!sleeps.size && !rhrs.size) return null;
+
+  const pick = <T>(m: Map<string, T>): [string, T] | null => {
+    const keys = [...m.keys()].sort();
+    return keys.length ? [keys[keys.length - 1], m.get(keys[keys.length - 1]) as T] : null;
+  };
+  const avgOf = <T,>(m: Map<string, T>, pickFn: (v: T) => number, days: number): number | undefined => {
+    const keys = [...m.keys()].sort().filter((d) => d >= shiftDate(today, -days + 1) && d <= today);
+    const vals = keys.map((d) => pickFn(m.get(d) as T)).filter((n) => Number.isFinite(n) && n > 0);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : undefined;
+  };
+  const lastSleep = pick(sleeps);
+  const lastRhr = pick(rhrs);
+  return {
+    sleepDate: lastSleep?.[0],
+    sleepMin: lastSleep?.[1].min,
+    sleepScore: lastSleep?.[1].score || undefined,
+    sleep7AvgMin: avgOf(sleeps, (v) => v.min, 7),
+    rhrLast: lastRhr?.[1],
+    rhr7Avg: avgOf(rhrs, (v) => v, 7),
+  };
+}
+
+/** 日期字符串前后挪动（北京时间语义，避免 UTC 跨日）。 */
+function shiftDate(dateStr: string, days: number): string {
+  return new Date(Date.parse(`${dateStr}T12:00:00+08:00`) + days * 864e5).toISOString().slice(0, 10);
 }
 
 export function grpOf(t: string): string {
@@ -584,28 +667,42 @@ export async function appendRow(
   env: Env, row: Record<string, string>, actor: string, sql?: SqlTag,
 ): Promise<{ path: string; written: boolean }> {
   const path = `data/workouts/${row.date.slice(0, 4)}.csv`;
-  const cur = await ghGetFile(env, path).catch(() => null);
-  let header = WORKOUT_COLS;
-  let rows: Record<string, string>[] = [];
-  if (cur?.text) {
-    rows = parseCSV(cur.text);
-    if (rows.length) header = Object.keys(rows[0]);
-  }
-  // 按 id 去重：id 由「截图时间+类型+距离」构成，同一个 id 就是同一次训练。
-  // 不去重会重复写入——同一张图有两个 review 文件、或用户把同一张截图发两次，
-  // 都会造成重复行（2026-10-28 实测出现过）。
-  if (rows.some((r) => r.id === row.id)) {
-    return { path, written: false };
-  }
-  rows.push(Object.fromEntries(header.map((h) => [h, row[h] ?? ""])));
   const esc = (v: string) => (/[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
-  const eol = cur?.text?.includes("\r\n") ? "\r\n" : "\n";
-  const next = header.map(esc).join(",") + eol
-    + rows.map((r) => header.map((h) => esc(r[h] ?? "")).join(",")).join(eol) + eol;
-  await ghPutFile(env, path, next, cur?.sha || "",
-    `bot: append ${row.id} via ${actor}`);
-  invalidateCache(sql, path);
-  return { path, written: true };
+  const build = (header: string[], list: Record<string, string>[], eol: string) =>
+    header.map(esc).join(",") + eol
+    + list.map((r) => header.map((h) => esc(r[h] ?? "")).join(",")).join(eol) + eol;
+
+  // 并发写（TG 收图 / 网页补录 / 后台补录同时跑）时旧 sha 会被 409/422 拒掉，
+  // 以前直接抛错 = 这一行静默丢失。这里读-改-写失败就重读重试。
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = await ghGetFile(env, path).catch((e) => {
+      lastErr = e;
+      return null;
+    });
+    if (!cur && lastErr) {
+      await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+      continue;
+    }
+    const list = cur?.text ? parseCSV(cur.text) : [];
+    // 按 id 去重：id = 截图时间/日期 + 类型 + 距离，同一个 id 就是同一次训练。
+    if (list.some((r) => r.id === row.id)) return { path, written: false };
+    const header = list.length ? Object.keys(list[0]) : WORKOUT_COLS;
+    const eol = cur?.text?.includes("\r\n") ? "\r\n" : "\n";
+    const next = [...list, Object.fromEntries(header.map((h) => [h, row[h] ?? ""]))];
+    try {
+      await ghPutFile(env, path, build(header, next, eol), cur?.sha || "",
+        `bot: append ${row.id} via ${actor}`);
+      invalidateCache(sql, path);
+      return { path, written: true };
+    } catch (e) {
+      lastErr = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/409|422|conflict|sha/i.test(msg)) throw e;
+      await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("appendRow 连续冲突，写入失败");
 }
 
 /** delete_workout 工具（两阶段）：预览 → confirmed=true 才删。删后 git 可 revert。 */
@@ -686,12 +783,16 @@ export async function toolAppendWorkout(
   const startUtc = Math.floor(Date.parse(`${date}T12:00:00+08:00`) / 1000);
   const numOr = (v: unknown) => (v == null || v === "" ? "" : String(Math.trunc(Number(v) || 0)));
   const row: Record<string, string> = {
+    // 同日同类型同距离可能是两次训练：用秒级时间戳 + 距离，避免被去重吞掉
     id: `manual-${startUtc}-${wtype}-${distM}`,
     date,
     start_utc: String(startUtc),
     start_beijing: `${date} 12:00:00 +08:00`,
     end_utc: String(startUtc + dur),
-    end_beijing: `${date} 12:${String(Math.floor(dur / 60)).padStart(2, "0")}:${String(dur % 60).padStart(2, "0")} +08:00`,
+    end_beijing: (() => {
+      const t = new Date(Date.parse(`${date}T12:00:00+08:00`) + dur * 1000 + 8 * 3600_000);
+      return `${t.toISOString().slice(0, 10)} ${t.toISOString().slice(11, 19)} +08:00`;
+    })(),
     type: wtype, category: wtype,
     distance_m: distM ? String(distM) : "", duration_s: dur ? String(dur) : "",
     avg_pace_s: "", max_pace_s: "", avg_speed: "", max_speed: "",

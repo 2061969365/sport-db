@@ -12,6 +12,7 @@ const BOT_DEFAULT = 'https://sport-db-bot.xia2061969365.workers.dev';
 const LS_HISTORY = 'sportdb.chat.history.v1';
 const LS_CONFIG = 'sportdb.chat.config.v2';
 const REPLY_CLIP = 3500; // 服务端已裁剪，此为展示兜底
+const LS_TOKEN = 'sportdb.chat.token'; // 可选口令（服务端配了 PWA_TOKEN 才需要）
 
 /* CSV 降级基址候选（与 app.js 一致，兼容本地根服务 / Pages 两种布局） */
 const CSV_BASE_CANDIDATES = [
@@ -194,15 +195,34 @@ async function pollReply(base, session, since, isAlive) {
   }
 }
 
+function tokenOf() {
+  try { return localStorage.getItem(LS_TOKEN) || ''; } catch { return ''; }
+}
+
+async function postChat(base, payload) {
+  const headers = { 'Content-Type': 'application/json' };
+  const t = tokenOf();
+  if (t) headers['x-pwa-token'] = t;
+  return fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+}
+
 async function askBot(botBase, session, key, question, isAlive) {
   const base = botBaseOf(botBase);
-  const r = await fetch(`${base}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session, key, text: question }),
-  });
+  let r = await postChat(base, { session, key, text: question });
   let data = null;
   try { data = await r.json(); } catch { /* fallthrough */ }
+  if (r.status === 401 && data && data.needToken) {
+    const input = window.prompt('这个机器人配了口令，输入一次（会存在本机）：', '');
+    if (input) {
+      try { localStorage.setItem(LS_TOKEN, input.trim()); } catch { /* 忽略 */ }
+      r = await postChat(base, { session, key, text: question });
+      try { data = await r.json(); } catch { data = null; }
+    }
+  }
   if (r.status === 202 && data && data.pending) {
     return pollReply(base, session, data.since, isAlive || (() => true));
   }

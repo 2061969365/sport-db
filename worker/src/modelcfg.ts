@@ -146,6 +146,21 @@ export function normalizeEndpoint(input: string): string | null {
   if (!s) return null;
   const withProto = /^https?:\/\//.test(s) ? s : `https://${s}`;
   if (!EP_RE.test(withProto)) return null;
+  // 不许指向内网/本机：否则任何能发 /model 的人都能让 Worker 去打内网
+  // （SSRF：云元数据 169.254.169.254、Durable Object 回环、局域网服务）。
+  let host = "";
+  try { host = new URL(withProto).hostname.toLowerCase(); } catch { return null; }
+  if (/^(localhost|.*\.local|.*\.internal)$/.test(host)) return null;
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 10 || a === 127 || a === 0) return null;
+    if (a === 192 && b === 168) return null;
+    if (a === 172 && b >= 16 && b <= 31) return null;
+    if (a === 169 && b === 254) return null;
+    if (a === 100 && b >= 64 && b <= 127) return null;
+  }
+  if (host === "[::1]" || host.startsWith("[fc") || host.startsWith("[fd") || host === "[::]") return null;
   if (/\/chat\/completions\/?$/.test(withProto)) return withProto.replace(/\/$/, "");
   if (/\/v1\/?$/.test(withProto)) return `${withProto.replace(/\/$/, "")}/chat/completions`;
   return `${withProto.replace(/\/$/, "")}/v1/chat/completions`;

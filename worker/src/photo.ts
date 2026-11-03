@@ -368,6 +368,10 @@ export async function writeReviewItem(
  * （图片作为 UIMessage 的 file 部件），而不是我们另发一次上网关的请求。
  * 少一次请求 = 少一次限流机会，而且模型能结合上下文判断。
  */
+/** 消息部件里图片的上限（base64 字符数）。DO 的单行约 1.8MB，
+ *  超了会在提交/持久化时整条失败，所以宁可在 1.4MB 处截断，改走代码识图。 */
+export const MAX_IMAGE_DATA_URL = 1_400_000;
+
 export async function saveTgPhoto(
   env: Env, fileId: string, isOrig: boolean, mid: number | string,
 ): Promise<{ imgPath: string; dataUrl: string; mediaType: string }> {
@@ -386,7 +390,9 @@ export async function saveTgPhoto(
     bin += String.fromCharCode(...raw.subarray(i, i + chunk));
   }
   const b64 = btoa(bin);
-  return { imgPath, dataUrl: `data:${mediaType};base64,${b64}`, mediaType };
+  const dataUrl = `data:${mediaType};base64,${b64}`;
+  // 太大就不进消息部件（会撑爆 DO 行），调用方改走代码识图
+  return { imgPath, dataUrl: dataUrl.length > MAX_IMAGE_DATA_URL ? "" : dataUrl, mediaType };
 }
 
 /**

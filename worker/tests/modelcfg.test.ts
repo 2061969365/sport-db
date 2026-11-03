@@ -137,3 +137,15 @@ test("摘要文案：说清来源与流式模式", () => {
   assert.match(s, /非流式/);
   assert.match(s, /tg:\/model/);
 });
+
+test("网关地址：拒绝内网/本机（防 SSRF）", () => {
+  assert.equal(normalizeEndpoint("http://127.0.0.1:8080/v1"), null);
+  assert.equal(normalizeEndpoint("http://localhost:1234"), null);
+  assert.equal(normalizeEndpoint("http://10.0.0.5/v1"), null);
+  assert.equal(normalizeEndpoint("http://192.168.1.2/v1"), null);
+  assert.equal(normalizeEndpoint("http://172.16.3.4/v1"), null);
+  assert.equal(normalizeEndpoint("http://169.254.169.254/latest/meta-data"), null);
+  assert.equal(normalizeEndpoint("http://[::1]:9000/v1"), null);
+  // 正常公网地址仍然可用
+  assert.ok(normalizeEndpoint("https://zen.uflash.ccwu.cc/v1"));
+});

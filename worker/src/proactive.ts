@@ -53,34 +53,73 @@ function agg(rows: Row[]) {
   };
 }
 
+/** 设备日报摘要（来自 data/daily/*.csv，没有就是 undefined）。 */
+export interface DailySummary {
+  sleepDate?: string;
+  sleepMin?: number;
+  sleepScore?: number;
+  sleep7AvgMin?: number;
+  rhrLast?: number;
+  rhr7Avg?: number;
+}
+
+/** 本周一（北京时间今天所在周的周一） */
+function mondayOf(dateStr: string): string {
+  const d = new Date(day(dateStr));
+  const w = d.getUTCDay(); // 0=周日
+  return shift(dateStr, -(w === 0 ? 6 : w - 1));
+}
+
+function fmtHours(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  return m ? `${h}小时${m}分` : `${h}小时`;
+}
+
 /**
  * 每轮注入的「实时数据快照」：让模型一开始就有数字可用，
  * 不用为了回答"最近怎么样"来回调工具，也避免它凭印象编。
+ *
+ * 关键：每个窗口都必须**带明确日期**。以前只写"上周（-14~-8 天）"，
+ * 结果模型把"本周"和"近 7 天"混着用，同一轮里出现 9km 和 0km 两个说法。
  * 纯函数，好测。
  */
-export function buildSnapshot(all: Row[], now = Date.now()): string {
+export function buildSnapshot(all: Row[], now = Date.now(), daily?: DailySummary): string {
   const today = bjToday(now);
-  const dated = all.filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date || ""));
-  if (!dated.length) return `今天：${today} ${bjWeekday(now)}（北京时间）
-库里还没有任何训练记录。`;
+  const dated = all.filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date || "") && (r.date || "") <= today);
+  const head = `今天：${today} ${bjWeekday(now)}（北京时间，以下日期均为北京时间）`;
+  if (!dated.length) return `${head}\n库里还没有任何训练记录。`;
+
   const sorted = [...dated].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const mon = mondayOf(today);
+  const sun = shift(mon, -1);
+  const prevMon = shift(mon, -7);
   const l7 = agg(inRange(sorted, shift(today, -6), today));
   const l30 = agg(inRange(sorted, shift(today, -29), today));
-  const prev7 = agg(inRange(sorted, shift(today, -13), shift(today, -7)));
-  const last = sorted.slice(-5).reverse();
+  const thisWeek = agg(inRange(sorted, mon, today));
+  const lastWeek = agg(inRange(sorted, prevMon, sun));
 
   const line = (label: string, a: ReturnType<typeof agg>) =>
     `${label}：跑 ${a.runs} 次 / ${a.km.toFixed(1)}km / 均配 ${fmtPace(a.pace)} / 均心率 ${a.hr ? Math.round(a.hr) : "—"}`
     + (a.rides ? `；骑行 ${a.rides} 次 / ${a.rideKm.toFixed(1)}km` : "");
 
-  const out: string[] = [`今天：${today} ${bjWeekday(now)}（北京时间，以下均为北京时间）`];
-  out.push(line("近 7 天", l7));
-  out.push(line("近 30 天", l30));
-  if (prev7.runs || prev7.km) {
-    const delta = prev7.km > 0 ? Math.round((l7.km / prev7.km - 1) * 100) : null;
-    out.push(`上周（-14~-8 天）：跑 ${prev7.runs} 次 / ${prev7.km.toFixed(1)}km`
-      + (delta === null ? "" : `（本周相对 ${delta >= 0 ? "+" : ""}${delta}%）`));
+  const out: string[] = [head];
+  out.push(line(`本周（${mon}~${today}）`, thisWeek));
+  if (lastWeek.runs || lastWeek.km) out.push(line(`上周（${prevMon}~${sun}）`, lastWeek));
+  out.push(line(`近 7 天（${shift(today, -6)}~${today}）`, l7));
+  out.push(line(`近 30 天（${shift(today, -29)}~${today}）`, l30));
+
+  // 身体状态：设备日报（睡眠/静息心率），有就报，没有就不提
+  const body: string[] = [];
+  if (daily?.sleepMin) {
+    body.push(`${daily.sleepDate || "最近一晚"} 睡 ${fmtHours(daily.sleepMin)}`
+      + (daily.sleepScore ? `（评分 ${daily.sleepScore}）` : ""));
   }
+  if (daily?.sleep7AvgMin) body.push(`近 7 天均睡 ${fmtHours(daily.sleep7AvgMin)}`);
+  if (daily?.rhrLast) body.push(`静息心率 ${daily.rhrLast}${daily.rhr7Avg ? `（7 日均 ${Math.round(daily.rhr7Avg)}）` : ""}`);
+  if (body.length) out.push(`身体状态：${body.join("；")}`);
+
+  const last = sorted.slice(-5).reverse();
   out.push("最近 5 次：");
   for (const r of last) {
     const km = num(r.distance_m) / 1000;
@@ -90,6 +129,7 @@ export function buildSnapshot(all: Row[], now = Date.now()): string {
       + `${num(r.avg_hr) ? ` HR${num(r.avg_hr)}` : ""}`);
   }
 
+  // 数据质量：碎片（<0.5km 的跑步）与同日同距离疑似重复
   const last30 = inRange(sorted, shift(today, -29), today);
   const frags = last30.filter((r) => RUN_TYPES.includes(r.type || "")
     && num(r.distance_m) > 0 && num(r.distance_m) < 500);
@@ -173,7 +213,11 @@ export function analyzeSignals(all: Row[], now = Date.now()): Signal[] {
   }
 
   // 4) 心率漂移：最近三次 vs 30 天基线
-  const runs30 = last30.filter((r) => RUN_TYPES.includes(r.type || "") && num(r.avg_hr) > 0);
+  // 必须按日期排序后再取"最近三次"：CSV 追加/导入不保证顺序，
+  // 直接 slice(-3) 可能拿到很久以前的记录，判成"心率漂移"就是误报。
+  const runs30 = last30
+    .filter((r) => RUN_TYPES.includes(r.type || "") && num(r.avg_hr) > 0)
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
   const last3 = runs30.slice(-3);
   if (last3.length === 3 && runs30.length >= 8) {
     const base = runs30.slice(0, -3).reduce((a, w) => a + num(w.avg_hr), 0) / (runs30.length - 3);

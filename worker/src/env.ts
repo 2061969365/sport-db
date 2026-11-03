@@ -41,6 +41,8 @@ export interface Env {
   MODEL_STREAMING?: string;
   /** 网关鉴权值：该网关只认"有没有 Authorization"，值随意（默认 "1"）。 */
   VISION_API_KEY?: string;
+  /** 可选：网页版口令。配了之后 /api/chat 必须带 x-pwa-token，否则 401。 */
+  PWA_TOKEN?: string;
   /** 网关暂停开关：设 "1" 时完全不调用网关（聊天回维护提示，图片只存不识别）。 */
   GATEWAY_PAUSED?: string;
   SportDbAgent: DurableObjectNamespace<SportDbAgent>;

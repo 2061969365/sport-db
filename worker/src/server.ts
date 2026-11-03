@@ -6,7 +6,7 @@
 // Think 默认的 WebSocket 聊天协议同时保留（routeAgentRequest 兜底）。
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
-import { ingestPhoto, pickImage, saveTgPhoto, writeReviewItem } from "./photo";
+import { MAX_IMAGE_DATA_URL, ingestPhoto, pickImage, saveTgPhoto, writeReviewItem } from "./photo";
 import { PAUSED_REPLY, isPaused } from "./pause";
 import { sseText } from "./gateway";
 import { UA_BROWSER } from "./photo";
@@ -221,6 +221,12 @@ export default {
         try {
           // 只存图，不自己调识图接口：图片作为消息部件交给模型，让它在对话里直接看。
           const saved = await saveTgPhoto(env, picked.fileId, picked.isOrig, mid);
+          if (!saved.dataUrl) {
+            // 图片超过消息部件上限（或网关暂停）：退回代码识图，图已存好不会丢
+            const out = await ingestPhoto(env, picked.fileId, picked.isOrig, mid, `tg:${chatId}`);
+            await tgSend(env, chatId, out.line);
+            return new Response("ok");
+          }
           const guide =
             `[用户发来一张运动截图，已存档为 ${saved.imgPath}，图片就在这条消息里]\n`
             + "请先看清图上的数据（类型/距离/时长/配速/心率/日期），再按规则入库：\n"
@@ -316,6 +322,15 @@ export default {
       if (request.method !== "POST") {
         return new Response("method not allowed", { status: 405, headers: cors });
       }
+      // 可选口令：配了 PWA_TOKEN 就必须带 x-pwa-token。
+      // 没配就是老行为（公开可问），但要清楚网页版能改库，建议配上。
+      if (env.PWA_TOKEN) {
+        const got = request.headers.get("x-pwa-token") || new URL(request.url).searchParams.get("t") || "";
+        if (got !== env.PWA_TOKEN) {
+          return Response.json({ error: "需要口令（网页右上角填）", needToken: true },
+            { status: 401, headers: { ...cors, "Access-Control-Allow-Headers": "Content-Type, x-pwa-token" } });
+        }
+      }
       let body: { session?: string; key?: string; text?: string; image?: string } = {};
       try {
         body = await request.json();
@@ -327,7 +342,19 @@ export default {
       const text = String(body.text || "").trim().slice(0, 2000);
       // image：data URL（data:image/jpeg;base64,...）。有图时 text 可以只给一句指令。
       const image = String(body.image || "").trim();
-      const validImage = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image) && image.length < 8_000_000;
+      const tooBig = image.length >= MAX_IMAGE_DATA_URL;
+      const validImage = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image) && !tooBig;
+      // 带图但图不合法：超限给 413，格式错给 400。
+      // 注意要在 session 校验之前——以前这条藏在 !text 分支里，
+      // 用户只要带一句话，超大图就被悄悄丢掉，模型只看到文字。
+      if (image && !validImage) {
+        if (tooBig) {
+          return Response.json({ error: "图片太大（超过约 1MB），压缩后重发，或直接在 Telegram 里发图" },
+            { status: 413, headers: cors });
+        }
+        return Response.json({ error: "图片格式不对（只支持 jpeg/png/webp 的 base64 data URL）" },
+          { status: 400, headers: cors });
+      }
       if (!/^[A-Za-z0-9-]{8,64}$/.test(session) || !/^[A-Za-z0-9-]{8,64}$/.test(key)
         || (!text && !validImage)) {
         return Response.json({ error: "参数不对（session/key/text 或 image）" }, { status: 400, headers: cors });
@@ -340,10 +367,12 @@ export default {
         if (!(await agent.claimUpdate(`pwa-${key}`))) {
           return Response.json({ error: "重复提交（请用新 key 重试）" }, { status: 409, headers: cors });
         }
-        // /model 之类的本地指令直接处理，不进模型（TG 与网页共用同一套）。
+        // /model 只允许在 TG 用：网页是无鉴权公网页，不能让任何人改全局网关。
         if (/^\/model(@\w+)?(\s|$)/.test(text) || /^\/(模型)(\s|$)/.test(text)) {
-          const out = await agent.modelCommand(text.replace(/^\/模型/, "/model").replace(/^\/model(@\w+)?/, "/model"));
-          return Response.json({ reply: out, pending: false }, { headers: cors });
+          return Response.json({
+            reply: "改模型/换网关请在 Telegram 里发 /model（网页版不开放，避免被陌生人改配置）。",
+            pending: false,
+          }, { headers: cors });
         }
         // 网关暂停：只放行本地指令，其余直接回维护提示（不打模型）
         if (isPaused(env)) {

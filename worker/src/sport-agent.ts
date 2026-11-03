@@ -30,14 +30,7 @@ import {
   profileShared, repoProfileProvider,
 } from "./profile";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
-import {
-  WORKOUT_TYPES, buildProfile, loadWorkouts,
-  toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout,
-  toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts,
-  toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends,
-  toolUpdateWorkout, toolWritePlan,
-  type SqlTag,
-} from "./github";
+import { WORKOUT_TYPES, buildProfile, loadWorkouts, toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout, toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts, toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout, toolWritePlan, type SqlTag, loadDailySummary } from "./github";
 
 const COACH_SYS =
   "你是 sport-db 运动库的教练助手。详细指令见 rules 上下文块。";
@@ -127,6 +120,12 @@ const RULES_BLOCK =
   + "④ 我的建议是什么？给一个明确立场，不要'都可以'。\n"
   + "【怎么答】第一句先给结论（或直接回答），再给依据，最后给下一步动作。"
   + "关键数字加粗。简单问题 1-3 句说完；需要展开时才用小标题/分点。\n"
+  + "【时间口径】说任何周/月数字都要带日期范围，且不许混用："
+  + "本周 = 本周一 00:00 至今（不是近 7 天）；上周 = 上周一~上周日；近 7 天 = 今天往前数 7 天。"
+  + "快照里每个窗口都写了起止日期，照抄那个范围，别自己重算。"
+  + "被问到「上周/本周/这个月」时，先看快照对应行；快照没有的区间就用 query_workouts 查，不要猜。\n"
+  + "【缺数据就认】睡眠、静息心率、最大心率、体重这些只有在快照或画像里出现时才能引用；"
+  + "没有就直说「这项我这边没有记录」，绝对不许从训练记录反推，也不许说「应该是」。\n"
   + "【必须指出的问题】看到这些就直接说，别绕：心率比基线高、轻松跑跑成了强度、"
   + "周跑量涨幅超过 20%、连续两天强度课、明显碎片/重复记录、计划漏练、"
   + "目标和当前能力差距过大（比如要跑半马但单次只有 2km）。指出时给出具体数字和改法。\n"
@@ -540,20 +539,21 @@ export class SportDbAgent extends Think<Env> {
   /** 提醒到点：由调度器调用，把话推到当前通道。 */
   async fireReminder(payload: { text?: string; once?: boolean }): Promise<void> {
     const text = String(payload?.text || "").trim() || "该训练了。";
-    // 到点时结合当前数据补一句判断（模型生成；失败就只发原提醒）
-    let nudge = "";
-    try {
-      const self = this;
-      const sql: SqlTag = (q, ...a) =>
-        (self.sql(q as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
-      const all = await loadWorkouts(this.env, sql);
-      const cfg = await this.currentCfg().catch(() => undefined);
-      nudge = await composeCoachNote(this.env, cfg, `到点提醒：${text}`, buildSnapshot(all)).catch(() => "");
-    } catch { /* 没数据就只发提醒 */ }
+    // 先判时段/暂停，再决定要不要花一次模型调用：以前是先调模型再丢掉 nudge，白烧额度。
     const hour = bjHour();
-    const body = (hour >= 22 || hour < 7)
-      ? `⏰ 提醒：${text}`  // 深夜/清晨只发提醒本身，不加评论
-      : (nudge ? `⏰ 提醒：${text}\n\n${nudge}` : `⏰ 提醒：${text}`);
+    const quiet = hour >= 22 || hour < 7;
+    let nudge = "";
+    if (!quiet && !isPaused(this.env)) {
+      try {
+        const self = this;
+        const sql: SqlTag = (q, ...a) =>
+          (self.sql(q as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
+        const all = await loadWorkouts(this.env, sql);
+        const cfg = await this.currentCfg().catch(() => undefined);
+        nudge = await composeCoachNote(this.env, cfg, `到点提醒：${text}`, buildSnapshot(all)).catch(() => "");
+      } catch { /* 没数据就只发提醒 */ }
+    }
+    const body = nudge ? `⏰ 提醒：${text}\n\n${nudge}` : `⏰ 提醒：${text}`;
     try {
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
@@ -593,22 +593,21 @@ export class SportDbAgent extends Think<Env> {
       // 5 段 cron：**按北京时间理解**，转成调度器用的 UTC。
       // 之前直接把 "0 7 * * *" 当 UTC 传下去，实际会在北京 15:00 才响。
       const parts = spec.split(/\s+/);
-      const isDaily = /^\d+$/.test(parts[1]) && (parts[2] === "*" || parts[2] === "?");
-      if (isDaily) {
-        const h = Number(parts[1]);
-        if (h >= 0 && h <= 23) {
-          parts[1] = String((h - 8 + 24) % 24);
-          target = parts.join(" ");
-          kind = "cron";
-        } else {
-          target = spec;
-          kind = "cron";
-        }
-      } else {
-        // 非"每天固定小时"的复杂 cron 无法简单换算，按 UTC 处理并告知
-        target = spec;
-        kind = "cron";
+      const isDaily = /^\d+$/.test(parts[1]) && parts[2] === "*"
+        && (parts[3] === "*" || parts[3] === "?") && (parts[4] === "*" || parts[4] === "?");
+      if (!isDaily) {
+        // 带星期/日期的 cron 直接平移小时会改到错误的那天（0 7 * * 1 会变成周二），
+        // 宁可不支持，也不要在错误的时间打扰人。
+        return `失败：只支持「每天固定时间」的 cron（分 时 * * *，如 0 7 * * *）。`
+          + `带星期/日期的表达式我换算不了时区（会错到别的日子），改用具体日期的一次性提醒吧。`;
       }
+      const h = Number(parts[1]);
+      if (!(h >= 0 && h <= 23) || !/^\d+$/.test(parts[0])) {
+        return `失败：cron 的小时/分钟不合法（${spec}），用「0 7 * * *」这种。`;
+      }
+      parts[1] = String((h - 8 + 24) % 24);
+      target = parts.join(" ");
+      kind = "cron";
     } else {
       let iso = spec.replace(" ", "T");
       if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(iso)) iso += "+08:00"; // 无时区按北京时间
@@ -766,6 +765,7 @@ export class SportDbAgent extends Think<Env> {
    */
   async proactiveCheck(): Promise<void> {
     try {
+      if (isPaused(this.env)) return;
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
       const channel = tv[0]?.channel || "";
@@ -955,6 +955,25 @@ export class SportDbAgent extends Think<Env> {
    * 重启后 hook 可能被重放（recovered），用 requestId 去重避免重复推送。
    */
   async onChatResponse(result: { message?: unknown; requestId?: string; status?: string; error?: string }): Promise<void> {
+    // 空回复兜底：模型偶尔回一条没有任何文本的消息（工具调完就结束）。
+    // 用户以前只会看到"这次没处理成功"，其实什么都没发生。
+    try {
+      const parts = (result?.message as { parts?: { type?: string; text?: string }[] })?.parts;
+      const hasText = Array.isArray(parts)
+        && parts.some((p) => p?.type === "text" && String(p.text || "").trim().length > 0);
+      if (result?.status === "completed" && !hasText) {
+        console.warn("[empty-reply] completed without text");
+        const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
+          { channel?: string; chat_id?: string }[];
+        const channel = tv[0]?.channel || "";
+        const chatId = tv[0]?.chat_id || "";
+        const body = "这次没生成出内容（模型返回了空回复）。再发一次就好，你的数据没受影响。";
+        if (channel === "tg" && chatId) await tgSend(this.env, chatId, body).catch(() => null);
+        else if (channel === "feishu" && chatId) await feishuSend(this.env, chatId, body).catch(() => null);
+        this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+        this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${body}, ${Date.now()})`;
+      }
+    } catch { /* 兜底失败不影响主流程 */ }
     try {
       const reqId = String(result?.requestId || "") || `t${Date.now()}`;
       this.sql`CREATE TABLE IF NOT EXISTS notified (id TEXT PRIMARY KEY, at INTEGER)`;
@@ -1017,13 +1036,14 @@ export class SportDbAgent extends Think<Env> {
     return [
       {
         label: "data_snapshot",
-        description: "实时数据快照（每次对话自动刷新）：今天日期星期、近 7/30 天跑量与配速心率、最近 5 次训练、数据质量问题。回答统计类问题先用它，别凭印象。",
-        maxTokens: 800,
+        description: "实时数据快照（每次对话自动刷新）：今天日期星期、本周/上周/近 7 天/近 30 天（都带明确日期）跑量与配速心率、最近 5 次训练、设备日报（睡眠/静息心率）、数据质量问题。回答统计类问题先用它，别凭印象。",
+        maxTokens: 900,
         provider: {
           get: async () => {
             try {
               const all = await loadWorkouts(this.env, sql);
-              return buildSnapshot(all);
+              const daily = await loadDailySummary(this.env, sql).catch(() => null);
+              return buildSnapshot(all, Date.now(), daily || undefined);
             } catch (e) {
               console.error("[snapshot-fail]", e instanceof Error ? e.message : String(e));
               return "";
