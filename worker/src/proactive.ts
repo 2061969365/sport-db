@@ -20,6 +20,93 @@ export function bjToday(now = Date.now()): string {
   return new Date(now + 8 * 36e5).toISOString().slice(0, 10);
 }
 
+/** 北京时间的小时（0-23） */
+export function bjHour(now = Date.now()): number {
+  return new Date(now + 8 * 36e5).getUTCHours();
+}
+
+/** 北京时间的「周几」中文 */
+export function bjWeekday(now = Date.now()): string {
+  return CN[new Date(now + 8 * 36e5).getUTCDay()];
+}
+
+function fmtPace(secPerKm: number): string {
+  if (!Number.isFinite(secPerKm) || secPerKm <= 0) return "—";
+  const m = Math.floor(secPerKm / 60);
+  const s = Math.round(secPerKm % 60);
+  return `${m}'${String(s).padStart(2, "0")}"`;
+}
+
+function agg(rows: Row[]) {
+  const runs = rows.filter((r) => RUN_TYPES.includes(r.type || ""));
+  const km = runs.reduce((a, r) => a + num(r.distance_m), 0) / 1000;
+  const dur = runs.reduce((a, r) => a + num(r.duration_s), 0);
+  const hr = runs.filter((r) => num(r.avg_hr) > 0);
+  const rides = rows.filter((r) => (r.type || "").includes("riding"));
+  return {
+    runs: runs.length,
+    km,
+    pace: km > 0 ? dur / km : 0,
+    hr: hr.length ? hr.reduce((a, r) => a + num(r.avg_hr), 0) / hr.length : 0,
+    rides: rides.length,
+    rideKm: rides.reduce((a, r) => a + num(r.distance_m), 0) / 1000,
+  };
+}
+
+/**
+ * 每轮注入的「实时数据快照」：让模型一开始就有数字可用，
+ * 不用为了回答"最近怎么样"来回调工具，也避免它凭印象编。
+ * 纯函数，好测。
+ */
+export function buildSnapshot(all: Row[], now = Date.now()): string {
+  const today = bjToday(now);
+  const dated = all.filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date || ""));
+  if (!dated.length) return `今天：${today} ${bjWeekday(now)}（北京时间）
+库里还没有任何训练记录。`;
+  const sorted = [...dated].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const l7 = agg(inRange(sorted, shift(today, -6), today));
+  const l30 = agg(inRange(sorted, shift(today, -29), today));
+  const prev7 = agg(inRange(sorted, shift(today, -13), shift(today, -7)));
+  const last = sorted.slice(-5).reverse();
+
+  const line = (label: string, a: ReturnType<typeof agg>) =>
+    `${label}：跑 ${a.runs} 次 / ${a.km.toFixed(1)}km / 均配 ${fmtPace(a.pace)} / 均心率 ${a.hr ? Math.round(a.hr) : "—"}`
+    + (a.rides ? `；骑行 ${a.rides} 次 / ${a.rideKm.toFixed(1)}km` : "");
+
+  const out: string[] = [`今天：${today} ${bjWeekday(now)}（北京时间，以下均为北京时间）`];
+  out.push(line("近 7 天", l7));
+  out.push(line("近 30 天", l30));
+  if (prev7.runs || prev7.km) {
+    const delta = prev7.km > 0 ? Math.round((l7.km / prev7.km - 1) * 100) : null;
+    out.push(`上周（-14~-8 天）：跑 ${prev7.runs} 次 / ${prev7.km.toFixed(1)}km`
+      + (delta === null ? "" : `（本周相对 ${delta >= 0 ? "+" : ""}${delta}%）`));
+  }
+  out.push("最近 5 次：");
+  for (const r of last) {
+    const km = num(r.distance_m) / 1000;
+    const dur = num(r.duration_s);
+    out.push(`- ${r.date} ${r.type} ${km.toFixed(2)}km${dur ? ` ${Math.round(dur / 60)}分钟` : ""}`
+      + `${km > 0 && dur > 0 ? ` ${fmtPace(dur / km)}/km` : ""}`
+      + `${num(r.avg_hr) ? ` HR${num(r.avg_hr)}` : ""}`);
+  }
+
+  const last30 = inRange(sorted, shift(today, -29), today);
+  const frags = last30.filter((r) => RUN_TYPES.includes(r.type || "")
+    && num(r.distance_m) > 0 && num(r.distance_m) < 500);
+  const seen = new Map<string, number>();
+  for (const r of last30) {
+    const k = `${r.date}|${num(r.distance_m)}|${r.type}`;
+    seen.set(k, (seen.get(k) || 0) + 1);
+  }
+  const dups = [...seen.values()].filter((n) => n > 1).length;
+  const issues: string[] = [];
+  if (frags.length >= 3) issues.push(`${frags.length} 条不足 0.5km 的碎片记录（可能是同一次间歇被拆开）`);
+  if (dups) issues.push(`${dups} 组同日同距离的疑似重复`);
+  if (issues.length) out.push(`数据质量：${issues.join("；")}`);
+
+  return out.join("\n");
+}
+
 function shift(dateStr: string, days: number): string {
   return new Date(day(dateStr) + days * 864e5).toISOString().slice(0, 10);
 }

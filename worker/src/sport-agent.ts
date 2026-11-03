@@ -10,7 +10,7 @@ import { z } from "zod";
 import type { Env } from "./env";
 import { feishuSend, finalReplyText, tgSend, tgTyping } from "./notify";
 import { isPaused } from "./pause";
-import { analyzeSignals, bjToday } from "./proactive";
+import { analyzeSignals, bjHour, buildSnapshot, bjToday } from "./proactive";
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, sseFromResponse, sseText, type ChatCompletionLike } from "./gateway";
@@ -67,16 +67,76 @@ async function summarizeText(env: Env, prompt: string, cfg?: ModelCfg): Promise<
   return text;
 }
 
+/**
+ * 让模型写一条主动提醒（而不是发固定模板）。
+ * 输入：今天、触发信号、数据快照；输出：2-4 句有判断的话。
+ * 失败返回空串，调用方回退到模板文案。
+ */
+async function composeCoachNote(
+  env: Env, cfg: ModelCfg | undefined, signal: string, snapshot: string,
+): Promise<string> {
+  const ep = cfg?.endpoint || env.VISION_ENDPOINT;
+  const prompt =
+    "你是用户的跑步教练。现在你要主动给他发一条消息（不是回答提问）。\n"
+    + `今天的日期与数据：\n${snapshot}\n\n`
+    + `触发这条消息的信号：${signal}\n\n`
+    + "要求：\n"
+    + "1) 2-4 句，口语，像教练随手发的微信，不要小标题、不要列表、不要客套开场；\n"
+    + "2) 必须引用具体数字（来自上面的快照），不要空话；\n"
+    + "3) 给一个明确的判断或建议（该练/该歇/该减量/该补哪块），不要模棱两可；\n"
+    + "4) 如果数据里有隐患（心率偏高、配速过快、碎片/重复记录、跑量缺口），直接点出来；\n"
+    + "5) 结尾最多问一个问题，或者干脆不问。\n"
+    + "只输出这条消息本身，不要任何解释。";
+  try {
+    const r = await fetch(ep, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA_BROWSER,
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${env.VISION_API_KEY || "1"}`,
+      },
+      body: JSON.stringify({
+        model: cfg?.model || env.VISION_MODEL,
+        reasoning_effort: "high",
+        stream: true,
+        max_tokens: 1200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) return "";
+    return sseText(await r.text()).trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Date → 北京时间 ISO（带 +08:00），存/显示都用它，避免 UTC 被误读。 */
+function bjIso(d: Date): string {
+  const t = new Date(d.getTime() + 8 * 3600_000);
+  return t.toISOString().replace(/\.\d{3}Z$/, "").replace(/Z$/, "") + "+08:00";
+}
+
 const RULES_BLOCK =
-  "你是一名私人教练，也是这个运动库的管理员。用户会告诉你他当前的健身水平、目标和生活习惯"
-  + "（信息不够时你先问他要），你的职责是结合他的真实运动数据，运用运动科学知识、营养建议和其他相关因素，"
-  + "为他制定最适合的计划和临场建议。说话像 ChatGPT 那样自然：口语亲切、有条理，先给结论再给依据，关键数字加粗；"
-  + "简单问题一两句话答完；分析、计划类问题用小标题或分点展开，但不啰嗦。"
-  + "问题模糊时先反问 1-2 个关键信息再答，不猜着答；多轮对话必须接上文。"
-  + "用户告诉你长期事实（目标、伤病、偏好）时，用 set_context 写进 user_profile，下次先看它再给建议；"
-  + "每次有效建议后，把弱项和下次提醒记进 coaching_notes。"
-  + "不知道就说不知道，绝不编数据；只谈训练恢复。"
-  + "【数据铁律】只用工具查到的数据说话：跑步是跑步、骑行是骑行，配速只谈跑步。"
+  "你是用户的私人跑步教练，也是这个运动库的管理员。你要像一个真正懂行、有判断力的教练那样说话，"
+  + "而不是客服机器人。\n"
+  + "【怎么想】每次回答前先在脑子里做完这几步，但只输出结论，不要念思考过程：\n"
+  + "① 这个问题真正想知道的是什么？（问'最近怎么样'=想知道状态好坏和该不该调整，不是要一串原始数字）\n"
+  + "② 数据支持什么结论？（下面的「实时数据快照」已经有数字，直接用；不够再调工具）\n"
+  + "③ 有没有矛盾或隐患？（心率漂移、配速对不上、跑量缺口、连续强度、伤病复发的诱因）\n"
+  + "④ 我的建议是什么？给一个明确立场，不要'都可以'。\n"
+  + "【怎么答】第一句先给结论（或直接回答），再给依据，最后给下一步动作。"
+  + "关键数字加粗。简单问题 1-3 句说完；需要展开时才用小标题/分点。\n"
+  + "【必须指出的问题】看到这些就直接说，别绕：心率比基线高、轻松跑跑成了强度、"
+  + "周跑量涨幅超过 20%、连续两天强度课、明显碎片/重复记录、计划漏练、"
+  + "目标和当前能力差距过大（比如要跑半马但单次只有 2km）。指出时给出具体数字和改法。\n"
+  + "【禁止的废话】不要'注意休息''循序渐进''根据自身情况调整'这类没有数字的空话；"
+  + "不要复述用户刚说过的话；不要每次都从'很高兴帮你'开场；"
+  + "不确定就说不确定，但要说清缺哪个信息才有把握。\n"
+  + "【记忆】用户告诉你长期事实（目标、伤病、偏好）就用 set_context 写进 user_profile，"
+  + "下次先看它再给建议；每次有效建议后，把弱项和下次该盯的点记进 coaching_notes。\n"
+  + "【不知道就说不知道，绝不编数据；只谈训练恢复。】\n"
+"【数据铁律】只用工具查到的数据说话：跑步是跑步、骑行是骑行，配速只谈跑步。"
   + "用户问具体某条、某天、某月、某年、最早/最晚、最多/最少时，"
   + "必须先调 query_workouts（配好 date_from/date_to/type，找最早用 sort=oldest），"
   + "拿到工具结果再回答；绝不允许凭印象说不知道；工具能查到的，以工具为准。"
@@ -92,7 +152,7 @@ const RULES_BLOCK =
   + "【计划留存】给用户排好完整计划后，主动问一句要不要存进仓里；用户同意就用 write_plan 写到 plans/ 下（两步确认），"
   + "以后他要「我的计划」就读出来，别凭记忆复述。"
   + "【提醒】用户说「提醒我」「到点叫我」就用 set_reminder；时间先用 current_time 确认，"
-  + "相对时间用 +2h/+1d，固定每天用 cron（如每天 7 点 = 0 7 * * *）。"
+  + "相对时间用 +2h/+1d，固定每天用 cron，**cron 一律按北京时间写（如每天 7 点 = `0 7 * * *`）**，工具会自动换算成 UTC 存储；list_reminders 里显示的 UTC 表达式不要当成设错，也绝对不要「顺手改成 0 7 * * *」。"
   + "【计划纪律】用户要训练计划/让他别受伤/问接下来怎么练时，按这个顺序做，不许跳步："
   + "①先调 current_time 确认今天日期（算「下周六」「还有几天」必须用它，不许自己猜）；"
   + "②调 get_summary 和 trends 看真实训练量与近期强度，别拿旧记忆当现状；"
@@ -480,7 +540,20 @@ export class SportDbAgent extends Think<Env> {
   /** 提醒到点：由调度器调用，把话推到当前通道。 */
   async fireReminder(payload: { text?: string; once?: boolean }): Promise<void> {
     const text = String(payload?.text || "").trim() || "该训练了。";
-    const body = `⏰ 提醒：${text}`;
+    // 到点时结合当前数据补一句判断（模型生成；失败就只发原提醒）
+    let nudge = "";
+    try {
+      const self = this;
+      const sql: SqlTag = (q, ...a) =>
+        (self.sql(q as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
+      const all = await loadWorkouts(this.env, sql);
+      const cfg = await this.currentCfg().catch(() => undefined);
+      nudge = await composeCoachNote(this.env, cfg, `到点提醒：${text}`, buildSnapshot(all)).catch(() => "");
+    } catch { /* 没数据就只发提醒 */ }
+    const hour = bjHour();
+    const body = (hour >= 22 || hour < 7)
+      ? `⏰ 提醒：${text}`  // 深夜/清晨只发提醒本身，不加评论
+      : (nudge ? `⏰ 提醒：${text}\n\n${nudge}` : `⏰ 提醒：${text}`);
     try {
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
@@ -517,8 +590,25 @@ export class SportDbAgent extends Think<Env> {
       const mul = rel[2].toLowerCase() === "m" ? 60_000 : rel[2].toLowerCase() === "h" ? 3_600_000 : 86_400_000;
       target = new Date(Date.now() + Number(rel[1]) * mul);
     } else if (/^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/.test(spec)) {
-      target = spec; // 5 段 cron
-      kind = "cron";
+      // 5 段 cron：**按北京时间理解**，转成调度器用的 UTC。
+      // 之前直接把 "0 7 * * *" 当 UTC 传下去，实际会在北京 15:00 才响。
+      const parts = spec.split(/\s+/);
+      const isDaily = /^\d+$/.test(parts[1]) && (parts[2] === "*" || parts[2] === "?");
+      if (isDaily) {
+        const h = Number(parts[1]);
+        if (h >= 0 && h <= 23) {
+          parts[1] = String((h - 8 + 24) % 24);
+          target = parts.join(" ");
+          kind = "cron";
+        } else {
+          target = spec;
+          kind = "cron";
+        }
+      } else {
+        // 非"每天固定小时"的复杂 cron 无法简单换算，按 UTC 处理并告知
+        target = spec;
+        kind = "cron";
+      }
     } else {
       let iso = spec.replace(" ", "T");
       if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(iso)) iso += "+08:00"; // 无时区按北京时间
@@ -534,11 +624,12 @@ export class SportDbAgent extends Think<Env> {
     const s = await this.schedule(target, "fireReminder", { text: body, once: kind === "once" },
       { idempotent: kind !== "once" });
     const id = String(s?.id || "");
-    const whenText = typeof target === "string" ? target : target.toISOString();
+    const whenText = typeof target === "string" ? target : bjIso(target);
     this.sql`INSERT OR REPLACE INTO reminders(id, when_spec, text, kind, at) VALUES (${id}, ${whenText}, ${body}, ${kind}, ${Date.now()})`;
     // 落仓备份：换账号/DO 重建后能自动恢复（内容无隐私代价）
     await this.persistReminders();
-    return `已设定提醒（id=${id}）：${kind === "cron" ? `按周期 ${whenText}` : whenText} 推送「${body}」。`;
+    const whenShow = kind === "cron" ? `按周期 ${spec}（北京时间）` : whenText;
+    return `已设定提醒（id=${id}）：${whenShow} 推送「${body}」。`;
   }
 
   /** 把提醒列表合并写进 state/reminders.json（只动自己这个会话的条目，别人的保留）。 */
@@ -617,7 +708,16 @@ export class SportDbAgent extends Think<Env> {
     const rows = this.sql`SELECT id, when_spec, text, kind FROM reminders ORDER BY at DESC LIMIT 20` as
       { id: string; when_spec: string; text: string; kind: string }[];
     if (!rows.length) return "当前没有提醒。";
-    return rows.map((r) => `${r.id}｜${r.kind === "cron" ? "周期" : "一次性"} ${r.when_spec}｜${r.text}`).join("\n");
+    const bjOf = (spec: string): string => {
+      // 存的是 UTC cron；展示时换回北京时间，免得模型/用户以为设错了
+      const p = spec.trim().split(/\s+/);
+      if (p.length === 5 && /^\d+$/.test(p[1]) && (p[2] === "*" || p[2] === "?")) {
+        const h = (Number(p[1]) + 8) % 24;
+        return `${spec}（= 每天 ${String(h).padStart(2, "0")}:${String(Number(p[0]) || 0).padStart(2, "0")} 北京时间）`;
+      }
+      return spec;
+    };
+    return rows.map((r) => `${r.id}｜${r.kind === "cron" ? `周期 ${bjOf(r.when_spec)}` : `一次性 ${r.when_spec}`}｜${r.text}`).join("\n");
   }
 
   @callable()
@@ -673,9 +773,16 @@ export class SportDbAgent extends Think<Env> {
       // 网页版没有主动推送通道：只在 TG/飞书开口
       if (!chatId || (channel !== "tg" && channel !== "feishu")) return;
 
+      // 静默时段：北京时间 22:00-08:00 绝不主动打扰（这就是之前"凌晨 2 点提醒"的来源）
+      const hour = bjHour();
+      if (hour < 8 || hour >= 22) {
+        console.log(`[proactive-skip quiet-hour=${hour}]`);
+        return;
+      }
       this.sql`CREATE TABLE IF NOT EXISTS proactive_log(id TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
       const last = this.sql`SELECT at FROM proactive_log ORDER BY at DESC LIMIT 1` as { at: number }[];
-      if (last.length && Date.now() - last[0].at < 20 * 3600_000) return;
+      // 一天最多两条：间隔不到 8 小时就闭嘴
+      if (last.length && Date.now() - last[0].at < 8 * 3600_000) return;
 
       // 注意：sql 必须是箭头闭包、以方法形式调 this.sql（bind/摘出来都会丢 ctx）
       const self = this;
@@ -698,7 +805,13 @@ export class SportDbAgent extends Think<Env> {
       if (!signals.length) return;
 
       const top = signals[0];
-      const body = `📣 教练提醒\n${top.text}`;
+      // 模板只做兜底：正常走模型生成，内容会带上下文判断，不是那几句固定话
+      const snapshot = buildSnapshot(all);
+      const cfg = await this.currentCfg().catch(() => undefined);
+      const composed = await composeCoachNote(this.env, cfg, top.text, snapshot).catch(() => "");
+      const body = composed
+        ? `📣 ${composed}`
+        : `📣 教练提醒\n${top.text}`;
       if (channel === "tg") await tgSend(this.env, chatId, body);
       else await feishuSend(this.env, chatId, body);
       this.sql`INSERT OR REPLACE INTO proactive_log(id, text, at) VALUES (${`${top.key}-${Date.now()}`}, ${body}, ${Date.now()})`;
@@ -902,6 +1015,22 @@ export class SportDbAgent extends Think<Env> {
       provider: repoProfileProvider(this.env, path, sql, seed),
     });
     return [
+      {
+        label: "data_snapshot",
+        description: "实时数据快照（每次对话自动刷新）：今天日期星期、近 7/30 天跑量与配速心率、最近 5 次训练、数据质量问题。回答统计类问题先用它，别凭印象。",
+        maxTokens: 800,
+        provider: {
+          get: async () => {
+            try {
+              const all = await loadWorkouts(this.env, sql);
+              return buildSnapshot(all);
+            } catch (e) {
+              console.error("[snapshot-fail]", e instanceof Error ? e.message : String(e));
+              return "";
+            }
+          },
+        },
+      },
       {
         label: "rules",
         description: "教练人设与数据/改库铁律，每轮必读并遵守。",

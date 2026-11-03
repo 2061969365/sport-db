@@ -46,10 +46,12 @@ test("故障不静默：onChatError 兜底还在", () => {
   assert.match(SRC, /模型服务这会儿不可用|模型服务不可用/, "故障提示文案没了");
 });
 
-test("主动教练：定时自查与每天最多打扰一次的闸门还在", () => {
+test("主动教练：定时自查、静默时段、频率闸门都还在", () => {
   assert.match(SRC, /scheduleEvery\(\s*6 \* 3600/, "主动自查的定时没挂上");
-  assert.match(SRC, /20 \* 3600_000/, "每天最多打扰一次的闸门被删了 → 会变骚扰");
+  assert.match(SRC, /8 \* 3600_000/, "频率闸门被删了 → 会变骚扰");
+  assert.match(SRC, /hour < 8 \|\| hour >= 22/, "静默时段没了 → 会半夜推送（踩过：凌晨 2 点提醒）");
   assert.match(SRC, /channel !== "tg" && channel !== "feishu"/, "网页版不该走主动推送");
+  assert.match(SRC, /composeCoachNote/, "主动消息应交给模型生成，而不是固定模板");
 });
 
 test("答复整形：丢掉工具调用间隙的旁白，只留最终答复", () => {
