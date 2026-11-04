@@ -48,3 +48,10 @@ test("计划只走 plan_save，write_plan 只写自由文本", () => {
   assert.match(rules, /别拿它存训练计划|不要用 write_plan 存训练计划/, "计划与笔记的分工没写进规则");
   assert.match(SRC, /训练计划请用 plan_save/, "write_plan 的工具描述没说清分工");
 });
+
+test("目标只能来自用户：规则里不许写死个人赛事", () => {
+  const rules = rulesText();
+  assert.doesNotMatch(rules, /半马|11-15|2026-11-15|右膝/, "规则里写死了个人情况（模型会当成用户设定过的目标）");
+  assert.match(rules, /目标是他的，不是你的/, "没写「目标只能来自用户」这条底线");
+  assert.match(rules, /user_profile 里他确认过的条目/, "没说明目标只能来自画像/亲口说过的话");
+});
