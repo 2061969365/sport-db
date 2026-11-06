@@ -244,7 +244,13 @@ export class SportDbAgent extends Think<Env> {
     const env = this.env;
     const fallbackArmed = () => !!(env.VISION_ENDPOINT_ALT && env.VISION_MODEL_ALT);
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-    const nativeStreaming = cfg.streaming;
+    // 强制流式：这个网关对非流式请求几乎必回 429/530（实测过很多次）。
+    // 之前 /model streaming off 会把它写进 config/model.json，结果就是
+    // 「/health 一切正常，聊天却一直说模型不可用」——因为健康检查本身是流式探活。
+    const nativeStreaming = true;
+    if (!cfg.streaming) {
+      console.warn("[model-streaming] 配置里是 off，已忽略并强制流式（非流式会被网关限流）");
+    }
 
     const raw: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -459,10 +465,15 @@ export class SportDbAgent extends Think<Env> {
     }
 
     if (cmd.action === "streaming") {
-      const loaded = await saveCfg(this.env, sql, { streaming: cmd.on }, "tg:/model");
+      if (!cmd.on) {
+        // 真的关掉就会变成非流式，这个网关对非流式几乎必回 429/530，
+        // 表现就是「健康检查正常、聊天一直说模型不可用」。所以直接拒绝。
+        return "不关：这个网关对非流式请求几乎必回 429/530（会表现成「模型一直不可用」）。\n"
+          + "流式现在是强制开启的，配置里即使写了 off 也会被忽略。";
+      }
+      const loaded = await saveCfg(this.env, sql, { streaming: true }, "tg:/model");
       this.cfgCache = { cfg: loaded.cfg, at: Date.now() };
-      return `流式已设为「${cmd.on ? "原生流式" : "非流式+合成SSE"}」。\n`
-        + (cmd.on ? "⚠️ 网关流式目前是坏的，开原生可能报错；出问题就 /model streaming off。" : "这是当前的稳妥设置。");
+      return "流式已开启（原生流式）。这个网关必须走流式，配置会一直保持 on。";
     }
 
     // 切换：先构成目标配置，体检过了再落盘

@@ -1,7 +1,7 @@
 {
  "endpoint": "https://zen.uflash.ccwu.cc/v1/chat/completions",
  "model": "deepseek-v4.1-flash-free",
- "streaming": false,
- "savedAt": 1793150000000,
+ "streaming": true,
+ "savedAt": 1793000000000,
  "by": "cli:model-switch"
 }
