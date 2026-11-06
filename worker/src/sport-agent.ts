@@ -837,6 +837,81 @@ export class SportDbAgent extends Think<Env> {
     }
   }
 
+  /**
+   * 把历史里的图片（base64 data URL）换成文字占位。
+   *
+   * 收图时图片作为消息部件发给模型，这条消息会一直留在会话历史里，
+   * 之后每轮都把整张图重新发一遍——又慢又容易被网关拒。
+   * 尤其是失败的那一轮：onChatResponse 不会触发，图片就永久卡在历史里，
+   * 导致后面「一直说模型不可用」。所以成功和失败两条路径都要清。
+   */
+  private async stripImageParts(): Promise<void> {
+    try {
+      const msgs = (await this.getMessages()) as { id?: string; parts?: { type?: string }[] }[];
+      let changed = 0;
+      for (const m of msgs) {
+        const parts = m.parts;
+        if (!Array.isArray(parts) || !parts.some((p) => p?.type === "file")) continue;
+        const next = parts.map((p) => (p?.type === "file"
+          ? { type: "text", text: "[用户发来一张运动截图：原图已存档，识别与入库已完成]" }
+          : p));
+        await this.addMessages([{ ...m, parts: next } as never], { mode: "upsert" } as never);
+        changed++;
+      }
+      if (changed) console.log(`[strip-images] 清理 ${changed} 条历史图片`);
+    } catch (e) {
+      console.error("[strip-images-fail]", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** 诊断：某个会话的消息量、图片数、最近错误（只读，不含正文）。 */
+  @callable()
+  async diagnose(): Promise<Record<string, unknown>> {
+    const msgs = (await this.getMessages().catch(() => [])) as {
+      role?: string; parts?: { type?: string; text?: string }[];
+    }[];
+    let chars = 0;
+    let files = 0;
+    for (const m of msgs) {
+      for (const p of m.parts || []) {
+        if (p?.type === "text") chars += String(p.text || "").length;
+        if (p?.type === "file") files++;
+      }
+    }
+    let errors: { msg: string; at: number }[] = [];
+    try {
+      this.sql`CREATE TABLE IF NOT EXISTS error_log(id TEXT PRIMARY KEY, msg TEXT, at INTEGER)`;
+      errors = this.sql`SELECT msg, at FROM error_log ORDER BY at DESC LIMIT 5` as { msg: string; at: number }[];
+    } catch { /* 没有就算了 */ }
+    let channel = "";
+    try {
+      const tv = this.sql`SELECT channel FROM reply_target WHERE slot = 'current'` as
+        { channel?: string }[];
+      channel = tv[0]?.channel || "";
+    } catch { /* 新会话还没这张表 */ }
+    return {
+      messages: msgs.length,
+      textChars: chars,
+      imageParts: files,
+      estTokens: Math.round(chars / 3),
+      channel,
+      paused: isPaused(this.env),
+      errors: errors.map((e) => ({ at: e.at, msg: String(e.msg).slice(0, 200) })),
+    };
+  }
+
+  /** 运维：立刻清掉历史里的图片（会话被大图卡住时用）。 */
+  @callable()
+  async stripImagesAdmin(): Promise<{ before: number; after: number }> {
+    const count = async (): Promise<number> => {
+      const msgs = (await this.getMessages()) as { parts?: { type?: string }[] }[];
+      return msgs.reduce((n, m) => n + (m.parts || []).filter((p) => p?.type === "file").length, 0);
+    };
+    const before = await count();
+    await this.stripImageParts();
+    return { before, after: await count() };
+  }
+
   /** 网页版轮询用：取 since 之后的最新回复。 */
   @callable()
   async latestReply(since: number): Promise<string> {
@@ -853,6 +928,9 @@ export class SportDbAgent extends Think<Env> {
   async onChatError(error: unknown, ctx?: { classification?: string }): Promise<unknown> {
     const raw = error instanceof Error ? error.message : String(error);
     console.error("[chat-error]", ctx?.classification || "", raw.slice(0, 300));
+    // 关键：失败的 turn 不会走 onChatResponse，图片就会永久留在历史里，
+    // 之后每一轮都把几百 KB 的 base64 重新发一遍 → 一直失败。
+    await this.stripImageParts().catch(() => null);
     this.bumpMetrics({ errors: 1 });
     try {
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
@@ -971,6 +1049,7 @@ export class SportDbAgent extends Think<Env> {
    * 重启后 hook 可能被重放（recovered），用 requestId 去重避免重复推送。
    */
   async onChatResponse(result: { message?: unknown; requestId?: string; status?: string; error?: string }): Promise<void> {
+    await this.stripImageParts().catch(() => null);
     // 空回复兜底：模型偶尔回一条没有任何文本的消息（工具调完就结束）。
     // 用户以前只会看到"这次没处理成功"，其实什么都没发生。
     try {

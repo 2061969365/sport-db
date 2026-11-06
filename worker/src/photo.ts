@@ -368,13 +368,33 @@ export async function writeReviewItem(
  * （图片作为 UIMessage 的 file 部件），而不是我们另发一次上网关的请求。
  * 少一次请求 = 少一次限流机会，而且模型能结合上下文判断。
  */
-/** 消息部件里图片的上限（base64 字符数）。DO 的单行约 1.8MB，
- *  超了会在提交/持久化时整条失败，所以宁可在 1.4MB 处截断，改走代码识图。 */
-export const MAX_IMAGE_DATA_URL = 1_400_000;
+/** 只有小图才内联成 data URL；大图一律用 https URL。
+ *  实测：网关对超过约 700KB 的 data URL 直接回
+ *  `invalid_request_error: You have uploaded an unsupported image`，
+ *  而同一张图的 https 链接它能正常读。TG 截图基本都超过这个大小。 */
+export const MAX_IMAGE_DATA_URL = 400_000;
+
+/** 等 raw.githubusercontent 真能访问（刚提交的文件有 CDN 延迟）。 */
+export async function waitForPublicUrl(
+  env: Env, url: string, tries = 6, gapMs = 2500,
+): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { method: "GET", headers: { "User-Agent": UA_BROWSER } });
+      if (r.ok) {
+        await r.body?.cancel().catch(() => null);
+        return true;
+      }
+      await r.body?.cancel().catch(() => null);
+    } catch { /* 继续等 */ }
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, gapMs));
+  }
+  return false;
+}
 
 export async function saveTgPhoto(
   env: Env, fileId: string, isOrig: boolean, mid: number | string,
-): Promise<{ imgPath: string; dataUrl: string; mediaType: string }> {
+): Promise<{ imgPath: string; imgUrl: string; dataUrl: string; mediaType: string }> {
   if (!env.GH_PAT) throw new Error("未配 GH_PAT，收图入库不可用（问数不受影响）");
   const { bytes } = await downloadTgFile(env, fileId);
   const raw = new Uint8Array(bytes);
@@ -391,8 +411,14 @@ export async function saveTgPhoto(
   }
   const b64 = btoa(bin);
   const dataUrl = `data:${mediaType};base64,${b64}`;
-  // 太大就不进消息部件（会撑爆 DO 行），调用方改走代码识图
-  return { imgPath, dataUrl: dataUrl.length > MAX_IMAGE_DATA_URL ? "" : dataUrl, mediaType };
+  const imgUrl = `https://raw.githubusercontent.com/${env.REPO}/main/${imgPath}`;
+  // 大图不走 data URL（网关会拒），交给调用方用 https URL
+  return {
+    imgPath,
+    imgUrl,
+    dataUrl: dataUrl.length > MAX_IMAGE_DATA_URL ? "" : dataUrl,
+    mediaType,
+  };
 }
 
 /**

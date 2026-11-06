@@ -6,7 +6,7 @@
 // Think 默认的 WebSocket 聊天协议同时保留（routeAgentRequest 兜底）。
 import { routeAgentRequest, getAgentByName } from "agents";
 import { SportDbAgent } from "./sport-agent";
-import { MAX_IMAGE_DATA_URL, ingestPhoto, pickImage, saveTgPhoto, writeReviewItem } from "./photo";
+import { MAX_IMAGE_DATA_URL, ingestPhoto, pickImage, saveTgPhoto, waitForPublicUrl, writeReviewItem } from "./photo";
 import { PAUSED_REPLY, isPaused } from "./pause";
 import { sseText } from "./gateway";
 import { UA_BROWSER } from "./photo";
@@ -22,17 +22,18 @@ export { SportDbAgent };
  *  模型在本轮里直接"看"图，不需要我们再单独打一次上网关的识图请求。 */
 async function submitTurn(
   env: Env, instance: string, channel: string, target: string, text: string, idemKey: string,
-  image?: { dataUrl: string; mediaType?: string },
+  image?: { dataUrl?: string; url?: string; mediaType?: string },
 ): Promise<string> {
   const agent = (await getAgentByName(env.SportDbAgent, instance)) as unknown as SportDbAgent;
   await agent.setReplyTarget(channel, target);
   const parts: Record<string, unknown>[] = [{ type: "text", text }];
-  if (image?.dataUrl) {
+  const imageUrl = image?.dataUrl || image?.url || "";
+  if (imageUrl) {
     parts.push({
       type: "file",
-      mediaType: image.mediaType || "image/jpeg",
+      mediaType: image?.mediaType || "image/jpeg",
       filename: "workout-screenshot.jpg",
-      url: image.dataUrl,
+      url: imageUrl,
     });
   }
   const res = await agent.submitMessages(
@@ -222,10 +223,14 @@ export default {
           // 只存图，不自己调识图接口：图片作为消息部件交给模型，让它在对话里直接看。
           const saved = await saveTgPhoto(env, picked.fileId, picked.isOrig, mid);
           if (!saved.dataUrl) {
-            // 图片超过消息部件上限（或网关暂停）：退回代码识图，图已存好不会丢
-            const out = await ingestPhoto(env, picked.fileId, picked.isOrig, mid, `tg:${chatId}`);
-            await tgSend(env, chatId, out.line);
-            return new Response("ok");
+            // 大图不发 base64（网关会回 unsupported image），改用刚提交的 https 地址。
+            // 刚 push 的文件有 CDN 延迟，先等它真能访问；等不到再退回代码识图。
+            const ready = await waitForPublicUrl(env, saved.imgUrl);
+            if (!ready) {
+              const out = await ingestPhoto(env, picked.fileId, picked.isOrig, mid, `tg:${chatId}`);
+              await tgSend(env, chatId, out.line);
+              return new Response("ok");
+            }
           }
           const guide =
             `[用户发来一张运动截图，已存档为 ${saved.imgPath}，图片就在这条消息里]\n`
@@ -238,7 +243,8 @@ export default {
           const text = caption ? `${guide}\n\n[用户附言] ${caption}` : guide;
           try {
             await submitTurn(env, `tg-${chatId}`, "tg", String(chatId), text,
-              `tg-${update.update_id ?? `${chatId}-${mid}`}`, saved);
+              `tg-${update.update_id ?? `${chatId}-${mid}`}`,
+              { dataUrl: saved.dataUrl, url: saved.imgUrl, mediaType: saved.mediaType });
           } catch (e) {
             // 图已存好，只是这一轮没跑起来（多半是网关抖动）：
             // 记进 review，后台会自动重新提交给模型读，用户不用重发。
@@ -342,8 +348,10 @@ export default {
       const text = String(body.text || "").trim().slice(0, 2000);
       // image：data URL（data:image/jpeg;base64,...）。有图时 text 可以只给一句指令。
       const image = String(body.image || "").trim();
-      const tooBig = image.length >= MAX_IMAGE_DATA_URL;
-      const validImage = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image) && !tooBig;
+      const isImageUrl = /^https:\/\/raw\.githubusercontent\.com\//.test(image);
+      const tooBig = !isImageUrl && image.length >= MAX_IMAGE_DATA_URL;
+      const validImage = isImageUrl
+        || (/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image) && !tooBig);
       // 带图但图不合法：超限给 413，格式错给 400。
       // 注意要在 session 校验之前——以前这条藏在 !text 分支里，
       // 用户只要带一句话，超大图就被悄悄丢掉，模型只看到文字。
@@ -383,7 +391,7 @@ export default {
         const since = Date.now();
         const parts: Record<string, unknown>[] = [{ type: "text", text: text || "请读取这张图并按规则入库。" }];
         if (validImage) {
-          const mediaType = image.slice(5, image.indexOf(";"));
+          const mediaType = isImageUrl ? "image/jpeg" : image.slice(5, image.indexOf(";"));
           parts.push({ type: "file", mediaType, filename: "upload.jpg", url: image });
         }
         const sub = await agent.submitMessages(
@@ -409,6 +417,26 @@ export default {
     }
 
     // ---------------- 网页版轮询：长 turn 完成后来这里取答复 ----------------
+    if (url.pathname === "/api/diag" && request.method === "GET") {
+      const sess = String(url.searchParams.get("session") || "");
+      if (!/^[A-Za-z0-9-]{3,64}$/.test(sess)) {
+        return Response.json({ error: "session 不合法" }, { status: 400 });
+      }
+      try {
+        const agent = (await getAgentByName(env.SportDbAgent, sess)) as unknown as {
+          diagnose(): Promise<Record<string, unknown>>;
+          stripImagesAdmin(): Promise<{ before: number; after: number }>;
+        };
+        if (url.searchParams.get("strip") === "1") {
+          const fixed = await agent.stripImagesAdmin();
+          return Response.json({ session: sess, ...fixed, ...(await agent.diagnose()) });
+        }
+        return Response.json({ session: sess, ...(await agent.diagnose()) });
+      } catch (e) {
+        return Response.json({ error: String((e as Error).message).slice(0, 200) }, { status: 500 });
+      }
+    }
+
     if (url.pathname === "/api/chat/result" && request.method === "GET") {
       const cors = {
         "Access-Control-Allow-Origin": "*",
