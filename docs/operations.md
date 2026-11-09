@@ -122,6 +122,23 @@ python scripts/build_db.py                                       # 重建 data.d
   机器人读快照时用的就是这里的 `segment_details[].duration`。
 - sid 一律 sha256 前 8 位脱敏，和 `import_mi.py` 一致。
 
+### 自动同步（GitHub Action）
+
+`.github/workflows/mi-sync.yml`：每天 05:40 / 17:40（北京）各跑一次，回溯 7 天，
+拉云端 → `import_mi_cloud.py` → 提交 `data/`（提交后 `sync.yml` 会自动重建 data.db）。
+
+- 凭证在私有仓 `sport-db-private/config/mi_credentials.json`（`user_id` + `pass_token`）。
+- 首次（或 passToken 失效时）在本地跑一次：
+  ```bash
+  python scripts/seed_mi_credentials.py --verify
+  ```
+  交互输入 userId / passToken（浏览器登录 account.xiaomi.com 后从 Cookie 里拿，
+  或用之前那个 HAR 提取脚本）。`--verify` 会真登录一次并把轮换后的 token 写回。
+- 需要的 secret：`MI_SYNC_PAT`（细粒度 PAT，仅 `sport-db-private` 的 Contents 读写）。
+  现在临时用的是 gh CLI 的个人 token，建议之后换成细粒度 PAT。
+- Action 里 `mi_sync.py` 自己会把轮换后的 passToken 写回私有仓，不需要人工维护。
+- 全量回填：Actions → mi-sync → Run workflow，days 填 365。
+
 注意：云端运动记录的时间以服务器为准，和 App 截图显示的时间可能差一两个小时
 （截图是设备本地时间），以 `start_beijing` 为准即可。
 

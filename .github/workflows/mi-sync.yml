@@ -1,0 +1,58 @@
+name: mi-sync
+
+# 小米运动健康云端取数：每天两次拉最近 7 天 -> 合并进 data/ -> 触发 sync 重建 data.db。
+#
+# 凭证在私有仓 2061969365/sport-db-private/config/mi_credentials.json
+# （首次用 scripts/seed_mi_credentials.py 写入；passToken 每次登录轮换，
+#  本工作流会把轮换后的值写回，别手动改）。
+# 需要的 secret：MI_SYNC_PAT —— 细粒度 PAT，仅 sport-db-private 的 Contents 读写。
+
+on:
+  schedule:
+    - cron: '40 21 * * *'   # 05:40 北京（补昨晚睡眠/昨天的运动）
+    - cron: '40 9 * * *'    # 17:40 北京
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '回溯天数（全量回填填 365）'
+        required: false
+        default: '7'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mi-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install --quiet requests
+
+      - name: 拉取并导入
+        env:
+          MI_SYNC_PAT: ${{ secrets.MI_SYNC_PAT }}
+        run: python scripts/mi_sync.py --days "${{ github.event.inputs.days || '7' }}"
+
+      - name: 提交数据
+        run: |
+          if git diff --quiet -- data/; then
+            echo "数据无变化"
+            exit 0
+          fi
+          git config user.name "sportdb-jet"
+          git config user.email "sportdb-jet@users.noreply.github.com"
+          git add data/
+          git commit -m "bot: 云端同步 $(TZ=Asia/Shanghai date +%F)"
+          git pull --rebase origin main
+          git push origin main
