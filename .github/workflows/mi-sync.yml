@@ -56,3 +56,13 @@ jobs:
           git commit -m "bot: 云端同步 $(TZ=Asia/Shanghai date +%F)"
           git pull --rebase origin main
           git push origin main
+
+      - name: 失败提醒（Telegram）
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          if [ -z "$TG_TOKEN" ]; then exit 0; fi
+          curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            -d chat_id=5896689604 \
+            --data-urlencode "text=⚠️ 小米云端同步失败了。多半是 passToken 失效，在本机跑：python scripts/seed_mi_credentials.py --verify"

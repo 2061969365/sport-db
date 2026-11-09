@@ -101,6 +101,7 @@ def main() -> int:
     ap.add_argument("--pass-token", default=os.environ.get("MI_PASS_TOKEN"))
     ap.add_argument("--region", default=os.environ.get("MI_REGION", "cn"))
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--cookie", help='直接粘贴 "userId=…; passToken=…"（从 HAR/DevTools 复制）')
     a = ap.parse_args()
 
     token = gh_token()
@@ -110,6 +111,16 @@ def main() -> int:
 
     uid = (a.user_id or "").strip()
     pt = (a.pass_token or "").strip()
+    if a.cookie:
+        for part in a.cookie.replace("\n", " ").split(";"):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k = k.strip().lower()
+            if k == "userid":
+                uid = v.strip()
+            elif k == "passtoken":
+                pt = v.strip()
     if not uid:
         uid = input("小米账号 userId: ").strip()
     if not pt:
