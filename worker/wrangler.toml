@@ -30,6 +30,8 @@ VISION_MODEL = "deepseek-v4.1-flash-free"
 # 历史教训：之前判断"流式坏了"其实是 reasoning_effort=xhigh 不被上游支持造成的假象；
 # 改成 high 之后流式可用。若再遇到断流，把它设成 "off" 走非流式+合成 SSE。
 MODEL_STREAMING = "on"
+# 429/限流时依次尝试的备用模型（同一个网关，只换 model 字段）。
+MODEL_FALLBACKS = "mimo-v2.6-flash-free"
 # 鉴权头：该网关只认"有没有 Authorization"，值无所谓（DSH 那边配的就是假 key "1"）。
 # 不带头会走匿名小额度，容易被限流，所以默认带上。
 VISION_API_KEY = "1"

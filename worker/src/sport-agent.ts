@@ -318,46 +318,64 @@ export class SportDbAgent extends Think<Env> {
       };
 
       let lastErr: unknown = null;
-      // 免费网关会限流（"Free usage limit reached"）：这种情况要等更久再试，
-      // 按故障的 0.8s 重试是白费——实测等几秒就能过。
-      // 另外 zen 偶尔整站 530（Cloudflare 隧道故障 code 1033），几十秒后自愈，
-      // 所以隧道类错误也要退避重试。
+      // 免费网关会限流（"Free usage limit reached"），而且额度窗口是按账号/节点算的，
+      // 换个免费模型往往就能过。所以这里按「主模型 → 备用模型列表」轮着试。
+      const fallbackModels = String(env.MODEL_FALLBACKS || "mimo-v2.6-flash-free")
+        .split(",").map((x) => x.trim()).filter(Boolean)
+        .filter((m) => m !== cfg.model);
+      const models = [cfg.model, ...fallbackModels];
+      let freeLimit = false;
+      let retryAfterSec = 0;
       const errText = () => String((lastErr as Error)?.message || "");
-      const quotaLike = () => /usage limit|rate limit|quota|too many|429/i.test(errText());
       const tunnelLike = () => /53[0-9]|1033|tunnel|522|524|timeout|aborted/i.test(errText());
-      const backoff = (attempt: number) => {
-        // 额度类错误必须等得更久：免费网关额度很小，急着重试只会把窗口烧穿
-        const base = quotaLike() ? 8000 : tunnelLike() ? 3000 : 800;
-        return sleep(base * (attempt + 1));
-      };
-      const ATTEMPTS = 3;
-      for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+      const backoff = (attempt: number) => sleep((tunnelLike() ? 3000 : 800) * (attempt + 1));
+      const withModel = (body: string | null, model: string): string | null => {
+        if (!body) return body;
         try {
-          await gateModelCall();
-          const r = await send(url, sendBody);
-          if (r.status === 429 || r.status >= 500) {
-            lastErr = new Error(`网关 ${r.status}`);
-            if (attempt < ATTEMPTS - 1) {
-              await backoff(attempt);
-              continue;
+          const b = JSON.parse(body) as Record<string, unknown>;
+          b.model = model;
+          return JSON.stringify(b);
+        } catch { return body; }
+      };
+
+      outer: for (let mi = 0; mi < models.length; mi++) {
+        const model = models[mi];
+        const bodyForModel = withModel(sendBody, model);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await gateModelCall();
+            const r = await send(url, bodyForModel);
+            if (r.status === 429) {
+              const txt = await r.text().catch(() => "");
+              const ra = Number(r.headers.get("retry-after") || 0);
+              if (ra > 0) retryAfterSec = Math.max(retryAfterSec, ra);
+              if (/FreeUsageLimit|free usage limit/i.test(txt)) freeLimit = true;
+              lastErr = new Error(freeLimit
+                ? "网关 429（免费额度用尽）"
+                : "网关 429（限流）");
+              console.warn(`[model-429] ${model} -> 换下一个（retry-after=${ra}s）`);
+              if (mi < models.length - 1) { await sleep(1200); continue outer; }
+              break outer;
             }
-            break;
-          }
-          if (synthSse) {
-            const made = await synthesize(r);
-            if (made) return made;
-            if (attempt < ATTEMPTS - 1) {
-              await backoff(attempt);
-              continue;
+            if (r.status >= 500) {
+              lastErr = new Error(`网关 ${r.status}`);
+              if (attempt === 0) { await backoff(attempt); continue; }
+              if (mi < models.length - 1) { await sleep(1200); continue outer; }
+              break outer;
             }
-            break;
-          }
-          return r;
-        } catch (e) {
-          lastErr = e;
-          if (attempt < ATTEMPTS - 1) {
-            await backoff(attempt);
-            continue;
+            if (synthSse) {
+              const made = await synthesize(r);
+              if (made) return made;
+              if (attempt === 0) { await backoff(attempt); continue; }
+              if (mi < models.length - 1) { await sleep(1200); continue outer; }
+              break outer;
+            }
+            return r;
+          } catch (e) {
+            lastErr = e;
+            if (attempt === 0) { await backoff(attempt); continue; }
+            if (mi < models.length - 1) { await sleep(1200); continue outer; }
+            break outer;
           }
         }
       }
@@ -380,6 +398,13 @@ export class SportDbAgent extends Think<Env> {
         } catch (e) {
           lastErr = e;
         }
+      }
+      if (freeLimit) {
+        const when = retryAfterSec > 0
+          ? new Date(Date.now() + retryAfterSec * 1000).toLocaleString("zh-CN",
+              { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit" })
+          : "";
+        throw new Error(`模型服务不可用（免费额度用尽${when ? `，约 ${when} 恢复` : ""}）`);
       }
       throw new Error(`模型服务不可用（${String((lastErr as Error)?.message || lastErr).slice(0, 120)}）`);
     }) as typeof fetch;
@@ -938,7 +963,11 @@ export class SportDbAgent extends Think<Env> {
       const channel = tv[0]?.channel || "";
       const chatId = tv[0]?.chat_id || "";
       const cls = String(ctx?.classification || "");
-      const hint = cls === "rate_limit"
+      const hint = /免费额度用尽/.test(raw)
+        ? "免费模型额度用完了（网关的 FreeUsageLimit），" +
+          (/恢复/.test(raw) ? raw.replace(/^.*?（/, "").replace(/）$/, "") + "。" : "") +
+          "这期间问数据可以，但生成不了回答；数据没受影响。"
+        : cls === "rate_limit"
         ? "模型服务在限流，等一两分钟再问一次就好。"
         : /模型服务不可用|网关/.test(raw)
           ? "模型服务这会儿不可用（重试过也没成），过几分钟再试；你的数据没受影响。"

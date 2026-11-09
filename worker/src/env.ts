@@ -39,6 +39,8 @@ export interface Env {
    * 哪天网关修好了，设成 "on" 就恢复原生流式。
    */
   MODEL_STREAMING?: string;
+  /** 429/限流时依次尝试的备用模型（逗号分隔）。 */
+  MODEL_FALLBACKS?: string;
   /** 网关鉴权值：该网关只认"有没有 Authorization"，值随意（默认 "1"）。 */
   VISION_API_KEY?: string;
   /** 可选：网页版口令。配了之后 /api/chat 必须带 x-pwa-token，否则 401。 */
