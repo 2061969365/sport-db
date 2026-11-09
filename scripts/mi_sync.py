@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -60,19 +61,40 @@ def fetch_creds(repo: str, path: str, token: str) -> tuple[dict, str | None]:
     return json.loads(raw.decode("utf-8")), d.get("sha")
 
 
-def push_creds(repo: str, path: str, token: str, creds: dict, sha: str | None, reason: str) -> None:
+def push_creds(repo: str, path: str, token: str, creds: dict, sha: str | None, reason: str) -> bool:
+    """写回私有仓；失败重试 3 次（409 说明被别处改过，重取 sha 再来）。"""
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    if sha is None:
-        d = api("GET", url, token)
-        sha = d.get("sha")
     body = {
         "message": f"bot: {reason}",
         "content": base64.b64encode(
             json.dumps(creds, ensure_ascii=False, indent=2).encode()).decode(),
     }
-    if sha:
-        body["sha"] = sha
-    api("PUT", url, token, body)
+    for attempt in range(3):
+        try:
+            cur = sha
+            if cur is None:
+                cur = api("GET", url, token).get("sha")
+            payload = dict(body)
+            if cur:
+                payload["sha"] = cur
+            api("PUT", url, token, payload)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (409, 422):
+                sha = None  # 重新取 sha
+            elif e.code in (401, 403):
+                print(f"[mi-sync] 写回凭证失败：PAT 无权限（HTTP {e.code}）", file=sys.stderr)
+                return False
+            if attempt == 2:
+                print(f"[mi-sync] 写回凭证失败：HTTP {e.code}", file=sys.stderr)
+                return False
+            time.sleep(2 * (attempt + 1))
+        except Exception as e:
+            if attempt == 2:
+                print(f"[mi-sync] 写回凭证失败：{e}", file=sys.stderr)
+                return False
+            time.sleep(2 * (attempt + 1))
+    return False
 
 
 def main() -> int:
@@ -125,6 +147,31 @@ def main() -> int:
            "--workouts", "--sleep-daily",
            "--token-file", str(creds_file), "--out", str(out)]
     rc = subprocess.call(cmd)
+
+    # 登录只要成功就可能轮换 token，所以「先写回、再导入」：
+    # 否则导入一失败，新的 passToken 就丢了，下次直接登不上。
+    after_bytes = creds_file.read_bytes()
+    if hashlib.sha256(after_bytes).hexdigest() != before:
+        try:
+            new_creds = json.loads(after_bytes.decode("utf-8"))
+        except Exception:
+            new_creds = {}
+        if new_creds.get("user_id") and new_creds.get("pass_token"):
+            new_creds.setdefault("region", creds.get("region", "cn"))
+            if a.creds:
+                print("[mi-sync] passToken 已轮换，写回本地凭证文件")
+            elif push_creds(a.state_repo, a.state_path, token, new_creds, sha,
+                            f"更新小米 passToken {datetime.now(BJ):%Y-%m-%d}"):
+                print("[mi-sync] passToken 已轮换，已写回私有仓")
+            env_file = os.environ.get("GITHUB_ENV")
+            if env_file:
+                with open(env_file, "a", encoding="utf-8") as f:
+                    f.write("MI_TOKEN_CHANGED=1\n")
+        else:
+            print("[mi-sync] 凭证文件被改写但字段不完整，跳过写回", file=sys.stderr)
+    else:
+        print("[mi-sync] passToken 未变化")
+
     if rc != 0:
         print(f"[mi-sync] 导出失败（退出码 {rc}）——passToken 可能已失效，"
               f"重新跑 scripts/seed_mi_credentials.py", file=sys.stderr)
@@ -135,23 +182,6 @@ def main() -> int:
     if rc != 0:
         print(f"[mi-sync] 导入失败（退出码 {rc}）", file=sys.stderr)
         return rc
-
-    after_bytes = creds_file.read_bytes()
-    if hashlib.sha256(after_bytes).hexdigest() != before:
-        new_creds = json.loads(after_bytes.decode("utf-8"))
-        new_creds.setdefault("region", creds.get("region", "cn"))
-        if a.creds:
-            print("[mi-sync] passToken 已轮换，写回本地凭证文件")
-        else:
-            push_creds(a.state_repo, a.state_path, token, new_creds, sha,
-                       f"更新小米 passToken {datetime.now(BJ):%Y-%m-%d}")
-            print("[mi-sync] passToken 已轮换，已写回私有仓")
-        env_file = os.environ.get("GITHUB_ENV")
-        if env_file:
-            with open(env_file, "a", encoding="utf-8") as f:
-                f.write("MI_TOKEN_CHANGED=1\n")
-    else:
-        print("[mi-sync] passToken 未变化")
 
     if not a.keep_json:
         out.unlink(missing_ok=True)
