@@ -73,6 +73,10 @@ def put_creds(token: str, creds: dict) -> None:
 
 def verify(creds: dict) -> bool:
     tmp = Path(tempfile.gettempdir()) / "mi_seed_creds.json"
+    out = Path(tempfile.gettempdir()) / "mi_seed_probe.json"
+    # 教训：这两个路径绝不能相同——导出会覆盖凭证，导致轮换后的 token 丢失。
+    if out == tmp:
+        raise RuntimeError("creds/out 路径冲突")
     tmp.write_text(json.dumps(creds), encoding="utf-8")
     from datetime import datetime, timedelta, timezone
     bj = timezone(timedelta(hours=8))
@@ -81,7 +85,7 @@ def verify(creds: dict) -> bool:
     rc = subprocess.call([
         sys.executable, str(ROOT / "scripts" / "mi_fitness_export.py"),
         "--start", str(start), "--end", str(end), "--keys", "steps",
-        "--token-file", str(tmp), "--out", str(tmp.with_suffix(".json")),
+        "--token-file", str(tmp), "--out", str(out),
     ])
     if rc != 0:
         print("[seed] 验证失败：passToken 无效或账号登不上", file=sys.stderr)
@@ -91,7 +95,7 @@ def verify(creds: dict) -> bool:
         print("[seed] 登录成功，passToken 已轮换，写回")
         put_creds(gh_token(), rotated)
     tmp.unlink(missing_ok=True)
-    tmp.with_suffix(".json").unlink(missing_ok=True)
+    out.unlink(missing_ok=True)
     return True
 
 
