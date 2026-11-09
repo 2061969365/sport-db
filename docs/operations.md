@@ -96,6 +96,35 @@ curl -X POST "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook" \
 daily ≥ 14000 的卫生下限）。早期写死 806/14082 的断言会在正常入库后自杀 —— 
 你那张截图入库变成 807 行时 sync 连挂两次，就是这么来的。
 
+## 云端 API 取数（小米运动健康，2026-11 新增）
+
+除了收运动截图，现在可以直连小米运动健康云端取数（步数/心率/睡眠/运动记录/体重/血氧/压力）。
+逆向与接口细节见 `F:/worker/work/mihealth/report/mihealth-3.59.2-DATA-API.md`，
+导出脚本是那边的 `report/mi_fitness_export.py`（需要本人账号的 `userId` + `passToken`，
+`passToken` 每次登录都会轮换）。
+
+导出得到 `mi_fitness.json` 后，导入本仓：
+
+```bash
+python scripts/import_mi_cloud.py --src F:/worker/work/mihealth/report/exports/mi_fitness.json --dry-run
+python scripts/import_mi_cloud.py --src .../mi_fitness.json     # 真写
+python scripts/build_db.py                                       # 重建 data.db
+```
+
+导入规则（都在 `scripts/import_mi_cloud.py` 里，改之前先看注释）：
+
+- 运动记录按「同一天 + 同类型 + 距离相差 ≤30m」与现有行一对一认领；认领上的补全真实
+  起止时间、心率、步数、配速、卡路里，保留原 id（截图/手工记录的 id 不会变）。
+- 对不上的作为新行追加，id 形如 `mi-<sid_hash>-<start_utc>-<type>`，`source=mihealth-cloud`。
+- 先按「开始时间相差 ≤3 分钟且距离/时长相同」去掉重复行，再合并云端（顺序不能反，
+  合并会把开始时间改成云端时间，之后认不出那对重复）。
+- 睡眠日报按 `(date, tag=daily_report, key=sleep)` 覆盖写入 `data/daily/YYYY.csv`，
+  机器人读快照时用的就是这里的 `segment_details[].duration`。
+- sid 一律 sha256 前 8 位脱敏，和 `import_mi.py` 一致。
+
+注意：云端运动记录的时间以服务器为准，和 App 截图显示的时间可能差一两个小时
+（截图是设备本地时间），以 `start_beijing` 为准即可。
+
 ## 换 Cloudflare 账号 / 换域名部署
 
 代码里**没有任何账号绑定**（`wrangler.toml` 只有 worker 名、DO 绑定、vars），
