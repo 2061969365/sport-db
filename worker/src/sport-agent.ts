@@ -67,13 +67,16 @@ async function summarizeText(env: Env, prompt: string, cfg?: ModelCfg): Promise<
  */
 async function composeCoachNote(
   env: Env, cfg: ModelCfg | undefined, signal: string, snapshot: string, extra = "",
+  history = "",
 ): Promise<string> {
   const ep = cfg?.endpoint || env.VISION_ENDPOINT;
   const prompt =
     "你是他的跑步教练。现在你要主动给他发一条消息（不是回答提问）。\n"
     + `背景：\n${snapshot}\n` + (extra ? `\n${extra}\n` : "")
+    + (history ? `\n你俩最近的实际对话（最后一条在下）：\n${history}\n` : "")
     + `\n今天触发的信号：${signal}\n\n`
     + "由你决定现在说不说、说什么：\n"
+    + "- 如果上面有对话，必须接着最近的语境说，像同一个人继续说，不能像另一个人突然插话；已经说过的不要重复；\n"
     + "- 如果你判断不值得打扰（不紧急、刚提醒过、说了也是废话），只输出 SILENT，一个字都不要多；\n"
     + "- 要说就 2-4 句，口语，像教练随手发的微信：不要标题、不要列表、不要客套开场；\n"
     + "- 必须有具体数字（来自上面的背景），必须有明确判断（该练/该歇/该减量/该补哪块），模棱两可不如不说；\n"
@@ -558,6 +561,44 @@ export class SportDbAgent extends Think<Env> {
     return session;
   }
 
+  /** 最近几轮对话的纯文本（给主动提醒当上下文用）。 */
+  private async recentDialogue(limit = 10): Promise<string> {
+    try {
+      const msgs = (await this.getMessages()) as { role?: string; parts?: { type?: string; text?: string }[] }[];
+      const lines: string[] = [];
+      for (const m of msgs.slice(-limit)) {
+        const text = (m.parts || [])
+          .filter((p) => p?.type === "text")
+          .map((p) => String(p.text || ""))
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!text) continue;
+        const who = m.role === "assistant" ? "你（教练）" : m.role === "user" ? "他" : "系统";
+        lines.push(`${who}：${text.slice(0, 300)}`);
+      }
+      const joined = lines.join("\n");
+      return joined.length > 1600 ? joined.slice(-1600) : joined;
+    } catch {
+      return "";
+    }
+  }
+
+  /** 主动说出的话要留在会话里，否则下一轮模型不知道自己刚才说过什么。 */
+  private async rememberSpoken(text: string): Promise<void> {
+    const body = String(text || "").trim();
+    if (!body) return;
+    try {
+      await this.addMessages([{
+        id: crypto.randomUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: body }],
+      } as never]);
+    } catch (e) {
+      console.error("[remember-spoken-fail]", e instanceof Error ? e.message : String(e));
+    }
+  }
+
   /** 提醒到点：由调度器调用，把话推到当前通道。 */
   async fireReminder(payload: { text?: string; once?: boolean }): Promise<void> {
     const text = String(payload?.text || "").trim() || "该训练了。";
@@ -572,7 +613,9 @@ export class SportDbAgent extends Think<Env> {
           (self.sql(q as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
         const all = await loadWorkouts(this.env, sql);
         const cfg = await this.currentCfg().catch(() => undefined);
-        nudge = await composeCoachNote(this.env, cfg, `到点提醒：${text}`, buildSnapshot(all)).catch(() => "");
+        const history = await this.recentDialogue();
+        nudge = await composeCoachNote(this.env, cfg, `到点提醒：${text}`, buildSnapshot(all), "", history)
+          .catch(() => "");
       } catch { /* 没数据就只发提醒 */ }
     }
     const body = nudge ? `⏰ 提醒：${text}\n\n${nudge}` : `⏰ 提醒：${text}`;
@@ -592,6 +635,7 @@ export class SportDbAgent extends Think<Env> {
       }
       this.sql`CREATE TABLE IF NOT EXISTS reminder_log(id TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
       this.sql`INSERT OR REPLACE INTO reminder_log(id, text, at) VALUES (${`${text}-${Date.now()}`}, ${body}, ${Date.now()})`;
+      await this.rememberSpoken(body);
       console.log(`[reminder-fired channel=${channel}] ${text}`);
     } catch (e) {
       console.error("[fireReminder-fail]", e instanceof Error ? e.message : String(e));
@@ -785,26 +829,26 @@ export class SportDbAgent extends Think<Env> {
    * 主动教练：每 6 小时自查一次数据，**只在发现值得说的信号时**才开口，
    * 且 20 小时内最多打扰一次。没有信号就静默返回（不花 token）。
    */
-  async proactiveCheck(): Promise<void> {
+  async proactiveCheck(): Promise<string> {
     try {
-      if (isPaused(this.env)) return;
+      if (isPaused(this.env)) return "paused";
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
         { channel?: string; chat_id?: string }[];
       const channel = tv[0]?.channel || "";
       const chatId = tv[0]?.chat_id || "";
       // 网页版没有主动推送通道：只在 TG/飞书开口
-      if (!chatId || (channel !== "tg" && channel !== "feishu")) return;
+      if (!chatId || (channel !== "tg" && channel !== "feishu")) return "no-channel";
 
       // 静默时段：北京时间 22:00-08:00 绝不主动打扰（这就是之前"凌晨 2 点提醒"的来源）
       const hour = bjHour();
       if (hour < 8 || hour >= 22) {
         console.log(`[proactive-skip quiet-hour=${hour}]`);
-        return;
+        return `quiet-hour(${hour})`;
       }
       this.sql`CREATE TABLE IF NOT EXISTS proactive_log(id TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
       const last = this.sql`SELECT at FROM proactive_log ORDER BY at DESC LIMIT 1` as { at: number }[];
       // 一天最多两条：间隔不到 8 小时就闭嘴
-      if (last.length && Date.now() - last[0].at < 8 * 3600_000) return;
+      if (last.length && Date.now() - last[0].at < 8 * 3600_000) return "recent";
 
       // 注意：sql 必须是箭头闭包、以方法形式调 this.sql（bind/摘出来都会丢 ctx）
       const self = this;
@@ -824,7 +868,7 @@ export class SportDbAgent extends Think<Env> {
       } catch { /* 没计划就算了 */ }
 
       signals = signals.filter((s) => s.weight >= 50).sort((a, b) => b.weight - a.weight);
-      if (!signals.length) return;
+      if (!signals.length) return "no-signal";
 
       // 不止给一条：把前三条信号一起交给模型，让它自己挑要不要说、说哪条。
       const top = signals[0];
@@ -844,21 +888,26 @@ export class SportDbAgent extends Think<Env> {
         extraBits.push(`其他候选信号（不一定都要说）：\n${signals.slice(1, 3).map((x) => `- ${x.text}`).join("\n")}`);
       }
       const cfg = await this.currentCfg().catch(() => undefined);
-      const composed = await composeCoachNote(this.env, cfg, top.text, snapshot, extraBits.join("\n")).catch(() => "");
+      const history = await this.recentDialogue();
+      const composed = await composeCoachNote(this.env, cfg, top.text, snapshot, extraBits.join("\n"), history)
+        .catch(() => "");
       // 模型判断"现在不值得说"就真的不说
       if (shouldStaySilent(composed)) {
         console.log(`[proactive-quiet model] ${top.key}`);
-        return;
+        return "model-silent";
       }
       const body = composed
         ? `📣 ${composed}`
         : `📣 教练提醒\n${top.text}`;
       if (channel === "tg") await tgSend(this.env, chatId, body);
       else await feishuSend(this.env, chatId, body);
+      await this.rememberSpoken(body);
       this.sql`INSERT OR REPLACE INTO proactive_log(id, text, at) VALUES (${`${top.key}-${Date.now()}`}, ${body}, ${Date.now()})`;
       console.log(`[proactive-sent weight=${top.weight}] ${top.key}`);
+      return `sent: ${body}`;
     } catch (e) {
       console.error("[proactive-fail]", e instanceof Error ? e.message : String(e));
+      return `error: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 

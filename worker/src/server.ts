@@ -427,6 +427,10 @@ export default {
           diagnose(): Promise<Record<string, unknown>>;
           stripImagesAdmin(): Promise<{ before: number; after: number }>;
         };
+        if (url.searchParams.get("proactive") === "1") {
+          const res = await (agent as unknown as { proactiveCheck(): Promise<string> }).proactiveCheck();
+          return Response.json({ session: sess, proactive: res });
+        }
         if (url.searchParams.get("strip") === "1") {
           const fixed = await agent.stripImagesAdmin();
           return Response.json({ session: sess, ...fixed, ...(await agent.diagnose()) });
