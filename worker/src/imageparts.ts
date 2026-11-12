@@ -31,7 +31,9 @@ export function injectImageParts(bodyText: string | null): InjectResult {
   }
 
   let injected = 0;
-  for (const m of b.messages) {
+  // 只看最近 4 条：历史里的旧标记不该让此后每一轮都重发图片。
+  const recent = b.messages.slice(-4);
+  for (const m of recent) {
     const txt = typeof m.content === "string"
       ? m.content
       : Array.isArray(m.content)
@@ -55,4 +57,11 @@ export function injectImageParts(bodyText: string | null): InjectResult {
 /** 这个 body 里有没有图片部件（用于决定 400 是否值得重试）。 */
 export function hasImagePart(bodyText: string | null): boolean {
   return !!bodyText && /"type":\s*"image_url"|@@IMG@@/.test(bodyText);
+}
+
+/** 请求体里真正带了几张图（image_url 部件），用于决定是否换视觉模型。 */
+export function countImageParts(bodyText: string | null): number {
+  if (!bodyText) return 0;
+  const re = /"type":\s*"image_url"/g;
+  return (bodyText.match(re) || []).length;
 }

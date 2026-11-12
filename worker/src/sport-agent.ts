@@ -14,7 +14,7 @@ import { analyzeSignals, bjHour, buildSnapshot, bjToday, shouldStaySilent } from
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, sseFromResponse, sseText, type ChatCompletionLike } from "./gateway";
-import { hasImagePart, injectImageParts } from "./imageparts";
+import { countImageParts, hasImagePart, injectImageParts } from "./imageparts";
 import { autoRetryReviews, imageDataUrl, retryReview, UA_BROWSER } from "./photo.ts";
 import { ghDeleteFile, ghGetFile } from "./github.ts";
 import {
@@ -106,6 +106,24 @@ async function composeCoachNote(
   } catch {
     return "";
   }
+}
+
+/** 把消息部件里残留的 @@IMG@@<url> 标记换成文字（否则此后每轮都当成图片轮）。 */
+function scrubMarker<T>(value: T): T {
+  if (typeof value === "string") {
+    return value.replace(/@@IMG@@\S+/g, "（图片已看过）") as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => scrubMarker(v)) as unknown as T;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = scrubMarker(v);
+    }
+    return out as T;
+  }
+  return value;
 }
 
 /** Date → 北京时间 ISO（带 +08:00），存/显示都用它，避免 UTC 被误读。 */
@@ -293,7 +311,7 @@ export class SportDbAgent extends Think<Env> {
           if (inj.injected) body = inj.body;
           // 主模型（deepseek-v4.1-flash-free）不收大图，图片轮必须换视觉模型，
           // 否则网关回 400 "the request is invalid"。实测 mimo / nemotron 都能读。
-          if (body && hasImagePart(body)) {
+          if (body && countImageParts(body) > 0) {
             try {
               const bb = JSON.parse(body) as Record<string, unknown>;
               bb.model = env.IMAGE_MODEL || "mimo-v2.6-flash-free";
@@ -305,6 +323,10 @@ export class SportDbAgent extends Think<Env> {
               keys: b ? Object.keys(b).join(",") : "-",
               tools: (b?.tools || []).length,
               msgs: (b?.messages || []).length,
+              model: (() => {
+                try { return (JSON.parse(String(body)) as { model?: string }).model; }
+                catch { return b?.model; }
+              })(),
               kb: b ? Math.round(JSON.stringify(b).length / 1024) : 0,
               imgs: (b?.messages || []).reduce((n: number, m: { content?: unknown }) =>
                 n + (Array.isArray(m.content)
@@ -378,7 +400,9 @@ export class SportDbAgent extends Think<Env> {
               lastErr = new Error(freeLimit
                 ? "网关 429（免费额度用尽）"
                 : "网关 429（限流）");
-              console.warn(`[model-429] ${model} -> 换下一个（retry-after=${ra}s）`);
+              console.warn(`[model-429] ${model}（retry-after=${ra}s）`);
+              // 先给主模型一次重试：429 常常是瞬时的，立刻掉到备用模型会明显变笨。
+              if (attempt === 0) { await sleep(2500); continue; }
               if (mi < models.length - 1) { await sleep(1200); continue outer; }
               break outer;
             }
@@ -953,10 +977,12 @@ export class SportDbAgent extends Think<Env> {
       let changed = 0;
       for (const m of msgs) {
         const parts = m.parts;
-        if (!Array.isArray(parts) || !parts.some((p) => p?.type === "file")) continue;
-        const next = parts.map((p) => (p?.type === "file"
+        if (!Array.isArray(parts)) continue;
+        const hasMarker = JSON.stringify(parts).includes("@@IMG@@");
+        if (!parts.some((p) => p?.type === "file") && !hasMarker) continue;
+        const next = scrubMarker(parts.map((p) => (p?.type === "file"
           ? { type: "text", text: "[用户发来一张运动截图：原图已存档，识别与入库已完成]" }
-          : p));
+          : p)));
         await this.addMessages([{ ...m, parts: next } as never], { mode: "upsert" } as never);
         changed++;
       }
@@ -996,6 +1022,7 @@ export class SportDbAgent extends Think<Env> {
       textChars: chars,
       imageParts: files,
       estTokens: Math.round(chars / 3),
+      markers: (JSON.stringify(msgs).match(/@@IMG@@/g) || []).length,
       channel,
       paused: isPaused(this.env),
       errors: errors.map((e) => ({ at: e.at, msg: String(e.msg).slice(0, 200) })),
