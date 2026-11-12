@@ -31,7 +31,7 @@ import {
   profileShared, repoProfileProvider,
 } from "./profile";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
-import { WORKOUT_TYPES, buildProfile, loadWorkouts, toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout, toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts, toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout, toolWritePlan, type SqlTag, loadDailySummary } from "./github";
+import { WORKOUT_TYPES, buildProfile, loadWorkouts, toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout, toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts, toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout, toolWritePlan, toolTriggerMiSync, type SqlTag, loadDailySummary } from "./github";
 
 const COACH_SYS =
   "你是 sport-db 运动库的教练助手。详细指令见 rules 上下文块。";
@@ -137,14 +137,14 @@ const RULES_BLOCK =
   + "画像里没有就不提、不假设、更不要替他定；他说的话和画像不一致，以他这次说的为准，并当场改掉记录。"
   + "【时间口径】说周/月数字必须带日期范围：本周从周一算，和近 7 天不是一回事（快照里两个都列了，照抄）。"
   + "算「下周几」「还有几天」先用 current_time 对今天。\n"
-  + "【工具边界】你手上有 31 个工具，名字原样用，别自己造、别假装用过：\n"
+  + "【工具边界】你手上有 32 个工具，名字原样用，别自己造、别假装用过：\n"
   + "· 查数据：get_summary / query_workouts / stats_workouts / trends / records / compare_periods / streaks / "
   + "coach_check（自查异常信号）\n"
   + "· 改数据（先预览后确认）：update_workout / delete_workout / append_workout\n"
   + "· 收图审核：list_review / retry_review / confirm_review\n"
   + "· 计划：plan_save / plan_list / plan_progress / plan_mark\n"
   + "· 提醒：set_reminder / list_reminders / cancel_reminder\n"
-  + "· 外部与仓：current_time / weather / web_search / fetch_url / list_repo_dir / read_repo_file / view_repo_image / "
+  + "· 外部与仓：current_time / weather / web_search / fetch_url / list_repo_dir / read_repo_file / view_repo_image / refresh_data / "
   + "write_plan / usage_stats / chat_backup\n"
   + "运动数据只从「查数据 / 改数据 / 收图审核」这三组读写；其他工具用来查外部信息或存计划。\n"
   + "【计划】排训练计划用 plan_save：按天给日期、类型（easy/long/tempo/interval/rest/race/other）和目标"
@@ -1530,6 +1530,11 @@ export class SportDbAgent extends Think<Env> {
           max_chars: z.number().int().min(500).max(8000).default(4000),
         }),
         execute: async (args: { url?: string; max_chars?: number }) => toolFetchUrl(env, args),
+      }),
+      refresh_data: tool({
+        description: "刷新运动数据：触发小米云端同步（GitHub Actions，拉最近 3 天）。用户说「数据怎么没更新」「刷新一下数据」「同步一下」时用它。触发后 1~2 分钟生效，不要重复触发。",
+        inputSchema: z.object({}),
+        execute: async () => toolTriggerMiSync(env),
       }),
       list_repo_dir: tool({
         description: "列数据仓里的目录（只读）：plans/ 训练计划、reports/daily/ 每日报告、data/ 数据、docs/ 文档。想知道有什么文件时用它。",
