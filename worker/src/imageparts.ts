@@ -54,5 +54,5 @@ export function injectImageParts(bodyText: string | null): InjectResult {
 
 /** 这个 body 里有没有图片部件（用于决定 400 是否值得重试）。 */
 export function hasImagePart(bodyText: string | null): boolean {
-  return !!bodyText && /"type":"image_url"|"type": "image_url"/.test(bodyText);
+  return !!bodyText && /"type":\s*"image_url"|@@IMG@@/.test(bodyText);
 }

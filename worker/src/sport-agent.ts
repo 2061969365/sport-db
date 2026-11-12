@@ -291,6 +291,15 @@ export class SportDbAgent extends Think<Env> {
           // 否则模型只看到一段链接文本（会说"看不到"）。见 imageparts.ts。
           const inj = injectImageParts(body);
           if (inj.injected) body = inj.body;
+          // 主模型（deepseek-v4.1-flash-free）不收大图，图片轮必须换视觉模型，
+          // 否则网关回 400 "the request is invalid"。实测 mimo / nemotron 都能读。
+          if (body && hasImagePart(body)) {
+            try {
+              const bb = JSON.parse(body) as Record<string, unknown>;
+              bb.model = env.IMAGE_MODEL || "mimo-v2.6-flash-free";
+              body = JSON.stringify(bb);
+            } catch { /* 原样发 */ }
+          }
           console.log("[model-req]", targetUrl.replace("https://apius2.fastfaster.kdns.fr", ""),
             JSON.stringify({
               keys: b ? Object.keys(b).join(",") : "-",

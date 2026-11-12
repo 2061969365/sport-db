@@ -32,6 +32,8 @@ VISION_MODEL = "deepseek-v4.1-flash-free"
 MODEL_STREAMING = "on"
 # 429/限流时依次尝试的备用模型（同一个网关，只换 model 字段）。
 MODEL_FALLBACKS = "mimo-v2.6-flash-free"
+# 图片轮用视觉模型（deepseek 主模型不收大图）
+IMAGE_MODEL = "mimo-v2.6-flash-free"
 # 鉴权头：该网关只认"有没有 Authorization"，值无所谓（DSH 那边配的就是假 key "1"）。
 # 不带头会走匿名小额度，容易被限流，所以默认带上。
 VISION_API_KEY = "1"
