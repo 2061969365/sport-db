@@ -11,6 +11,8 @@ on:
   schedule:
     - cron: '40 21 * * *'   # 05:40 北京（补昨晚睡眠/昨天的运动）
     - cron: '40 9 * * *'    # 17:40 北京
+  repository_dispatch:
+    types: [mi-sync]
   workflow_dispatch:
     inputs:
       days:
@@ -42,7 +44,7 @@ jobs:
       - name: 拉取并导入
         env:
           MI_SYNC_PAT: ${{ secrets.MI_SYNC_PAT }}
-        run: python scripts/mi_sync.py --days "${{ github.event.inputs.days || '7' }}"
+        run: python scripts/mi_sync.py --days "${{ github.event.inputs.days || github.event.client_payload.days || '7' }}"
 
       - name: 提交数据
         run: |

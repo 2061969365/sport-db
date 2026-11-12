@@ -845,7 +845,9 @@ export async function toolListDir(env: Env, dir: string): Promise<string> {
 /** refresh_data：触发 GitHub Actions 里的 mi-sync（小米云端同步）。 */
 export async function toolTriggerMiSync(env: Env): Promise<string> {
   if (!env.GH_PAT) return "失败：未授权（缺 GH_PAT），没法触发同步。";
-  const url = `https://api.github.com/repos/${env.REPO}/actions/workflows/mi-sync.yml/dispatches`;
+  // 用 repository_dispatch：contents:write 的 PAT 就能触发；
+  // workflow_dispatch 需要 actions:write，worker 的 GH_PAT 没有。
+  const url = `https://api.github.com/repos/${env.REPO}/dispatches`;
   const r = await fetch(url, {
     method: "POST",
     headers: {
@@ -854,14 +856,14 @@ export async function toolTriggerMiSync(env: Env): Promise<string> {
       "Content-Type": "application/json",
       "User-Agent": "sportdb-bot",
     },
-    body: JSON.stringify({ ref: "main", inputs: { days: "3" } }),
+    body: JSON.stringify({ event_type: "mi-sync", client_payload: { days: "3" } }),
   });
   if (r.status === 204) {
     return "已触发小米云端同步（最近 3 天）。大概 1~2 分钟跑完，之后数据会自动更新；"
       + "过一会儿问我「同步好了吗」或直接问今天的数据就行。";
   }
   if (r.status === 403 || r.status === 404) {
-    return `失败：GH_PAT 没有触发 Actions 的权限（HTTP ${r.status}）。`;
+    return `失败：GH_PAT 没有触发同步的权限（HTTP ${r.status}），需要 contents:write。`;
   }
   return `失败：触发同步返回 HTTP ${r.status}。`;
 }
