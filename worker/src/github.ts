@@ -850,7 +850,12 @@ export async function toolReadRepoFile(env: Env, file: string, maxChars = 6000):
   if (!Number.isFinite(mc)) mc = 6000;
   mc = Math.min(20000, Math.max(500, mc));
   const g = await ghGetFile(env, path).catch(() => null);
-  if (!g?.text) return `失败：读不到 ${path}（不存在，或是图片等二进制文件）。`;
+  if (!g?.text) {
+    if (/\.(jpe?g|png|webp)$/i.test(path)) {
+      return `失败：${path} 是图片，用 view_repo_image 打开（它会把图放进对话）。`;
+    }
+    return `失败：读不到 ${path}（不存在或不是文本文件）。`;
+  }
   const text = g.text.slice(0, mc);
   return `${path}（共 ${g.text.length} 字符，已给前 ${text.length}）：\n${text}`
     + (text.length >= mc ? "\n…（截断，需要更多可提高 max_chars）" : "");

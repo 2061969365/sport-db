@@ -14,6 +14,7 @@ import { analyzeSignals, bjHour, buildSnapshot, bjToday, shouldStaySilent } from
 import { listPlans, normalizePlan, planPath, planProgress, planSignals, readPlan, writePlan } from "./plan";
 import { extractUsage, formatUsage, type DayMetric } from "./metrics";
 import { gatewayError, nonStreamToSse, sseFromResponse, sseText, type ChatCompletionLike } from "./gateway";
+import { hasImagePart, injectImageParts } from "./imageparts";
 import { autoRetryReviews, imageDataUrl, retryReview, UA_BROWSER } from "./photo.ts";
 import { ghDeleteFile, ghGetFile } from "./github.ts";
 import {
@@ -131,19 +132,19 @@ const RULES_BLOCK =
   + "【职业底线】1) 数字只从数据来，查不到就说查不到，绝不编、也不猜；"
   + "2) 改/删记录先给预览和影响，等他说确认再写；"
   + "3) 疼、晕、胸闷、夜间心悸永远压过任何训练计划；"
-  + "4) 别碰 workspace 的内置文件工具（读写/bash），要看仓里的文件用 list_repo_dir / read_repo_file。\n"
+  + "4) 别碰 workspace 的内置文件工具（读写/bash），要看仓里的文件用 list_repo_dir / read_repo_file；看截图/图片用 view_repo_image（它会把图放进对话）。\n"
   + "【目标是他的，不是你的】目标赛事、目标成绩、周跑量目标只能来自他亲口说过的话，或 user_profile 里他确认过的条目。"
   + "画像里没有就不提、不假设、更不要替他定；他说的话和画像不一致，以他这次说的为准，并当场改掉记录。"
   + "【时间口径】说周/月数字必须带日期范围：本周从周一算，和近 7 天不是一回事（快照里两个都列了，照抄）。"
   + "算「下周几」「还有几天」先用 current_time 对今天。\n"
-  + "【工具边界】你手上有 30 个工具，名字原样用，别自己造、别假装用过：\n"
+  + "【工具边界】你手上有 31 个工具，名字原样用，别自己造、别假装用过：\n"
   + "· 查数据：get_summary / query_workouts / stats_workouts / trends / records / compare_periods / streaks / "
   + "coach_check（自查异常信号）\n"
   + "· 改数据（先预览后确认）：update_workout / delete_workout / append_workout\n"
   + "· 收图审核：list_review / retry_review / confirm_review\n"
   + "· 计划：plan_save / plan_list / plan_progress / plan_mark\n"
   + "· 提醒：set_reminder / list_reminders / cancel_reminder\n"
-  + "· 外部与仓：current_time / weather / web_search / fetch_url / list_repo_dir / read_repo_file / "
+  + "· 外部与仓：current_time / weather / web_search / fetch_url / list_repo_dir / read_repo_file / view_repo_image / "
   + "write_plan / usage_stats / chat_backup\n"
   + "运动数据只从「查数据 / 改数据 / 收图审核」这三组读写；其他工具用来查外部信息或存计划。\n"
   + "【计划】排训练计划用 plan_save：按天给日期、类型（easy/long/tempo/interval/rest/race/other）和目标"
@@ -286,16 +287,28 @@ export class SportDbAgent extends Think<Env> {
         if (extra) for (const [k, v] of Object.entries(extra)) h.set(k, v);
         try {
           const b = body ? JSON.parse(body) : null;
+          // 工具 view_repo_image 的结果里带 @@IMG@@<url>：把它变成真正的图片部件，
+          // 否则模型只看到一段链接文本（会说"看不到"）。见 imageparts.ts。
+          const inj = injectImageParts(body);
+          if (inj.injected) body = inj.body;
           console.log("[model-req]", targetUrl.replace("https://apius2.fastfaster.kdns.fr", ""),
             JSON.stringify({
               keys: b ? Object.keys(b).join(",") : "-",
               tools: (b?.tools || []).length,
               msgs: (b?.messages || []).length,
               kb: b ? Math.round(JSON.stringify(b).length / 1024) : 0,
+              imgs: (b?.messages || []).reduce((n: number, m: { content?: unknown }) =>
+                n + (Array.isArray(m.content)
+                  ? m.content.filter((p: { type?: string }) => p?.type === "image_url").length : 0), 0),
               effort: b?.reasoning_effort, stream: b?.stream, synth: synthSse,
             }));
         } catch { /* 记录失败无所谓 */ }
-        return fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
+        const resp = await fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
+        if (resp.status >= 400) {
+          console.log("[model-res]", resp.status, targetUrl.replace("https://zen.uflash.ccwu.cc/v1", ""),
+            `imgs=${(JSON.stringify(JSON.parse(body || "{}").messages || []).match(/image_url/g) || []).length}`);
+        }
+        return resp;
       };
 
       // 请求节流：免费网关额度极小，一个 turn 里有多次工具步 = 多次模型请求，
@@ -359,6 +372,12 @@ export class SportDbAgent extends Think<Env> {
               console.warn(`[model-429] ${model} -> 换下一个（retry-after=${ra}s）`);
               if (mi < models.length - 1) { await sleep(1200); continue outer; }
               break outer;
+            }
+            if (r.status === 400 && hasImagePart(bodyForModel) && attempt === 0) {
+              lastErr = new Error("网关 400（图片通道，重试）");
+              console.warn(`[model-400-img] ${model} 重试一次`);
+              await sleep(2000);
+              continue;
             }
             if (r.status >= 500) {
               lastErr = new Error(`网关 ${r.status}`);
@@ -1012,7 +1031,10 @@ export class SportDbAgent extends Think<Env> {
       const channel = tv[0]?.channel || "";
       const chatId = tv[0]?.chat_id || "";
       const cls = String(ctx?.classification || "");
-      const hint = /免费额度用尽/.test(raw)
+      const hint = /the request is invalid/.test(raw)
+        ? "网关的图片通道这会儿不通（免费额度或上游限制），图已存档不会丢——"
+          + "过几分钟再看，或者直接把图发到对话里。"
+        : /免费额度用尽/.test(raw)
         ? "免费模型额度用完了（网关的 FreeUsageLimit），" +
           (/恢复/.test(raw) ? raw.replace(/^.*?（/, "").replace(/）$/, "") + "。" : "") +
           "这期间问数据可以，但生成不了回答；数据没受影响。"
@@ -1504,6 +1526,28 @@ export class SportDbAgent extends Think<Env> {
         description: "列数据仓里的目录（只读）：plans/ 训练计划、reports/daily/ 每日报告、data/ 数据、docs/ 文档。想知道有什么文件时用它。",
         inputSchema: z.object({ path: z.string() }),
         execute: async ({ path }: { path?: string }) => toolListDir(env, path || ""),
+      }),
+      view_repo_image: tool({
+        description: "看数据仓里的截图/图片（images/ 下）。用户让你看某张图、或要你分析截图内容（数据、心率曲线）时用它——它会把图直接放进对话，你就能看到画面。文本文件用 read_repo_file。",
+        inputSchema: z.object({ path: z.string() }),
+        execute: async ({ path }: { path?: string }) => {
+          const p = String(path || "").trim().replace(/^\/+/, "");
+          const m = /^images\/[\w./-]+\.(jpe?g|png|webp)$/i.exec(p);
+          if (!m) {
+            return "失败：只能看 images/ 下的 jpg/png/webp，路径写全（如 images/2026/11/05-tg249.jpg）。先用 list_repo_dir 看文件名。";
+          }
+          const ext = m[1].toLowerCase();
+          const mediaType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+          const url = `https://raw.githubusercontent.com/${env.REPO}/main/${p.split("/").map(encodeURIComponent).join("/")}`;
+          const head = await fetch(url, { method: "HEAD", headers: { "User-Agent": UA_BROWSER } })
+            .catch(() => null);
+          if (!head || !head.ok) {
+            return `失败：仓里读不到 ${p}（${head ? `HTTP ${head.status}` : "网络错误"}）。先用 list_repo_dir 确认文件名。`;
+          }
+          // 工具结果里塞图片部件，这个网关/模型组合看不到；而 addMessages 中途写消息
+          // 也不会进入本轮请求（实测 imgs 恒为 0）。所以只回标记，由 send() 注入图像。
+          return `图已放入：${p}\n@@IMG@@${url}`;
+        },
       }),
       read_repo_file: tool({
         description: "读数据仓里的文本文件（日报、计划、文档、CSV）。用户问「我的计划呢」「昨天的日报」就用它。",
