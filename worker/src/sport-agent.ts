@@ -31,7 +31,7 @@ import {
   profileShared, repoProfileProvider,
 } from "./profile";
 import { toolCurrentTime, toolFetchUrl, toolWeather, toolWebSearch } from "./web";
-import { WORKOUT_TYPES, buildProfile, loadWorkouts, toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout, toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts, toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout, toolWritePlan, toolTriggerMiSync, type SqlTag, loadDailySummary } from "./github";
+import { WORKOUT_TYPES, buildProfile, loadWorkouts, toolAppendWorkout, toolCompare, toolConfirmReview, toolDeleteWorkout, toolGetSummary, toolListDir, toolListReview, toolQueryWorkouts, toolReadRepoFile, toolRecords, toolStatsWorkouts, toolStreaks, toolTrends, toolUpdateWorkout, toolWorkoutSeries, toolWritePlan, toolTriggerMiSync, type SqlTag, loadDailySummary } from "./github";
 
 const COACH_SYS =
   "你是 sport-db 运动库的教练助手。详细指令见 rules 上下文块。";
@@ -156,8 +156,8 @@ const RULES_BLOCK =
   + "画像里没有就不提、不假设、更不要替他定；他说的话和画像不一致，以他这次说的为准，并当场改掉记录。"
   + "【时间口径】说周/月数字必须带日期范围：本周从周一算，和近 7 天不是一回事（快照里两个都列了，照抄）。"
   + "算「下周几」「还有几天」先用 current_time 对今天。\n"
-  + "【工具边界】你手上有 32 个工具，名字原样用，别自己造、别假装用过：\n"
-  + "· 查数据：get_summary / query_workouts / stats_workouts / trends / records / compare_periods / streaks / "
+  + "【工具边界】你手上有 33 个工具，名字原样用，别自己造、别假装用过：\n"
+  + "· 查数据：get_summary / query_workouts / workout_series / stats_workouts / trends / records / compare_periods / streaks / "
   + "coach_check（自查异常信号）\n"
   + "· 改数据（先预览后确认）：update_workout / delete_workout / append_workout\n"
   + "· 收图审核：list_review / retry_review / confirm_review\n"
@@ -1624,6 +1624,16 @@ export class SportDbAgent extends Think<Env> {
         }),
         execute: async (args: { path?: string; max_chars?: number }) =>
           toolReadRepoFile(env, args.path || "", args.max_chars ?? 6000),
+      }),
+      workout_series: tool({
+        description: "单场运动逐分钟的心率与步频（时间点→心率→步频）。用户问「跑的时候第几分钟心率多少」「步频多少」「哪一段掉速」时用它；可按日期或场次 id 查，不给参数就给最近一场。",
+        inputSchema: z.object({
+          date: z.string().optional().describe("北京时间日期 YYYY-MM-DD"),
+          workout_id: z.string().optional().describe("场次 id，可先 query_workouts 拿到"),
+          limit: z.number().int().min(10).max(300).default(60),
+        }),
+        execute: async (args: { date?: string; workout_id?: string; limit?: number }) =>
+          toolWorkoutSeries(env, sql, args),
       }),
       write_plan: tool({
         description: "把**自由文本**笔记写进仓里的 plans/*.md（两步：先预览，用户确认后带 confirmed=true 再调一次）。只用于说明/备忘，**训练计划请用 plan_save**（结构化、可打卡）；运动数据别用这个改。",

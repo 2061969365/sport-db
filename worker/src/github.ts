@@ -908,6 +908,59 @@ export async function toolReadRepoFile(env: Env, file: string, maxChars = 6000):
     + (text.length >= mc ? "\n…（截断，需要更多可提高 max_chars）" : "");
 }
 
+/** get_workout_series：单场运动的分钟级心率/步频，读 data/series/<year>.csv。 */
+export async function toolWorkoutSeries(
+  env: Env, sql: SqlTag | undefined,
+  opts: { date?: string; workout_id?: string; limit?: number } = {},
+): Promise<string> {
+  const date = String(opts.date || "").trim();
+  const wid = String(opts.workout_id || "").trim();
+  const limit = Math.min(300, Math.max(10, Number(opts.limit) || 60));
+  const year = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.slice(0, 4) : "";
+  const now = new Date().getUTCFullYear();
+  const years = year ? [year] : [String(now), String(now - 1)];
+  let rows: Record<string, string>[] = [];
+  let usedYear = "";
+  for (const y of years) {
+    const g = await cachedGetFile(env, sql, `data/series/${y}.csv`).catch(() => null);
+    if (!g?.text) continue;
+    const all = parseCSV(g.text);
+    const sel = wid
+      ? all.filter((r) => r.workout_id === wid)
+      : date
+        ? all.filter((r) => r.date === date)
+        : all;
+    if (sel.length) { rows = sel; usedYear = y; break; }
+  }
+  if (!rows.length) {
+    return wid
+      ? `没有 ${wid} 的分钟级明细（可能这场太早，或云端没同步到心率）。`
+      : `没有 ${date || "最近"} 的分钟级明细。`;
+  }
+  if (!wid && !date) {
+    const lastDate = rows[rows.length - 1].date;
+    rows = rows.filter((r) => r.date === lastDate);
+  }
+  const groups = new Map<string, Record<string, string>[]>();
+  for (const r of rows) {
+    const k = r.workout_id || "";
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(r);
+  }
+  const out: string[] = [];
+  for (const [k, arr] of groups) {
+    const hrs = arr.map((r) => Number(r.hr)).filter((n) => n > 0);
+    const cads = arr.map((r) => Number(r.cadence)).filter((n) => n > 0);
+    const avg = (a: number[]) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : 0);
+    out.push(`${arr[0].date} 场次 ${k}：${arr.length} 个分钟点，均心率 ${avg(hrs)}，最高 ${hrs.length ? Math.max(...hrs) : 0}，均步频 ${avg(cads)} spm`);
+    for (const r of arr.slice(0, limit)) {
+      out.push(`  ${r.t_beijing}  ${r.hr ? r.hr + " bpm" : "—"}  ${r.cadence ? r.cadence + " spm" : "—"}`);
+    }
+    if (arr.length > limit) out.push(`  …还有 ${arr.length - limit} 个点`);
+  }
+  return `分钟级明细（data/series/${usedYear}.csv）：\n` + out.join("\n");
+}
+
 /** write_plan：把训练计划写进 plans/（两阶段确认）。只允许写这个目录，绝不碰 data/。 */
 export async function toolWritePlan(
   env: Env, file: string, content: string, confirmed: boolean, actor: string, sql?: SqlTag,

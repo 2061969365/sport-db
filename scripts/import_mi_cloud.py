@@ -39,6 +39,7 @@ WORKOUT_COLS = ["id", "date", "start_utc", "start_beijing", "end_utc", "end_beij
                 "uid_hash", "sid_hash", "has_track", "source", "confidence", "value_json"]
 DAILY_COLS = ["date", "tag", "key", "time_utc", "time_beijing",
               "uid_hash", "sid_hash", "update_utc", "value_json"]
+SERIES_COLS = ["workout_id", "date", "minute", "t_beijing", "hr", "cadence"]
 
 # 云端 key -> 仓库 type
 TYPE_MAP = {
@@ -364,6 +365,67 @@ def aggregate_daily(data: dict) -> list[dict]:
     return out
 
 
+def sample_index(data: dict) -> tuple[dict, dict]:
+    """把云端采样整理成「分钟 -> 各来源值」。
+
+    心率/步数都是约 1 分钟一条，多个来源会在同一分钟重叠，
+    所以取该分钟的最大值，而不是相加（相加会翻倍）。
+    """
+    hr: dict[int, dict[str, float]] = defaultdict(dict)
+    sp: dict[int, dict[str, float]] = defaultdict(dict)
+    for s in data.get("heart_rate") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        bpm = _f(_val(s).get("bpm"))
+        if bpm > 0:
+            hr[t // 60][str(s.get("sid") or "")] = bpm
+    for s in data.get("steps") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        n = _f(_val(s).get("steps"))
+        if n > 0:
+            sp[t // 60][str(s.get("sid") or "")] = n
+    return hr, sp
+
+
+def aggregate_series(rows: list[dict], hr: dict, sp: dict) -> list[dict]:
+    """给每场运动生成分钟级曲线：时间点、心率、步频。"""
+    out: list[dict] = []
+    for r in rows:
+        try:
+            st = int(float(r.get("start_utc") or 0))
+            en = int(float(r.get("end_utc") or 0))
+        except (TypeError, ValueError):
+            continue
+        if en <= st:
+            continue
+        for m in range(st // 60, en // 60 + 1):
+            h = max(hr[m].values()) if m in hr else 0
+            c = max(sp[m].values()) if m in sp else 0
+            if h <= 0 and c <= 0:
+                continue
+            t = m * 60
+            out.append({
+                "workout_id": str(r.get("id") or ""),
+                "date": str(r.get("date") or ""),
+                "minute": str(t),
+                "t_beijing": datetime.fromtimestamp(t, BJ).strftime("%H:%M"),
+                "hr": str(int(round(h))) if h > 0 else "",
+                "cadence": str(int(round(c))) if c > 0 else "",
+            })
+    return out
+
+
+def merge_series(existing: list[dict], new: list[dict]) -> list[dict]:
+    """同一场运动整段替换，其余保留。"""
+    ids = {r["workout_id"] for r in new}
+    rows = [r for r in existing if r.get("workout_id") not in ids] + new
+    rows.sort(key=lambda r: (r.get("date", ""), int(float(r.get("minute") or 0))))
+    return rows
+
+
 def merge_daily(rows: list[dict], reports: list[dict], rep: dict) -> list[dict]:
     idx = {(r.get("date", ""), r.get("tag", ""), r.get("key", "")): i for i, r in enumerate(rows)}
     for w in reports:
@@ -435,8 +497,9 @@ def main() -> int:
         by_year[r["date"][:4]].append(r)
     print(f"[mi-cloud] 解析 {sum(len(v) for v in by_year.values())} 条，跳过 {skipped} 条")
 
+    hr_idx, sp_idx = sample_index(data)
     out = Path(a.out)
-    total = {"added": 0, "merged": 0, "daily_added": 0, "daily_updated": 0}
+    total = {"added": 0, "merged": 0, "daily_added": 0, "daily_updated": 0, "series": 0}
     for year in sorted(by_year):
         p = out / "workouts" / f"{year}.csv"
         rows = read_csv(p)
@@ -453,6 +516,14 @@ def main() -> int:
         total["merged"] += rep["merged"]
         if not a.dry_run:
             write_csv(p, WORKOUT_COLS, rows)
+        series = aggregate_series(rows, hr_idx, sp_idx)
+        if series:
+            sp_path = out / "series" / f"{year}.csv"
+            merged = merge_series(read_csv(sp_path), series)
+            if not a.dry_run:
+                write_csv(sp_path, SERIES_COLS, merged)
+            print(f"[mi-cloud] series {year}: 本次 {len(series)} 行 -> {len(merged)} 行（{sp_path.name}）")
+            total["series"] += len(series)
 
     if daily_reports:
         by_year_daily: dict[str, list[dict]] = defaultdict(list)
