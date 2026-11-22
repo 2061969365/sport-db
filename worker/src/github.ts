@@ -908,17 +908,52 @@ export async function toolReadRepoFile(env: Env, file: string, maxChars = 6000):
     + (text.length >= mc ? "\n…（截断，需要更多可提高 max_chars）" : "");
 }
 
-/** get_workout_series：单场运动的分钟级心率/步频，读 data/series/<year>.csv。 */
+/** get_workout_series：单场运动的心率/步频明细（分钟级或秒级）。 */
 export async function toolWorkoutSeries(
   env: Env, sql: SqlTag | undefined,
-  opts: { date?: string; workout_id?: string; limit?: number } = {},
+  opts: { date?: string; workout_id?: string; limit?: number; resolution?: string } = {},
 ): Promise<string> {
   const date = String(opts.date || "").trim();
   const wid = String(opts.workout_id || "").trim();
   const limit = Math.min(300, Math.max(10, Number(opts.limit) || 60));
-  const year = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.slice(0, 4) : "";
+  const sec = String(opts.resolution || "min").toLowerCase().startsWith("s");
   const now = new Date().getUTCFullYear();
-  const years = year ? [year] : [String(now), String(now - 1)];
+  const year = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.slice(0, 4) : String(now);
+
+  if (sec) {
+    const wg = await cachedGetFile(env, sql, `data/workouts/${year}.csv`).catch(() => null);
+    const all = wg?.text ? parseCSV(wg.text) : [];
+    const picked = wid
+      ? all.filter((r) => r.id === wid)
+      : date
+        ? all.filter((r) => r.date === date)
+        : (() => {
+            const last = all.length ? all[all.length - 1].date : "";
+            return all.filter((r) => r.date === last);
+          })();
+    if (!picked.length) return `没有 ${wid || date || "最近"} 的运动记录。`;
+    const out: string[] = [];
+    for (const w of picked.slice(0, 5)) {
+      const g = await cachedGetFile(env, sql, `data/series_sec/${year}/${w.id}.csv`).catch(() => null);
+      if (!g?.text) { out.push(`${w.date} ${w.id}：没有秒级明细（可能这场太早或没同步到）。`); continue; }
+      const rows = parseCSV(g.text);
+      if (!rows.length) { out.push(`${w.date} ${w.id}：秒级明细为空。`); continue; }
+      const step = Math.max(1, Math.ceil(rows.length / limit));
+      const hrs = rows.map((r) => Number(r.hr)).filter((n) => n > 0);
+      const cads = rows.map((r) => Number(r.cadence)).filter((n) => n > 0);
+      const avg = (a: number[]) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : 0);
+      out.push(`${w.date} ${w.id}：${rows.length} 秒样本，均心率 ${avg(hrs)}，最高 ${hrs.length ? Math.max(...hrs) : 0}，均步频 ${avg(cads) || "无"} spm（每 ${step} 秒取一行）`);
+      for (let i = 0; i < rows.length; i += step) {
+        const r = rows[i];
+        const t = Number(r.t) + 8 * 3600;
+        const hhmmss = new Date(t * 1000).toISOString().slice(11, 19);
+        out.push(`  ${hhmmss}  ${r.hr ? r.hr + " bpm" : "—"}  ${r.cadence ? r.cadence + " spm" : "—"}`);
+      }
+    }
+    return `秒级明细（data/series_sec/${year}/）：\n` + out.join("\n");
+  }
+
+  const years = /^\d{4}-\d{2}-\d{2}$/.test(date) ? [date.slice(0, 4)] : [String(now), String(now - 1)];
   let rows: Record<string, string>[] = [];
   let usedYear = "";
   for (const y of years) {

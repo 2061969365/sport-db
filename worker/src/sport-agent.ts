@@ -1626,13 +1626,14 @@ export class SportDbAgent extends Think<Env> {
           toolReadRepoFile(env, args.path || "", args.max_chars ?? 6000),
       }),
       workout_series: tool({
-        description: "单场运动逐分钟的心率与步频（时间点→心率→步频）。用户问「跑的时候第几分钟心率多少」「步频多少」「哪一段掉速」时用它；可按日期或场次 id 查，不给参数就给最近一场。",
+        description: "单场运动的心率与步频明细（时间点→心率→步频）。用户问「跑的时候第几分钟/第几秒心率多少」「步频多少」「哪一段掉速」时用它；resolution=sec 给秒级，默认分钟级。可按日期或场次 id 查，不给参数就给最近一场。",
         inputSchema: z.object({
           date: z.string().optional().describe("北京时间日期 YYYY-MM-DD"),
           workout_id: z.string().optional().describe("场次 id，可先 query_workouts 拿到"),
+          resolution: z.enum(["min", "sec"]).default("min").describe("min=每分钟，sec=每秒"),
           limit: z.number().int().min(10).max(300).default(60),
         }),
-        execute: async (args: { date?: string; workout_id?: string; limit?: number }) =>
+        execute: async (args: { date?: string; workout_id?: string; limit?: number; resolution?: string }) =>
           toolWorkoutSeries(env, sql, args),
       }),
       write_plan: tool({
