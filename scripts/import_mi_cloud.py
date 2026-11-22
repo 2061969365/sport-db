@@ -263,18 +263,28 @@ def aggregate_daily(data: dict) -> list[dict]:
     直接入库会几万行；这里按北京时间自然日汇总成一天一行。
     睡眠不在这里合成（用 sleep_daily_reports，字段更全）。
     """
-    steps = defaultdict(lambda: {"steps": 0.0, "distance": 0.0, "calories": 0.0})
-    cals: dict[str, float] = defaultdict(float)
-    hrs: dict[str, list[float]] = defaultdict(list)
-    stress: dict[str, list[float]] = defaultdict(list)
+    # 同一天有多个来源（App 聚合 hlth.gen*、手表 515700350、手动 xiaomiwear_app），
+    # 分钟级采样互相重叠，直接相加会翻倍。按来源分开累计，最后每天只取一个来源。
+    steps: dict[str, dict[str, dict]] = defaultdict(dict)
+    cals: dict[str, dict[str, float]] = defaultdict(dict)
+    hrs: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    stress: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     weight: dict[str, tuple[int, float, float]] = {}
+
+    def pick(by_sid: dict, metric: str = ""):
+        """优先 App 聚合源，其次取量最大的来源（避免多源相加）。"""
+        for sid, v in by_sid.items():
+            if sid.startswith("hlth.gen"):
+                return v
+        return max(by_sid.values(), key=lambda v: (v.get(metric, 0) if metric else v))
 
     for s in data.get("steps") or []:
         t = int(s.get("time") or 0)
         if t < 1_000_000_000:
             continue
         v = _val(s)
-        a = steps[date_bj(t)]
+        sid = str(s.get("sid") or "")
+        a = steps[date_bj(t)].setdefault(sid, {"steps": 0.0, "distance": 0.0, "calories": 0.0})
         a["steps"] += _f(v.get("steps"))
         a["distance"] += _f(v.get("distance"))
         a["calories"] += _f(v.get("calories"))
@@ -282,21 +292,23 @@ def aggregate_daily(data: dict) -> list[dict]:
         t = int(s.get("time") or 0)
         if t < 1_000_000_000:
             continue
-        cals[date_bj(t)] += _f(_val(s).get("calories"))
+        d = date_bj(t)
+        sid = str(s.get("sid") or "")
+        cals[d][sid] = cals[d].get(sid, 0.0) + _f(_val(s).get("calories"))
     for s in data.get("heart_rate") or []:
         t = int(s.get("time") or 0)
         if t < 1_000_000_000:
             continue
         bpm = _f(_val(s).get("bpm"))
         if bpm > 0:
-            hrs[date_bj(t)].append(bpm)
+            hrs[date_bj(t)][str(s.get("sid") or "")].append(bpm)
     for s in data.get("stress") or []:
         t = int(s.get("time") or 0)
         if t < 1_000_000_000:
             continue
         st = _f(_val(s).get("stress"))
         if st > 0:
-            stress[date_bj(t)].append(st)
+            stress[date_bj(t)][str(s.get("sid") or "")].append(st)
     for s in data.get("weight") or []:
         t = int(s.get("time") or 0)
         if t < 1_000_000_000:
@@ -317,7 +329,8 @@ def aggregate_daily(data: dict) -> list[dict]:
             "time": ts, "sid": "mi-cloud", "value": value,
         })
 
-    for d, a in steps.items():
+    for d, bysid in steps.items():
+        a = pick(bysid, "steps")
         if a["steps"] <= 0 and a["distance"] <= 0:
             continue
         add(d, "steps", _noon(d), {
@@ -325,16 +338,23 @@ def aggregate_daily(data: dict) -> list[dict]:
             "distance": int(round(a["distance"])),
             "calories": round(a["calories"], 1),
         })
-    for d, c in cals.items():
+    for d, bysid in cals.items():
+        c = pick(bysid)
         if c > 0:
             add(d, "calories", _noon(d), {"calories": int(round(c))})
-    for d, arr in hrs.items():
+    for d, bysid in hrs.items():
+        arr = max(bysid.values(), key=len)
+        if not arr:
+            continue
         add(d, "heart_rate", _noon(d), {
             "avg_hr": int(round(sum(arr) / len(arr))),
             "min_hr": int(round(min(arr))),
             "max_hr": int(round(max(arr))),
         })
-    for d, arr in stress.items():
+    for d, bysid in stress.items():
+        arr = max(bysid.values(), key=len)
+        if not arr:
+            continue
         add(d, "stress", _noon(d), {"avg_stress": int(round(sum(arr) / len(arr)))})
     for d, (t, w, bmi) in weight.items():
         val = {"weight": w}
