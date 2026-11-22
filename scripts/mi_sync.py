@@ -104,6 +104,7 @@ def main() -> int:
     ap.add_argument("--state-repo", default=os.environ.get("MI_STATE_REPO", DEFAULT_REPO))
     ap.add_argument("--state-path", default=os.environ.get("MI_STATE_PATH", DEFAULT_PATH))
     ap.add_argument("--keep-json", action="store_true", help="保留导出的 mi_fitness.json")
+    ap.add_argument("--details", action="store_true", help="同时拉取每场运动的秒级明细")
     a = ap.parse_args()
 
     token = os.environ.get("MI_SYNC_PAT") or os.environ.get("GITHUB_TOKEN") or ""
@@ -146,6 +147,8 @@ def main() -> int:
            "--start", str(start), "--end", str(end),
            "--workouts", "--sleep-daily",
            "--token-file", str(creds_file), "--out", str(out)]
+    if a.details:
+        cmd.append("--details")
     rc = subprocess.call(cmd)
 
     # 登录只要成功就可能轮换 token，所以「先写回、再导入」：

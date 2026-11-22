@@ -42,6 +42,9 @@ from urllib.parse import urlencode, urlparse
 
 import requests
 
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+import fds  # noqa: E402  FDS 秒级明细协议
+
 # ---------------------------------------------------------------------------
 # 常量（来自逆向 / 开源适配器印证）
 # ---------------------------------------------------------------------------
@@ -316,6 +319,54 @@ class MiFitnessClient:
             sign_path="/service/gen_download_url",
         )
 
+    def fetch_workout_detail(self, w: dict) -> dict | None:
+        """下载单场运动的 FDS 秒级样本（fileType=0）。
+
+        返回 {"sid","start","proto","samples":[[epoch,hr,cadence,dist,pace],...]}；
+        没有明细（version<=0、proto 不支持、无 obj_key）返回 None。
+        """
+        try:
+            v = json.loads(w.get("value") or "{}")
+        except Exception:
+            return None
+        sid = str(w.get("sid") or "")
+        proto = int(v.get("proto_type") or 0)
+        version = int(v.get("version") or 0)
+        report_time = int(v.get("time") or v.get("timestamp") or 0)
+        start = int(v.get("start_time") or w.get("time") or 0)
+        tz_byte = int(v.get("timezone") or 0) & 0xFF
+        if not sid or not report_time or version <= 0 or not start:
+            return None
+        if proto not in fds.SUPPORTED_RECORD_PROTO_TYPES:
+            return None
+        suffix = fds.build_fds_suffix(
+            sid=sid, timestamp=report_time, tz_in_15min=tz_byte,
+            proto_type=proto, file_type=fds.FDS_FILE_TYPE_SPORT_RECORD,
+        )
+        key = fds.fds_server_key(suffix, report_time)
+        try:
+            res = self.gen_download_url(sid, [{"timestamp": report_time, "suffix": suffix}])
+            entry = res.get(key)
+            if not isinstance(entry, dict) or not entry.get("url") or not entry.get("obj_key"):
+                return None
+            r = self.session.get(entry["url"], timeout=self.timeout)
+            r.raise_for_status()
+            dec = fds.decrypt_fds_blob(r.text, entry["obj_key"])
+            samples = []
+            for seg_start, records in fds.parse_sport_record(dec, proto):
+                for i, rec in enumerate(records):
+                    samples.append([
+                        seg_start + i,
+                        rec.get(fds.TYPE_HR),
+                        rec.get(fds.TYPE_CADENCE),
+                        rec.get(fds.TYPE_DISTANCE),
+                        rec.get(fds.TYPE_PACE),
+                    ])
+            return {"sid": sid, "start": start, "proto": proto, "samples": samples}
+        except Exception as e:
+            print(f"[!] 明细失败 sid={sid} start={start}: {type(e).__name__}: {e}")
+            return None
+
 
 # ---------------------------------------------------------------------------
 # 导出
@@ -358,6 +409,7 @@ def main() -> int:
                     help="逗号分隔: " + ",".join(DATA_KEYS))
     ap.add_argument("--workouts", action="store_true", help="额外拉取运动记录列表")
     ap.add_argument("--sleep-daily", action="store_true", help="额外拉取每日聚合睡眠报告(补睡眠评分)")
+    ap.add_argument("--details", action="store_true", help="额外拉取每次运动的 FDS 秒级明细")
     ap.add_argument("--out", default="mi_fitness.json")
     ap.add_argument("--csv-dir", help="可选：每类数据额外导出 CSV 的目录")
     ap.add_argument("--timeout", type=float, default=20.0)
@@ -422,6 +474,18 @@ def main() -> int:
             print(f"[+] sleep_daily_reports: {len(s)} 条")
         except Exception as e:
             print(f"[!] sleep_daily_reports 失败: {e}")
+
+    if args.details and result.get("workouts"):
+        ws = result["workouts"]
+        det = []
+        for i, w in enumerate(ws, 1):
+            d = c.fetch_workout_detail(w)
+            if d and d.get("samples"):
+                det.append(d)
+            if i % 10 == 0:
+                print(f"[+] details {i}/{len(ws)}（已拿到 {len(det)} 场）")
+        result["details"] = det
+        print(f"[+] details: {len(det)} 场有秒级样本")
 
     write_json(args.out, result)
     if args.csv_dir:

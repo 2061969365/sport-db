@@ -499,7 +499,11 @@ def main() -> int:
 
     hr_idx, sp_idx = sample_index(data)
     out = Path(a.out)
-    total = {"added": 0, "merged": 0, "daily_added": 0, "daily_updated": 0, "series": 0}
+    id_by_start = {
+        int(float(r.get("start_utc") or 0)): r.get("id", "")
+        for rows in by_year.values() for r in rows
+    }
+    total = {"added": 0, "merged": 0, "daily_added": 0, "daily_updated": 0, "series": 0, "series_sec": 0}
     for year in sorted(by_year):
         p = out / "workouts" / f"{year}.csv"
         rows = read_csv(p)
@@ -547,6 +551,37 @@ def main() -> int:
             total["daily_updated"] += rep["daily_updated"]
             if not a.dry_run:
                 write_csv(p, DAILY_COLS, rows)
+
+    details = data.get("details") or []
+    if details:
+        n = 0
+        for det in details:
+            start = int(det.get("start") or 0)
+            wid = id_by_start.get(start)
+            if not wid:
+                continue
+            rows = []
+            for s in det.get("samples") or []:
+                t, hr, cad, dist, pace = (list(s) + [None] * 5)[:5]
+                if t is None:
+                    continue
+                rows.append({
+                    "t": str(int(t)),
+                    "offset_s": str(int(t) - start),
+                    "hr": "" if hr is None else str(int(hr)),
+                    "cadence": "" if cad is None else str(int(cad)),
+                    "distance_m": "" if dist is None else str(dist),
+                    "pace_s": "" if pace is None else str(pace),
+                })
+            if not rows:
+                continue
+            year = date_bj(start)[:4]
+            p = out / "series_sec" / year / f"{wid}.csv"
+            if not a.dry_run:
+                write_csv(p, ["t", "offset_s", "hr", "cadence", "distance_m", "pace_s"], rows)
+            n += 1
+        print(f"[mi-cloud] series_sec: {n} 场写入 data/series_sec/")
+        total["series_sec"] = n
 
     print(f"[mi-cloud] 完成{'（dry-run，未写文件）' if a.dry_run else ''}：{total}")
     return 0

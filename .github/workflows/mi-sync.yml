@@ -39,12 +39,12 @@ jobs:
           python-version: '3.12'
 
       - name: 安装依赖
-        run: pip install --quiet requests
+        run: pip install --quiet requests cryptography
 
       - name: 拉取并导入
         env:
           MI_SYNC_PAT: ${{ secrets.MI_SYNC_PAT }}
-        run: python scripts/mi_sync.py --days "${{ github.event.inputs.days || github.event.client_payload.days || '7' }}"
+        run: python scripts/mi_sync.py --details --days "${{ github.event.inputs.days || github.event.client_payload.days || '7' }}"
 
       - name: 提交数据
         run: |
