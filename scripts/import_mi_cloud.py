@@ -234,6 +234,116 @@ def dedupe_workouts(rows: list[dict], rep: dict) -> list[dict]:
     return out
 
 
+def _val(s: dict) -> dict:
+    v = s.get("value")
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _f(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def _noon(date: str) -> int:
+    """当天北京时间 12:00 的 epoch，给聚合行一个稳定的 time。"""
+    return int(datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=BJ).timestamp()) + 12 * 3600
+
+
+def aggregate_daily(data: dict) -> list[dict]:
+    """把云端原始采样聚合成按天的 daily_report 行。
+
+    导出里 steps/calories/heart_rate/stress/weight 是逐分钟/逐条采样，
+    直接入库会几万行；这里按北京时间自然日汇总成一天一行。
+    睡眠不在这里合成（用 sleep_daily_reports，字段更全）。
+    """
+    steps = defaultdict(lambda: {"steps": 0.0, "distance": 0.0, "calories": 0.0})
+    cals: dict[str, float] = defaultdict(float)
+    hrs: dict[str, list[float]] = defaultdict(list)
+    stress: dict[str, list[float]] = defaultdict(list)
+    weight: dict[str, tuple[int, float, float]] = {}
+
+    for s in data.get("steps") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        v = _val(s)
+        a = steps[date_bj(t)]
+        a["steps"] += _f(v.get("steps"))
+        a["distance"] += _f(v.get("distance"))
+        a["calories"] += _f(v.get("calories"))
+    for s in data.get("calories") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        cals[date_bj(t)] += _f(_val(s).get("calories"))
+    for s in data.get("heart_rate") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        bpm = _f(_val(s).get("bpm"))
+        if bpm > 0:
+            hrs[date_bj(t)].append(bpm)
+    for s in data.get("stress") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        st = _f(_val(s).get("stress"))
+        if st > 0:
+            stress[date_bj(t)].append(st)
+    for s in data.get("weight") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        v = _val(s)
+        w = _f(v.get("weight"))
+        if w <= 0:
+            continue
+        d = date_bj(t)
+        if d not in weight or t > weight[d][0]:
+            weight[d] = (t, w, _f(v.get("bmi")))
+
+    out: list[dict] = []
+
+    def add(d: str, key: str, ts: int, value: dict) -> None:
+        out.append({
+            "tag": "daily_report", "key": key, "date": d,
+            "time": ts, "sid": "mi-cloud", "value": value,
+        })
+
+    for d, a in steps.items():
+        if a["steps"] <= 0 and a["distance"] <= 0:
+            continue
+        add(d, "steps", _noon(d), {
+            "steps": int(round(a["steps"])),
+            "distance": int(round(a["distance"])),
+            "calories": round(a["calories"], 1),
+        })
+    for d, c in cals.items():
+        if c > 0:
+            add(d, "calories", _noon(d), {"calories": int(round(c))})
+    for d, arr in hrs.items():
+        add(d, "heart_rate", _noon(d), {
+            "avg_hr": int(round(sum(arr) / len(arr))),
+            "min_hr": int(round(min(arr))),
+            "max_hr": int(round(max(arr))),
+        })
+    for d, arr in stress.items():
+        add(d, "stress", _noon(d), {"avg_stress": int(round(sum(arr) / len(arr)))})
+    for d, (t, w, bmi) in weight.items():
+        val = {"weight": w}
+        if bmi:
+            val["bmi"] = round(bmi, 1)
+        add(d, "weight", t, val)
+    return out
+
+
 def merge_daily(rows: list[dict], reports: list[dict], rep: dict) -> list[dict]:
     idx = {(r.get("date", ""), r.get("tag", ""), r.get("key", "")): i for i, r in enumerate(rows)}
     for w in reports:
@@ -241,9 +351,9 @@ def merge_daily(rows: list[dict], reports: list[dict], rep: dict) -> list[dict]:
             t = int(w.get("time") or 0)
         except (TypeError, ValueError):
             continue
-        if t < 1_000_000_000:
+        if t < 1_000_000_000 and not w.get("date"):
             continue
-        date = date_bj(t)
+        date = str(w.get("date") or date_bj(t))
         key = str(w.get("key") or "")
         tag = str(w.get("tag") or "daily_report")
         if not key:
@@ -258,6 +368,16 @@ def merge_daily(rows: list[dict], reports: list[dict], rep: dict) -> list[dict]:
         }
         k = (date, tag, key)
         if k in idx:
+            # 保留截图入库时才有的字段（如 avg_rhr / latest_hr / 心率区间），
+            # 云端聚合只覆盖它自己提供的键（steps/calories/avg_hr…）。
+            try:
+                ov = json.loads(rows[idx[k]].get("value_json") or "{}")
+                nv = json.loads(row["value_json"])
+                if isinstance(ov, dict) and isinstance(nv, dict):
+                    row["value_json"] = json.dumps({**ov, **nv}, ensure_ascii=False,
+                                                   separators=(",", ":"))
+            except Exception:
+                pass
             rows[idx[k]] = row
             rep["daily_updated"] += 1
         else:
@@ -280,8 +400,10 @@ def main() -> int:
         return 2
     data = json.loads(src.read_text(encoding="utf-8"))
     workouts = data.get("workouts") or []
-    daily_reports = data.get("sleep_daily_reports") or []
-    print(f"[mi-cloud] 来源 {src.name}: workouts={len(workouts)} sleep_reports={len(daily_reports)}")
+    sleep_reports = data.get("sleep_daily_reports") or []
+    daily_reports = sleep_reports + aggregate_daily(data)
+    print(f"[mi-cloud] 来源 {src.name}: workouts={len(workouts)} sleep_reports={len(sleep_reports)} "
+          f"daily_samples={len(daily_reports) - len(sleep_reports)}")
 
     by_year: dict[str, list[dict]] = defaultdict(list)
     skipped = 0
@@ -313,17 +435,27 @@ def main() -> int:
             write_csv(p, WORKOUT_COLS, rows)
 
     if daily_reports:
-        p = out / "daily" / f"{date_bj(int(daily_reports[0].get('time') or 0))[:4]}.csv"
-        rows = read_csv(p)
-        rep = {"daily_added": 0, "daily_updated": 0}
-        rows = merge_daily(rows, daily_reports, rep)
-        rows.sort(key=lambda r: (r.get("date", ""), r.get("key", "")))
-        print(f"[mi-cloud] daily: 新增 {rep['daily_added']}，更新 {rep['daily_updated']} "
-              f"-> {len(rows)} 行（{p.name}）")
-        total["daily_added"] += rep["daily_added"]
-        total["daily_updated"] += rep["daily_updated"]
-        if not a.dry_run:
-            write_csv(p, DAILY_COLS, rows)
+        by_year_daily: dict[str, list[dict]] = defaultdict(list)
+        for w in daily_reports:
+            try:
+                t = int(w.get("time") or 0)
+            except (TypeError, ValueError):
+                continue
+            d = str(w.get("date") or (date_bj(t) if t >= 1_000_000_000 else ""))
+            if d:
+                by_year_daily[d[:4]].append(w)
+        for year in sorted(by_year_daily):
+            p = out / "daily" / f"{year}.csv"
+            rows = read_csv(p)
+            rep = {"daily_added": 0, "daily_updated": 0}
+            rows = merge_daily(rows, by_year_daily[year], rep)
+            rows.sort(key=lambda r: (r.get("date", ""), r.get("tag", ""), r.get("key", "")))
+            print(f"[mi-cloud] daily {year}: 新增 {rep['daily_added']}，更新 {rep['daily_updated']} "
+                  f"-> {len(rows)} 行（{p.name}）")
+            total["daily_added"] += rep["daily_added"]
+            total["daily_updated"] += rep["daily_updated"]
+            if not a.dry_run:
+                write_csv(p, DAILY_COLS, rows)
 
     print(f"[mi-cloud] 完成{'（dry-run，未写文件）' if a.dry_run else ''}：{total}")
     return 0

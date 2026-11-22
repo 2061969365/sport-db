@@ -63,10 +63,13 @@ export function tgApi(env: Env, method: string, payload: unknown) {
 }
 
 export async function tgSend(env: Env, chatId: number | string, text: string): Promise<void> {
+  // 长回复按行切成多条发，不再 clip 掉后半段（分析/计划类回答经常超过 3500 字）。
   // Telegram 侧失败不抛：异步路径里抛了也没人接，只会丢日志。
-  const r = await tgApi(env, "sendMessage", { chat_id: chatId, text: clip(text) }).catch(() => null);
-  if (r && !r.ok) {
-    console.error(`[tgSend-fail chat=${chatId}]`, r.status, (await r.text().catch(() => "")).slice(0, 200));
+  for (const piece of splitForTg(text)) {
+    const r = await tgApi(env, "sendMessage", { chat_id: chatId, text: piece }).catch(() => null);
+    if (r && !r.ok) {
+      console.error(`[tgSend-fail chat=${chatId}]`, r.status, (await r.text().catch(() => "")).slice(0, 200));
+    }
   }
 }
 
@@ -109,7 +112,7 @@ export async function feishuSend(env: Env, chatId: string, text: string): Promis
     const r = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok.tenant_access_token}` },
-      body: JSON.stringify({ receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: clip(text) }) }),
+      body: JSON.stringify({ receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: clip(text, 8000) }) }),
     });
     if (!r.ok) console.error(`[feishuSend-fail chat=${chatId}]`, r.status);
   } catch (e) {

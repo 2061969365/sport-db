@@ -11,7 +11,6 @@
 const BOT_DEFAULT = 'https://sport-db-bot.xia2061969365.workers.dev';
 const LS_HISTORY = 'sportdb.chat.history.v1';
 const LS_CONFIG = 'sportdb.chat.config.v2';
-const REPLY_CLIP = 3500; // 服务端已裁剪，此为展示兜底
 const LS_TOKEN = 'sportdb.chat.token'; // 可选口令（服务端配了 PWA_TOKEN 才需要）
 
 /* CSV 降级基址候选（与 app.js 一致，兼容本地根服务 / Pages 两种布局） */
@@ -228,7 +227,7 @@ async function askBot(botBase, session, key, question, isAlive) {
   }
   if (!r.ok) throw new Error((data && data.error) || `Bot 服务 HTTP ${r.status}`);
   if (!data || !data.reply) throw new Error('Bot 返回为空');
-  return String(data.reply).slice(0, REPLY_CLIP);
+  return String(data.reply);
 }
 
 /* ================= 页面逻辑 ================= */
