@@ -30,6 +30,17 @@ test("快照：给出今天、近7/30天、最近5次和配速", () => {
   assert.match(s, /5'00"\/km/);
 });
 
+test("快照：设备日报带上步数/消耗/日均心率", () => {
+  const rows = [row("2026-11-02", 4, 310, 152)];
+  const s = buildSnapshot(rows, NOW, {
+    stepsDate: "2026-11-03", stepsLast: 18726, steps7Avg: 12000,
+    caloriesLast: 913, hrDayAvg: 133,
+  });
+  assert.match(s, /今天步数 18726/);
+  assert.match(s, /活动消耗 913 kcal/);
+  assert.match(s, /日均心率 133/);
+});
+
 test("快照：指出碎片和疑似重复（教练要能主动挑问题）", () => {
   const rows = [
     row("2026-11-01", 0.38, 120, 150),

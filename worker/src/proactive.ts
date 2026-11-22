@@ -69,6 +69,11 @@ export interface DailySummary {
   sleep7AvgMin?: number;
   rhrLast?: number;
   rhr7Avg?: number;
+  stepsDate?: string;
+  stepsLast?: number;
+  steps7Avg?: number;
+  caloriesLast?: number;
+  hrDayAvg?: number;
 }
 
 /** 本周一（北京时间今天所在周的周一） */
@@ -125,6 +130,12 @@ export function buildSnapshot(all: Row[], now = Date.now(), daily?: DailySummary
   }
   if (daily?.sleep7AvgMin) body.push(`近 7 天均睡 ${fmtHours(daily.sleep7AvgMin)}`);
   if (daily?.rhrLast) body.push(`静息心率 ${daily.rhrLast}${daily.rhr7Avg ? `（7 日均 ${Math.round(daily.rhr7Avg)}）` : ""}`);
+  if (daily?.stepsLast) {
+    const when = daily.stepsDate === today ? "今天" : (daily.stepsDate || "最近");
+    body.push(`${when}步数 ${daily.stepsLast}${daily.steps7Avg ? `（7 日均 ${Math.round(daily.steps7Avg)}）` : ""}`);
+  }
+  if (daily?.caloriesLast) body.push(`活动消耗 ${daily.caloriesLast} kcal`);
+  if (daily?.hrDayAvg) body.push(`日均心率 ${daily.hrDayAvg}`);
   if (body.length) out.push(`身体状态：${body.join("；")}`);
 
   const last = sorted.slice(-5).reverse();

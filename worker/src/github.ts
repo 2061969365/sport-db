@@ -284,6 +284,8 @@ export async function loadDailySummary(
 ): Promise<{
   sleepDate?: string; sleepMin?: number; sleepScore?: number;
   sleep7AvgMin?: number; rhrLast?: number; rhr7Avg?: number;
+  stepsDate?: string; stepsLast?: number; steps7Avg?: number;
+  caloriesLast?: number; hrDayAvg?: number;
 } | null> {
   const today = new Date(now + 8 * 3600_000).toISOString().slice(0, 10);
   const year = today.slice(0, 4);
@@ -292,6 +294,9 @@ export async function loadDailySummary(
 
   const sleeps = new Map<string, { min: number; score: number }>();
   const rhrs = new Map<string, number>();
+  const steps = new Map<string, number>();
+  const cals = new Map<string, number>();
+  const dayHr = new Map<string, number>();
   for (const r of parseCSV(g.text)) {
     const date = r.date || "";
     if (!date || date > today) continue;
@@ -305,9 +310,17 @@ export async function loadDailySummary(
     } else if (r.key === "heart_rate") {
       const v2 = Number(v.avg_rhr);
       if (v2 > 0) rhrs.set(date, v2);
+      const ah = Number(v.avg_hr);
+      if (ah > 0) dayHr.set(date, ah);
+    } else if (r.key === "steps") {
+      const n = Number(v.steps);
+      if (n > 0) steps.set(date, n);
+    } else if (r.key === "calories") {
+      const n = Number(v.calories);
+      if (n > 0) cals.set(date, n);
     }
   }
-  if (!sleeps.size && !rhrs.size) return null;
+  if (!sleeps.size && !rhrs.size && !steps.size && !cals.size && !dayHr.size) return null;
 
   const pick = <T>(m: Map<string, T>): [string, T] | null => {
     const keys = [...m.keys()].sort();
@@ -320,6 +333,9 @@ export async function loadDailySummary(
   };
   const lastSleep = pick(sleeps);
   const lastRhr = pick(rhrs);
+  const lastSteps = pick(steps);
+  const lastCals = pick(cals);
+  const lastHr = pick(dayHr);
   return {
     sleepDate: lastSleep?.[0],
     sleepMin: lastSleep?.[1].min,
@@ -327,6 +343,11 @@ export async function loadDailySummary(
     sleep7AvgMin: avgOf(sleeps, (v) => v.min, 7),
     rhrLast: lastRhr?.[1],
     rhr7Avg: avgOf(rhrs, (v) => v, 7),
+    stepsDate: lastSteps?.[0],
+    stepsLast: lastSteps?.[1],
+    steps7Avg: avgOf(steps, (v) => v, 7),
+    caloriesLast: lastCals?.[1],
+    hrDayAvg: lastHr?.[1],
   };
 }
 
