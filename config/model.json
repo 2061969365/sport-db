@@ -1,7 +1,7 @@
 {
- "endpoint": "https://zen.uflash.ccwu.cc/v1/chat/completions",
+ "endpoint": "https://panel.forluseword.kdns.fr/v1/chat/completions",
  "model": "deepseek-v4.1-flash-free",
  "streaming": true,
- "savedAt": 1793000000000,
+ "savedAt": 1795348954375,
  "by": "cli:model-switch"
 }
