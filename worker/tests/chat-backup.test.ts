@@ -24,6 +24,12 @@ test("备份路径按天分文件", () => {
   assert.equal(chatPath("2026-10-16"), "state/chat/2026-10-16.md");
 });
 
+test("备份路径按通道分文件：同一天多个通道不互相覆盖", () => {
+  assert.equal(chatPath("2026-10-16", "tg"), "state/chat/2026-10-16-tg.md");
+  assert.equal(chatPath("2026-10-16", "pwa"), "state/chat/2026-10-16-pwa.md");
+  assert.equal(chatPath("2026-10-16", "a/b c"), "state/chat/2026-10-16-abc.md");
+});
+
 test("节流：刚备份过就不再写，force 可强制", () => {
   const now = 1_000_000_000;
   assert.equal(shouldExportChat(0, now), true, "从没备份过 → 立刻备份");

@@ -424,7 +424,7 @@ export default {
       }
       try {
         const agent = (await getAgentByName(env.SportDbAgent, sess)) as unknown as {
-          diagnose(): Promise<Record<string, unknown>>;
+          diagnose(tail?: number): Promise<Record<string, unknown>>;
           stripImagesAdmin(): Promise<{ before: number; after: number }>;
         };
         if (url.searchParams.get("proactive") === "1") {
@@ -435,7 +435,7 @@ export default {
           const fixed = await agent.stripImagesAdmin();
           return Response.json({ session: sess, ...fixed, ...(await agent.diagnose()) });
         }
-        return Response.json({ session: sess, ...(await agent.diagnose()) });
+        return Response.json({ session: sess, ...(await agent.diagnose(Number(url.searchParams.get("tail") || 0))) });
       } catch (e) {
         return Response.json({ error: String((e as Error).message).slice(0, 200) }, { status: 500 });
       }

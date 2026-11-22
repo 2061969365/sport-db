@@ -72,6 +72,42 @@ test("答复整形：没有工具调用时保留全部文本", () => {
   assert.equal(finalReplyText({ message: msg }), "你好，在的");
 });
 
+test("答复整形：工具之后只剩一句「记好了」也不能丢掉前面的正文", () => {
+  const msg = {
+    parts: [
+      { type: "text", text: "四组配速几乎一致，控速是历史最好的一次。" },
+      { type: "tool-set_context", state: "output-available" },
+      { type: "text", text: "记好了。明天全休。" },
+    ],
+  };
+  assert.equal(
+    finalReplyText({ message: msg }),
+    "四组配速几乎一致，控速是历史最好的一次。\n\n记好了。明天全休。",
+  );
+});
+
+test("答复整形：工具收尾且后面没字，保留前面的正文", () => {
+  const msg = {
+    parts: [
+      { type: "step-start" },
+      { type: "text", text: "结论：这周改成骑车。" },
+      { type: "tool-set_context", state: "output-available" },
+    ],
+  };
+  assert.equal(finalReplyText({ message: msg }), "结论：这周改成骑车。");
+});
+
+test("答复整形：工具前的「我查一下」旁白仍被丢掉", () => {
+  const msg = {
+    parts: [
+      { type: "text", text: "我先帮你查一下最近的数据。" },
+      { type: "tool-query_workouts", state: "output-available" },
+      { type: "text", text: "结论：今天该全休。" },
+    ],
+  };
+  assert.equal(finalReplyText({ message: msg }), "结论：今天该全休。");
+});
+
 test("答复整形：content 字符串直通（兼容旧格式）", () => {
   assert.equal(finalReplyText({ message: { content: "纯文本" } }), "纯文本");
 });

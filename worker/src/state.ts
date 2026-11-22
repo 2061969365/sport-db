@@ -182,8 +182,10 @@ export function chatBackupEnabled(env: Env): boolean {
   return !!loc && loc.dedicated;
 }
 
-export function chatPath(day: string): string {
-  return `state/chat/${String(day).slice(0, 10)}.md`;
+export function chatPath(day: string, tag?: string): string {
+  // 同一天多个通道（tg-/pwa-/fs-）各自导出，不加后缀会互相覆盖。
+  const clean = String(tag || "").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 16);
+  return `state/chat/${String(day).slice(0, 10)}${clean ? `-${clean}` : ""}.md`;
 }
 
 /** 距上次导出不足这个间隔就跳过，免得每句话都提交一次 git。 */

@@ -19,10 +19,17 @@ export function messageText(result: unknown): string {
   return "";
 }
 
+/** 工具调用前常见的「我查一下」旁白：短、且含过程动词，才丢。 */
+const CHATTER = /(稍等|稍候|马上|这就|正在|我先|让我|帮你(查|看|翻|对|拉|排|算)|我(去|来)?(查|看|翻|对)一下)/;
+
 /**
  * 只取「最终答复」：多步 turn 里模型会在工具调用之间插旁白
- * （实测计划类回答开头会粘出「收到…我来帮你排…刚看到你的近况…」一串碎片），
- * 这里丢掉最后一次工具调用之前的文本，只留收尾的正式答复。
+ * （实测计划类回答开头会粘出「收到…我来帮你排…刚看到你的近况…」一串碎片）。
+ * 这里按 step / 工具把文本切成段，丢掉非最后一段里的短旁白，其余按顺序保留。
+ *
+ * 关键：不能只取「最后一次工具调用之后」——模型常把完整分析写在前面，
+ * 再调 set_context 存备忘，最后补一句「记好了」，那样整段分析会被丢掉，
+ * 用户就只收到一句「记好了」。
  */
 export function finalReplyText(result: unknown): string {
   const msg = (result as { message?: { content?: unknown; parts?: { type?: string; text?: string }[] } })?.message;
@@ -31,17 +38,20 @@ export function finalReplyText(result: unknown): string {
   const parts = Array.isArray(msg.parts) ? msg.parts : [];
   if (!parts.length) return "";
   const typeOf = (p: { type?: string }) => String(p?.type || "");
-  const textOf = (p: { type?: string; text?: string }) => (typeOf(p).startsWith("text") ? p.text ?? "" : "");
-  let lastTool = -1;
-  parts.forEach((p, i) => {
+  const segments: string[] = [];
+  let cur = "";
+  for (const p of parts) {
     const t = typeOf(p);
-    if (t && !t.startsWith("text") && t !== "reasoning" && t !== "source-url" && t !== "step-start") {
-      lastTool = i;
-    }
-  });
-  const tail = parts.slice(lastTool + 1).map(textOf).join("");
-  if (tail.trim()) return tail;
-  return parts.map(textOf).join("");
+    if (t.startsWith("text")) { cur += p.text ?? ""; continue; }
+    if (t === "reasoning" || t === "source-url") continue;
+    if (cur.trim()) segments.push(cur.trim());
+    cur = "";
+  }
+  if (cur.trim()) segments.push(cur.trim());
+  if (!segments.length) return "";
+  const kept = segments.filter((s, i) =>
+    !(i < segments.length - 1 && s.length <= 80 && CHATTER.test(s)));
+  return (kept.length ? kept : segments).join("\n\n");
 }
 
 export function tgApi(env: Env, method: string, payload: unknown) {

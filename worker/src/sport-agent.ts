@@ -169,7 +169,8 @@ const RULES_BLOCK =
   + "（如 6km @6'10\"/km），先预览再确认。之后 plan_progress 看进度、plan_mark 打卡。"
   + "write_plan 只写说明/备忘，别拿它存训练计划（混用会导致计划查不到、打不了卡）。他说「我的计划」先 plan_list。\n"
   + "【提醒】set_reminder 支持「2026-11-07 07:00」「+2h」「+1d」和 cron；cron 按北京时间写，只支持每天固定时间。\n"
-  + "【只在最终答复说话】调工具前后不要输出「收到」「我查一下」这类旁白——用户只看得到最后那条答复。\n";
+  + "【只在最终答复说话】查数据/存备忘的工具调用都放在正文之前；调完工具必须把完整回答写在最后，"
+  + "不要在回答之后再调工具，也不要只补一句「记好了」就结束。存备忘是内部动作，不用向他汇报。\n";
 
 export class SportDbAgent extends Think<Env> {
   // 内置 workspace 的 bash 工具对本项目无用且危险，直接关闭；
@@ -318,7 +319,7 @@ export class SportDbAgent extends Think<Env> {
               body = JSON.stringify(bb);
             } catch { /* 原样发 */ }
           }
-          console.log("[model-req]", targetUrl.replace("https://apius2.fastfaster.kdns.fr", ""),
+          console.log("[model-req]", targetUrl.replace(/^https:\/\/[^/]+/, ""),
             JSON.stringify({
               keys: b ? Object.keys(b).join(",") : "-",
               tools: (b?.tools || []).length,
@@ -336,7 +337,7 @@ export class SportDbAgent extends Think<Env> {
         } catch { /* 记录失败无所谓 */ }
         const resp = await fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
         if (resp.status >= 400) {
-          console.log("[model-res]", resp.status, targetUrl.replace("https://zen.uflash.ccwu.cc/v1", ""),
+          console.log("[model-res]", resp.status, targetUrl.replace(/^https:\/\/[^/]+/, ""),
             `imgs=${(JSON.stringify(JSON.parse(body || "{}").messages || []).match(/image_url/g) || []).length}`);
         }
         return resp;
@@ -559,7 +560,7 @@ export class SportDbAgent extends Think<Env> {
     // 切换：先构成目标配置，体检过了再落盘
     if (cmd.action === "set-url") {
       const ep = normalizeEndpoint(cmd.endpoint);
-      if (!ep) return "失败：网关地址不合法。例：/model url https://apius2.fastfaster.kdns.fr";
+      if (!ep) return "失败：网关地址不合法。例：/model url https://panel.forluseword.kdns.fr/v1";
       const cur = await this.currentCfg(true);
       const probe = await probeCfg({ ...cur, endpoint: ep }, probeImg);
       if (!probe.ok) {
@@ -992,9 +993,9 @@ export class SportDbAgent extends Think<Env> {
     }
   }
 
-  /** 诊断：某个会话的消息量、图片数、最近错误（只读，不含正文）。 */
+  /** 诊断：某个会话的消息量、图片数、最近错误；tail>0 时附最近 N 条正文（排障用）。 */
   @callable()
-  async diagnose(): Promise<Record<string, unknown>> {
+  async diagnose(tail = 0): Promise<Record<string, unknown>> {
     const msgs = (await this.getMessages().catch(() => [])) as {
       role?: string; parts?: { type?: string; text?: string }[];
     }[];
@@ -1017,6 +1018,21 @@ export class SportDbAgent extends Think<Env> {
         { channel?: string }[];
       channel = tv[0]?.channel || "";
     } catch { /* 新会话还没这张表 */ }
+    const n = Math.max(0, Math.min(40, Number(tail) || 0));
+    const tailMsgs = n
+      ? msgs.slice(-n).map((m) => ({
+        role: String(m.role || ""),
+        text: (m.parts || [])
+          .filter((p) => p?.type === "text")
+          .map((p) => String(p.text || ""))
+          .join("")
+          .slice(0, 1200),
+        parts: (m.parts || []).map((p) => String(p?.type || "")),
+        partTexts: (m.parts || [])
+          .filter((p) => p?.type === "text")
+          .map((p) => String(p.text || "").slice(0, 400)),
+      }))
+      : undefined;
     return {
       messages: msgs.length,
       textChars: chars,
@@ -1026,6 +1042,7 @@ export class SportDbAgent extends Think<Env> {
       channel,
       paused: isPaused(this.env),
       errors: errors.map((e) => ({ at: e.at, msg: String(e.msg).slice(0, 200) })),
+      ...(tailMsgs ? { tail: tailMsgs } : {}),
     };
   }
 
@@ -1167,12 +1184,20 @@ export class SportDbAgent extends Think<Env> {
       }).filter((x) => x.text);
       if (!items.length) return "这次没有可备份的内容。";
       const day = bjToday();
+      // 按通道分文件：tg-/pwa-/fs- 各是独立 DO，同一天共用一个文件名会互相覆盖。
+      let tag = "misc";
+      try {
+        const tv = this.sql`SELECT channel FROM reply_target WHERE slot = 'current'` as
+          { channel?: string }[];
+        tag = tv[0]?.channel || "misc";
+      } catch { /* 新会话还没这张表 */ }
+      const path = chatPath(day, tag);
       const md = formatTranscript(items, day);
-      const ok = await writeStateText(this.env, chatPath(day),
+      const ok = await writeStateText(this.env, path,
         md, `bot: 对话备份 ${day}（${items.length} 条）`);
       if (!ok) return "备份失败（私有仓写入没成功，看 Worker 日志）。";
       this.sql`INSERT OR REPLACE INTO chat_export(slot, at, chars) VALUES ('last', ${Date.now()}, ${md.length})`;
-      return `已备份到私有仓 ${chatPath(day)}（${items.length} 条消息，${md.length} 字符）。`;
+      return `已备份到私有仓 ${path}（${items.length} 条消息，${md.length} 字符）。`;
     } catch (e) {
       return `备份异常：${(e as Error).message}`;
     }
