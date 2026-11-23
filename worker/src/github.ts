@@ -43,56 +43,61 @@ export type SqlTag = (
   ...values: unknown[]
 ) => Array<Record<string, unknown>>;
 
-const CACHE_TTL_MS = 300_000;
+// Actions 写入后靠这里读；60s 让新数据最多 1 分钟可见（原来 300s 太久）。
+const CACHE_TTL_MS = 60_000;
 
 function ensureCache(sql?: SqlTag): void {
   if (!sql) return;
   sql`CREATE TABLE IF NOT EXISTS csv_cache (path TEXT PRIMARY KEY, text TEXT, sha TEXT, updated_at INTEGER)`;
 }
 
-/** 读年文件：缓存命中（300s）直接用，否则 Contents API 拉取并回填。
+/** 读年文件：缓存命中（60s）直接用，否则 Contents API 拉取并回填。
  *  注意：写路径（update）必须用 ghGetFile 拿新鲜 sha，不能吃缓存。 */
 async function cachedGetFile(
   env: Env, sql: SqlTag | undefined, path: string,
 ): Promise<{ text: string; sha: string } | null> {
+  let stale: { text: string; sha: string } | null = null;
   if (sql) {
     try {
       ensureCache(sql);
       const hit = sql`SELECT text, sha, updated_at FROM csv_cache WHERE path = ${path}` as
         { text: string; sha: string; updated_at: number }[];
-      if (hit.length && Date.now() - hit[0].updated_at < CACHE_TTL_MS) {
-        // 空文本 = 之前确认过 404（CSV 不可能真空）。
-        if (!hit[0].text) return null;
-        return { text: hit[0].text, sha: hit[0].sha || "" };
+      if (hit.length) {
+        stale = { text: hit[0].text, sha: hit[0].sha || "" };
+        if (Date.now() - hit[0].updated_at < CACHE_TTL_MS) {
+          // 空文本 = 之前确认过 404（CSV 不可能真空）。
+          return hit[0].text ? stale : null;
+        }
       }
     } catch { /* 缓存坏了就当 miss */ }
   }
 
-  let g: { text: string; sha: string } | null = null;
-  let failed = false;
-  try {
-    g = await ghGetFile(env, path);
-  } catch (e) {
-    // 关键：**只有 404 才允许否定缓存**。429/5xx/超时若被当成"不存在"写进空缓存，
-    // 整整一年的数据会静默消失（快照/统计全错）。失败时优先用旧缓存。
-    failed = true;
-    console.error("[gh-cache-read-fail]", path, (e instanceof Error ? e.message : String(e)).slice(0, 120));
+  const r = await ghGetFileResult(env, path);
+  if (r.kind === "ok") {
     if (sql) {
       try {
         ensureCache(sql);
-        const stale = sql`SELECT text, sha FROM csv_cache WHERE path = ${path}` as
-          { text: string; sha: string }[];
-        if (stale.length && stale[0].text) return { text: stale[0].text, sha: stale[0].sha || "" };
+        sql`INSERT OR REPLACE INTO csv_cache(path, text, sha, updated_at) VALUES (${path}, ${r.text}, ${r.sha}, ${Date.now()})`;
+      } catch { /* 缓存写失败不影响主流程 */ }
+    }
+    return { text: r.text, sha: r.sha };
+  }
+  if (r.kind === "missing") {
+    // 只有确认 404 才写空文本负缓存。DNS/TLS/超时/5xx 绝不能走这里，
+    // 否则整整一年的数据会静默“消失”（快照/统计全错）。
+    if (sql) {
+      try {
+        ensureCache(sql);
+        sql`INSERT OR REPLACE INTO csv_cache(path, text, sha, updated_at) VALUES (${path}, ${""}, ${""}, ${Date.now()})`;
       } catch { /* 忽略 */ }
     }
+    return null;
   }
-  if (sql && !failed) {
-    try {
-      ensureCache(sql);
-      sql`INSERT OR REPLACE INTO csv_cache(path, text, sha, updated_at) VALUES (${path}, ${g?.text ?? ""}, ${g?.sha ?? ""}, ${Date.now()})`;
-    } catch { /* 缓存写失败不影响主流程 */ }
-  }
-  return g;
+
+  console.error("[gh-cache-read-fail]", path, r.message.slice(0, 120));
+  // 网络/鉴权失败：有旧缓存就吃 stale（忽略 TTL），没有才抛错——绝不返回空文本。
+  if (stale) return stale.text ? stale : null;
+  throw new Error(r.message.startsWith("GitHub读") ? r.message : `GitHub读 ${path} 失败：${r.message}`);
 }
 
 function invalidateCache(sql: SqlTag | undefined, path: string): void {
@@ -173,37 +178,60 @@ async function ghFetch(input: string, init?: RequestInit): Promise<Response> {
   return r;
 }
 
-async function fetchText(url: string): Promise<string> {
+/** 读请求的三种结果：成功 / 确认 404 / 网络或鉴权失败（不能当 404）。 */
+type GhReadResult =
+  | { kind: "ok"; text: string; sha: string }
+  | { kind: "missing" }
+  | { kind: "error"; message: string };
+
+function errText(e: unknown): string {
+  return (e instanceof Error ? e.message : String(e)).slice(0, 160);
+}
+
+/** raw 回退：只有 404 才算 missing，fetch 抛错/5xx 一律 error。 */
+async function fetchTextResult(env: Env, path: string): Promise<GhReadResult> {
   try {
-    const r = await fetch(url);
-    if (!r.ok) return "";
-    return await r.text();
-  } catch {
-    return "";
+    const r = await fetch(`https://raw.githubusercontent.com/${env.REPO}/main/${path}`);
+    if (r.status === 404) return { kind: "missing" };
+    if (!r.ok) return { kind: "error", message: `GitHub读 ${path} 失败 ${r.status}` };
+    return { kind: "ok", text: await r.text(), sha: "" };
+  } catch (e) {
+    return { kind: "error", message: `GitHub读 ${path} 网络异常：${errText(e)}` };
   }
 }
 
-/** 读文件：{text, sha}；不存在返回 null。无 GH_PAT 退回 raw。 */
-export async function ghGetFile(env: Env, path: string): Promise<{ text: string; sha: string } | null> {
+/** 内部读：区分“确认不存在”和“读失败”，供负缓存判断用。 */
+async function ghGetFileResult(env: Env, path: string): Promise<GhReadResult> {
   if (env.GH_PAT) {
     try {
       const r = await ghFetch(`https://api.github.com/repos/${env.REPO}/contents/${path}?ref=main`, {
         headers: ghHeaders(env),
       });
-      if (r.status === 404) return null;
+      if (r.status === 404) return { kind: "missing" };
       if (r.status === 401 || r.status === 403) {
-        throw new Error(`GitHub读 ${path} 鉴权失败 ${r.status}（PAT 过期或权限不足）`);
+        return { kind: "error", message: `GitHub读 ${path} 鉴权失败 ${r.status}（PAT 过期或权限不足）` };
       }
-      if (!r.ok) throw new Error(`GitHub读 ${path} 失败 ${r.status}`);
+      if (!r.ok) return { kind: "error", message: `GitHub读 ${path} 失败 ${r.status}` };
       const j = (await r.json()) as { type?: string; content?: string; sha?: string };
-      if (j.type !== "file" || !j.content) return null;
-      return { text: b64ToUtf8(j.content), sha: j.sha ?? "" };
+      if (j.type !== "file" || !j.content) return { kind: "missing" };
+      return { kind: "ok", text: b64ToUtf8(j.content), sha: j.sha ?? "" };
     } catch (e) {
-      if (String((e as Error).message || e).startsWith("GitHub读")) throw e;
+      // API 请求本身抛错（DNS/TLS/超时/JSON 坏）：再试 raw，raw 也失败才算网络错误。
+      const raw = await fetchTextResult(env, path);
+      if (raw.kind !== "error") return raw;
+      return { kind: "error", message: `GitHub读 ${path} 网络异常：${errText(e)}` };
     }
   }
-  const t = await fetchText(`https://raw.githubusercontent.com/${env.REPO}/main/${path}`);
-  return t ? { text: t, sha: "" } : null;
+  return fetchTextResult(env, path);
+}
+
+/** 读文件：{text, sha}；确认不存在返回 null，网络/鉴权失败抛 "GitHub读…" 错误。
+ *  无 GH_PAT 退回 raw。 */
+export async function ghGetFile(env: Env, path: string): Promise<{ text: string; sha: string } | null> {
+  const r = await ghGetFileResult(env, path);
+  if (r.kind === "ok") return { text: r.text, sha: r.sha };
+  if (r.kind === "missing") return null;
+  throw new Error(r.message);
 }
 
 /** 二进制直传（如 TG 原图）：base64 + PUT，返回短 sha。 */
@@ -252,13 +280,14 @@ export async function ghPutFile(env: Env, path: string, text: string, sha: strin
 /** 工具语料：读全 data/workouts/*.csv。
  * 直接并行拉近 6 年文件（不存在的 404 跳过），不依赖目录列举接口——
  * 未鉴权时列举易被限流，曾导致回退只读两年（rows=454 的教训）。
- * 有 sql 时走 DO 缓存（300s TTL），同 turn 多工具只拉一次。 */
+ * 有 sql 时走 DO 缓存（60s TTL），同 turn 多工具只拉一次。 */
 export async function loadWorkouts(env: Env, sql?: SqlTag): Promise<Row[]> {
   const y = new Date().getUTCFullYear();
   const years = [y - 5, y - 4, y - 3, y - 2, y - 1, y];
   const got = await Promise.all(
     years.map(async (year) => {
-      const g = await cachedGetFile(env, sql, `data/workouts/${year}.csv`).catch(() => null);
+      // 读失败（网络/鉴权）必须向上抛，不能当成空文件——否则整年数据会静默消失。
+      const g = await cachedGetFile(env, sql, `data/workouts/${year}.csv`);
       return { year, text: g?.text ?? "" };
     }),
   );
@@ -283,9 +312,10 @@ export async function loadDailySummary(
   env: Env, sql?: SqlTag, now = Date.now(),
 ): Promise<{
   sleepDate?: string; sleepMin?: number; sleepScore?: number;
-  sleep7AvgMin?: number; rhrLast?: number; rhr7Avg?: number;
+  sleep7AvgMin?: number; sleepDays7?: number;
+  rhrLast?: number; rhr7Avg?: number; rhrDate?: string;
   stepsDate?: string; stepsLast?: number; steps7Avg?: number;
-  caloriesLast?: number; hrDayAvg?: number;
+  caloriesLast?: number; hrDayAvg?: number; stressLast?: number;
 } | null> {
   const today = new Date(now + 8 * 3600_000).toISOString().slice(0, 10);
   const year = today.slice(0, 4);
@@ -297,6 +327,7 @@ export async function loadDailySummary(
   const steps = new Map<string, number>();
   const cals = new Map<string, number>();
   const dayHr = new Map<string, number>();
+  const stress = new Map<string, number>();
   for (const r of parseCSV(g.text)) {
     const date = r.date || "";
     if (!date || date > today) continue;
@@ -318,9 +349,12 @@ export async function loadDailySummary(
     } else if (r.key === "calories") {
       const n = Number(v.calories);
       if (n > 0) cals.set(date, n);
+    } else if (r.key === "stress") {
+      const n = Number(v.avg_stress);
+      if (n > 0) stress.set(date, n);
     }
   }
-  if (!sleeps.size && !rhrs.size && !steps.size && !cals.size && !dayHr.size) return null;
+  if (!sleeps.size && !rhrs.size && !steps.size && !cals.size && !dayHr.size && !stress.size) return null;
 
   const pick = <T>(m: Map<string, T>): [string, T] | null => {
     const keys = [...m.keys()].sort();
@@ -336,18 +370,23 @@ export async function loadDailySummary(
   const lastSteps = pick(steps);
   const lastCals = pick(cals);
   const lastHr = pick(dayHr);
+  const lastStress = pick(stress);
+  const sleepDays7 = [...sleeps.keys()].filter((d) => d >= shiftDate(today, -6) && d <= today).length;
   return {
     sleepDate: lastSleep?.[0],
     sleepMin: lastSleep?.[1].min,
     sleepScore: lastSleep?.[1].score || undefined,
     sleep7AvgMin: avgOf(sleeps, (v) => v.min, 7),
+    sleepDays7,
     rhrLast: lastRhr?.[1],
     rhr7Avg: avgOf(rhrs, (v) => v, 7),
+    rhrDate: lastRhr?.[0],
     stepsDate: lastSteps?.[0],
     stepsLast: lastSteps?.[1],
     steps7Avg: avgOf(steps, (v) => v, 7),
     caloriesLast: lastCals?.[1],
     hrDayAvg: lastHr?.[1],
+    stressLast: lastStress?.[1],
   };
 }
 
@@ -411,6 +450,162 @@ export function buildProfile(all: Row[], days = 30): string {
   return lines.join("\n");
 }
 
+/** 心率区间字段（value_json 里，单位秒）。 */
+const HR_ZONE_KEYS = [
+  "hrm_warm_up_duration", "hrm_fat_burning_duration", "hrm_aerobic_duration",
+  "hrm_anaerobic_duration", "hrm_extreme_duration",
+] as const;
+
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+const fmtPct = (n: number): string => String(round1(n));
+const ZERO_ZONES = { z1: 0, z2: 0, z3: 0, z4: 0, z5: 0 };
+
+/** P1 4.2：单场五区间分钟数（value_json 里秒 → 分钟，1 位小数；解析失败全 0）。 */
+export function workoutZoneMinutes(
+  row: Record<string, string>,
+): { z1: number; z2: number; z3: number; z4: number; z5: number } {
+  let v: unknown;
+  try { v = JSON.parse(row.value_json || "{}"); } catch { return { ...ZERO_ZONES }; }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { ...ZERO_ZONES };
+  const o = v as Record<string, unknown>;
+  const m = HR_ZONE_KEYS.map((k) => {
+    const sec = Number(o[k]);
+    return Number.isFinite(sec) && sec > 0 ? round1(sec / 60) : 0;
+  });
+  return { z1: m[0], z2: m[1], z3: m[2], z4: m[3], z5: m[4] };
+}
+
+/** P1 4.2：多场合计区间分钟与占比（空数据全 0，不会 NaN）。 */
+export function zoneTotals(rows: Record<string, string>[]): { minutes: number[]; pct: number[] } {
+  const minutes = [0, 0, 0, 0, 0];
+  for (const r of rows) {
+    const z = workoutZoneMinutes(r);
+    minutes[0] += z.z1; minutes[1] += z.z2; minutes[2] += z.z3;
+    minutes[3] += z.z4; minutes[4] += z.z5;
+  }
+  const mins = minutes.map((m) => round1(m));
+  const total = mins.reduce((a, b) => a + b, 0);
+  const pct = mins.map((m) => (total > 0 ? round1((m / total) * 100) : 0));
+  return { minutes: mins, pct };
+}
+
+/** 北京日期（优先 start_utc；没有就用 date 列，本身已是北京日期）。 */
+function rowBjDate(row: Record<string, string>): string {
+  const t = Number(row.start_utc);
+  if (Number.isFinite(t) && t > 0) {
+    return new Date((t + 8 * 3600) * 1000).toISOString().slice(0, 10);
+  }
+  const d = String(row.date || "");
+  return DATE_RE.test(d) ? d : "";
+}
+
+/** P1 4.1 数据部分：Edwards TRIMP + ACWR + 单调性/应变（纯函数，不读网络）。
+ *  TRIMP = z1*1 + z2*2 + z3*3 + z4*4 + z5*5（分钟），按北京日期聚合。 */
+export function computeLoad(
+  rows: Record<string, string>[], now = Date.now(),
+): { trimp7: number; trimp28: number; acwr: number; monotony: number; strain: number; days7: number } {
+  const today = new Date(now + 8 * 3600_000).toISOString().slice(0, 10);
+  const byDay = new Map<string, number>();
+  for (const r of rows) {
+    const d = rowBjDate(r);
+    if (!d) continue;
+    const z = workoutZoneMinutes(r);
+    const trimp = z.z1 * 1 + z.z2 * 2 + z.z3 * 3 + z.z4 * 4 + z.z5 * 5;
+    if (trimp <= 0) continue;
+    byDay.set(d, (byDay.get(d) ?? 0) + trimp);
+  }
+
+  const daily: number[] = [];
+  let trimp7 = 0, trimp28 = 0, days7 = 0;
+  for (let i = 0; i < 28; i++) {
+    const v = byDay.get(shiftDate(today, -i)) ?? 0;
+    trimp28 += v;
+    if (i < 7) {
+      trimp7 += v;
+      daily.push(v);
+      if (v > 0) days7++;
+    }
+  }
+
+  const acwr = trimp28 > 0 ? trimp7 / (trimp28 / 4) : 0;
+  const mean = trimp7 / 7;
+  const variance = daily.reduce((a, x) => a + (x - mean) ** 2, 0) / 7;
+  const std = Math.sqrt(variance);
+  const monotony = std > 0 ? mean / std : 0;
+  return {
+    trimp7: round1(trimp7), trimp28: round1(trimp28),
+    acwr: round2(acwr), monotony: round2(monotony),
+    strain: round1(trimp7 * monotony), days7,
+  };
+}
+
+/** 同一天同 type、相邻 start 间隔 <30 分钟的多次记录视为同一 session。 */
+const SESSION_GAP_S = 30 * 60;
+
+/** P1 4.5：按 session 合并（同一场被拆成多行/重复同步时只算一次）。 */
+export function mergeSessions(
+  rows: Record<string, string>[],
+): Array<{
+  date: string; type: string; start_utc: number; distance_m: number;
+  duration_s: number; avg_hr: number; ids: string[];
+}> {
+  const groups = new Map<string, Record<string, string>[]>();
+  for (const r of rows) {
+    const date = String(r.date || "");
+    if (!date) continue;
+    const type = String(r.type || "");
+    const k = `${date}\u0000${type}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(r);
+  }
+
+  const out: Array<{
+    date: string; type: string; start_utc: number; distance_m: number;
+    duration_s: number; avg_hr: number; ids: string[];
+  }> = [];
+  for (const list of groups.values()) {
+    list.sort((a, b) => num(a.start_utc) - num(b.start_utc));
+    let cur: (typeof out)[number] | null = null;
+    let lastStart = 0;
+    let hrWeighted = 0, hrWeight = 0, hrSum = 0, hrN = 0;
+    const flush = () => {
+      if (!cur) return;
+      cur.avg_hr = hrWeight > 0
+        ? round1(hrWeighted / hrWeight)
+        : hrN > 0 ? round1(hrSum / hrN) : 0;
+      out.push(cur);
+    };
+    for (const r of list) {
+      const start = num(r.start_utc);
+      const dur = num(r.duration_s);
+      const hr = num(r.avg_hr);
+      if (cur && start - lastStart < SESSION_GAP_S) {
+        cur.distance_m += num(r.distance_m);
+        cur.duration_s += dur;
+        if (r.id) cur.ids.push(r.id);
+      } else {
+        flush();
+        cur = {
+          date: String(r.date), type: String(r.type || ""), start_utc: start,
+          distance_m: num(r.distance_m), duration_s: dur, avg_hr: 0,
+          ids: r.id ? [r.id] : [],
+        };
+        hrWeighted = 0; hrWeight = 0; hrSum = 0; hrN = 0;
+      }
+      if (hr > 0) {
+        hrSum += hr;
+        hrN++;
+        if (dur > 0) { hrWeighted += hr * dur; hrWeight += dur; }
+      }
+      lastStart = start;
+    }
+    flush();
+  }
+  out.sort((a, b) => a.start_utc - b.start_utc);
+  return out;
+}
+
 /** get_summary 工具：任意天数分项画像。 */
 export function toolGetSummary(all: Row[], daysRaw: unknown): string {
   let d = parseInt(String(daysRaw ?? 30), 10);
@@ -425,13 +620,16 @@ export function toolGetSummary(all: Row[], daysRaw: unknown): string {
     const g = grpOf(r.type || "");
     (byGrp[g] ??= []).push(r);
   }
-  const lines = [`近${d}天共运动${recent.length}次。`];
+  const sessions = mergeSessions(recent);
+  const rawNote = (raw: number, merged: number) => (merged !== raw ? `（原始${raw}条）` : "");
+  const lines = [`近${d}天共运动${sessions.length}次${rawNote(recent.length, sessions.length)}。`];
   const runs = byGrp["跑步"] ?? [];
   if (runs.length) {
     const pd = runs.reduce((a, w) => a + num(w.distance_m), 0);
     const pt = runs.reduce((a, w) => a + num(w.duration_s), 0);
     const hrs = runs.map((w) => num(w.avg_hr)).filter((x) => x);
-    let seg = `跑步${runs.length}次共${(pd / 1000).toFixed(1)}km`;
+    const runSessions = sessions.filter((s) => RUN_TYPES.includes(s.type)).length;
+    let seg = `跑步${runSessions}次${rawNote(runs.length, runSessions)}共${(pd / 1000).toFixed(1)}km`;
     if (pd > 0 && pt > 0) seg += `，均配速${fmtPace(pt / (pd / 1000))}`;
     if (hrs.length) seg += `，均心率${Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length)}bpm`;
     lines.push(seg + "。");
@@ -439,9 +637,12 @@ export function toolGetSummary(all: Row[], daysRaw: unknown): string {
   for (const name of ["骑行", "步行", "游泳", "跳绳", "综合训练"]) {
     const rs = byGrp[name] ?? [];
     if (rs.length) {
-      lines.push(`${name}${rs.length}次共${(rs.reduce((a, w) => a + num(w.distance_m), 0) / 1000).toFixed(1)}km。`);
+      const n = sessions.filter((s) => grpOf(s.type) === name).length;
+      lines.push(`${name}${n}次${rawNote(rs.length, n)}共${(rs.reduce((a, w) => a + num(w.distance_m), 0) / 1000).toFixed(1)}km。`);
     }
   }
+  const zt = zoneTotals(recent);
+  lines.push(`强度分布（近${d}天）：Z1 ${fmtPct(zt.pct[0])}% / Z2 ${fmtPct(zt.pct[1])}% / Z3 ${fmtPct(zt.pct[2])}% / Z4 ${fmtPct(zt.pct[3])}% / Z5 ${fmtPct(zt.pct[4])}%`);
   return lines.join("\n");
 }
 
@@ -1185,9 +1386,10 @@ export function toolCompare(
   });
 }
 
-/** streaks 工具：连击——当前连续天数、历史最长、活跃天数。 */
+/** streaks 工具：连击——当前连续天数、历史最长、活跃天数（按 session 去重计数）。 */
 export function toolStreaks(all: Row[]): string {
-  const days = [...new Set(all.map((r) => r.date || "").filter(Boolean))].sort();
+  const sessions = mergeSessions(all);
+  const days = [...new Set(sessions.map((s) => s.date).filter(Boolean))].sort();
   if (!days.length) return "库里还没有记录。";
   const today = new Date(Date.now() + 8 * 36e5).toISOString().slice(0, 10);
   const set = new Set(days);
@@ -1207,5 +1409,8 @@ export function toolStreaks(all: Row[]): string {
     best = Math.max(best, run);
   }
   best = Math.max(best, run, cur);
-  return JSON.stringify({ today, current_streak_days: cur, longest_streak_days: best, active_days: days.length });
+  return JSON.stringify({
+    today, current_streak_days: cur, longest_streak_days: best,
+    active_days: days.length, total_sessions: sessions.length,
+  });
 }

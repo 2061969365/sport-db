@@ -3,6 +3,7 @@
 // 不调模型、不花 token，模板化输出数字，避免自动消息里出现幻觉。
 // 注：这里用显式 .ts 后缀，好让 node --test 直接跑测试（tsconfig 已开 allowImportingTsExtensions）。
 import { RUN_TYPES, num, type Row } from "./github.ts";
+import { computeLoad, mergeSessions } from "./coachload.ts";
 
 export interface Signal {
   /** 去重键：同一天同一信号不重复推 */
@@ -67,8 +68,14 @@ export interface DailySummary {
   sleepMin?: number;
   sleepScore?: number;
   sleep7AvgMin?: number;
+  /** 近 7 天真正有睡眠数据的天数（不足 4 天不拿单晚数据下结论） */
+  sleepDays7?: number;
   rhrLast?: number;
   rhr7Avg?: number;
+  /** 静息心率对应的日期（YYYY-MM-DD）；超过 7 天就不显示，避免拿旧值当现状 */
+  rhrDate?: string;
+  /** 最近一次压力均值 */
+  stressLast?: number;
   stepsDate?: string;
   stepsLast?: number;
   steps7Avg?: number;
@@ -124,12 +131,23 @@ export function buildSnapshot(all: Row[], now = Date.now(), daily?: DailySummary
 
   // 身体状态：设备日报（睡眠/静息心率），有就报，没有就不提
   const body: string[] = [];
-  if (daily?.sleepMin) {
-    body.push(`${daily.sleepDate || "最近一晚"} 睡 ${fmtHours(daily.sleepMin)}`
-      + (daily.sleepScore ? `（评分 ${daily.sleepScore}）` : ""));
+  // 睡眠：单晚 < 5 小时或近 7 天不足 4 晚有数据都不下结论（可能是设备没戴/没同步）。
+  const sleepMin = num(daily?.sleepMin);
+  const sleepDays7 = num(daily?.sleepDays7);
+  if (sleepMin >= 300 && sleepDays7 >= 4) {
+    body.push(`${daily?.sleepDate || "最近一晚"} 睡 ${fmtHours(sleepMin)}`
+      + (daily?.sleepScore ? `（评分 ${daily.sleepScore}）` : "")
+      + `（近 7 天 ${sleepDays7} 晚有数据）`);
+    if (daily?.sleep7AvgMin) body.push(`近 7 天均睡 ${fmtHours(daily.sleep7AvgMin)}`);
   }
-  if (daily?.sleep7AvgMin) body.push(`近 7 天均睡 ${fmtHours(daily.sleep7AvgMin)}`);
-  if (daily?.rhrLast) body.push(`静息心率 ${daily.rhrLast}${daily.rhr7Avg ? `（7 日均 ${Math.round(daily.rhr7Avg)}）` : ""}`);
+  // 静息心率：必须带日期且不超过 7 天，否则宁可不提。
+  const rhrDate = daily?.rhrDate || "";
+  const rhrAge = /^\d{4}-\d{2}-\d{2}$/.test(rhrDate) ? diffDays(today, rhrDate) : Infinity;
+  if (daily?.rhrLast && rhrAge >= 0 && rhrAge <= 7) {
+    body.push(`静息心率 ${daily.rhrLast}（${rhrDate}`
+      + `${daily.rhr7Avg ? `，7 日均 ${Math.round(daily.rhr7Avg)}` : ""}）`);
+  }
+  if (daily?.stressLast != null) body.push(`压力均值 ${daily.stressLast}`);
   if (daily?.stepsLast) {
     const when = daily.stepsDate === today ? "今天" : (daily.stepsDate || "最近");
     body.push(`${when}步数 ${daily.stepsLast}${daily.steps7Avg ? `（7 日均 ${Math.round(daily.steps7Avg)}）` : ""}`);
@@ -184,11 +202,19 @@ function inRange(rows: Row[], from: string, to: string): Row[] {
   return rows.filter((r) => (r.date || "") >= from && (r.date || "") <= to);
 }
 
+/** 处方/伤病上下文：由调用方（Lead 统一接入）可选传入。 */
+export interface SignalContext {
+  /** 当前训练处方/教练备注原文，用来识别"全改骑/暂停跑/膝痛"等恢复期 */
+  coaching?: string;
+  /** 明确处于交叉训练期（不跑步） */
+  crossTraining?: boolean;
+}
+
 /**
  * 分析该不该主动开口。无信号返回空数组。
  * 阈值都偏保守：宁可漏报，也不要天天打扰。
  */
-export function analyzeSignals(all: Row[], now = Date.now()): Signal[] {
+export function analyzeSignals(all: Row[], now = Date.now(), ctx?: SignalContext): Signal[] {
   const today = bjToday(now);
   const dated = all.filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date || ""));
   if (!dated.length) return [];
@@ -209,7 +235,32 @@ export function analyzeSignals(all: Row[], now = Date.now()): Signal[] {
     });
   }
 
-  // 2) 跑量骤降
+  // 2) 训练负荷（Edwards TRIMP / ACWR）
+  // 与跑量规则互补：负荷看心率区间，能识别"量没涨但强度堆太多"。
+  const load = computeLoad(dated, now);
+  const acwrHigh = load.acwr > 1.5;
+  if (acwrHigh) {
+    out.push({
+      key: `load-high-${today}`,
+      weight: 78,
+      text: `近 7 天训练负荷 **${Math.round(load.trimp7)}** TRIMP，28 天累计 **${Math.round(load.trimp28)}**；`
+        + `ACWR **${load.acwr.toFixed(2)}** 超过 1.5，单调性 ${load.monotony.toFixed(2)}（strain ${Math.round(load.strain)}）。`
+        + "负荷涨得比恢复快时先别加量，强度课和长距离别排在一起。",
+    });
+  }
+  if (load.acwr < 0.8 && load.trimp28 > 0) {
+    out.push({
+      key: `load-low-${today}`,
+      weight: 45,
+      text: `近 7 天负荷 **${Math.round(load.trimp7)}** TRIMP，28 天累计 ${Math.round(load.trimp28)}，`
+        + `ACWR **${load.acwr.toFixed(2)}** 偏低。是刻意减量/恢复周，还是受伤、太忙？`
+        + "先确认原因，不急着补量。",
+    });
+  }
+
+  // 3) 跑量骤降：恢复期（交叉训练/膝痛）改成按处方走，不劝补跑
+  const recoveryMode = ctx?.crossTraining === true
+    || /全改骑|暂停跑|PFPS|膝|髌骨/.test(ctx?.coaching || "");
   const km7 = runKm(last7), kmPrev = runKm(prev7);
   if (kmPrev >= 8 && km7 < kmPrev * 0.6) {
     const pct = Math.round((1 - km7 / kmPrev) * 100);
@@ -217,42 +268,63 @@ export function analyzeSignals(all: Row[], now = Date.now()): Signal[] {
       key: `volume-drop-${today}`,
       weight: 60,
       text: `本周跑量 **${km7.toFixed(1)}km**，比上周（${kmPrev.toFixed(1)}km）少了 **${pct}%**。`
-        + "是刻意减量还是被事情挤掉了？如果是后者，明天补一次轻松跑就能把节奏接回来。",
+        + (recoveryMode
+          ? "这和当前处方一致：按当前处方继续交叉训练，等疼痛稳定再评估复跑。"
+          : "是刻意减量还是被事情挤掉了？如果是后者，明天补一次轻松跑就能把节奏接回来。"),
     });
   }
 
-  // 3) 跑量骤增（受伤风险）
-  if (kmPrev >= 5 && km7 > kmPrev * 1.8 && km7 >= 15) {
+  // 4) 跑量骤增（次要提示）：ACWR 已报就不再重复
+  if (!acwrHigh && kmPrev >= 5 && km7 > kmPrev * 1.8 && km7 >= 15) {
     out.push({
       key: `volume-spike-${today}`,
       weight: 75,
-      text: `本周跑量 **${km7.toFixed(1)}km**，比上周（${kmPrev.toFixed(1)}km）涨了 **${Math.round((km7 / kmPrev - 1) * 100)}%**。`
-        + "单周涨幅超过 10~20% 是常见的伤病诱因，注意别把长距离和强度课排在一起。",
+      text: `本周跑量 **${km7.toFixed(1)}km**，比上周（${kmPrev.toFixed(1)}km）涨了 **${Math.round((km7 / kmPrev - 1) * 100)}%**（单周涨幅）。`
+        + `当前 ACWR ${load.acwr.toFixed(2)}。单周涨幅超过 10~20% 是常见的伤病诱因，注意别把长距离和强度课排在一起。`,
     });
   }
 
-  // 4) 心率漂移：最近三次 vs 30 天基线
-  // 必须按日期排序后再取"最近三次"：CSV 追加/导入不保证顺序，
-  // 直接 slice(-3) 可能拿到很久以前的记录，判成"心率漂移"就是误报。
-  const runs30 = last30
-    .filter((r) => RUN_TYPES.includes(r.type || "") && num(r.avg_hr) > 0)
-    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  // 5) 同配速心率漂移：最近三场各自找「配速 ±15 秒/km」的历史基线
+  // 旧版直接比 30 天均心率，不控配速：间歇被拆成多行或最近都是慢跑时必然误报。
+  // 先合并同日同 type 的间歇，再逐场匹配配速；基线不足 5 条就跳过，绝不猜。
+  const runs30 = mergeSessions(last30.filter((r) => RUN_TYPES.includes(r.type || "")))
+    .filter((r) => num(r.avg_pace_s) > 0 && num(r.avg_hr) > 0)
+    .sort((a, b) =>
+      String(a.date ?? "").localeCompare(String(b.date ?? ""))
+      || num(a.start_utc) - num(b.start_utc));
   const last3 = runs30.slice(-3);
-  if (last3.length === 3 && runs30.length >= 8) {
-    const base = runs30.slice(0, -3).reduce((a, w) => a + num(w.avg_hr), 0) / (runs30.length - 3);
-    const recent = last3.reduce((a, w) => a + num(w.avg_hr), 0) / 3;
-    if (recent >= base + 8) {
+  if (last3.length === 3 && runs30.length > 3) {
+    const basePool = runs30.slice(0, -3);
+    const PACE_TOL = 15; // 秒/km
+    const MIN_BASE = 5;
+    let wSum = 0, diffSum = 0, hrSum = 0, used = 0;
+    for (const cur of last3) {
+      const pace = num(cur.avg_pace_s);
+      const near = basePool.filter((b) => Math.abs(num(b.avg_pace_s) - pace) <= PACE_TOL);
+      if (near.length < MIN_BASE) continue;
+      const wAll = near.reduce((a, b) => a + Math.max(num(b.duration_s), 1), 0);
+      const baseHr = near.reduce(
+        (a, b) => a + num(b.avg_hr) * Math.max(num(b.duration_s), 1), 0,
+      ) / wAll;
+      const w = Math.max(num(cur.duration_s), 1);
+      wSum += w;
+      diffSum += (num(cur.avg_hr) - baseHr) * w;
+      hrSum += num(cur.avg_hr) * w;
+      used++;
+    }
+    const diff = wSum > 0 ? diffSum / wSum : 0;
+    if (used > 0 && diff >= 6) {
       out.push({
         key: `hr-drift-${today}`,
         weight: 65,
-        text: `最近三次平均心率 **${Math.round(recent)}**，比你 30 天基线（${Math.round(base)}）高了 `
-          + `**${Math.round(recent - base)}** 次/分。同配速下心率抬高通常是疲劳或睡眠不足，`
-          + "这周把轻松跑再放慢一点，别硬顶强度。",
+        text: `最近 ${used} 次跑步在**同配速下**（配速差 ±15 秒/km）平均心率 **${Math.round(hrSum / wSum)}**，`
+          + `比你自己的历史基线高了 **${Math.round(diff)}** 次/分。`
+          + "同配速心率抬高通常是疲劳或睡眠不足，这周把轻松跑再放慢一点，别硬顶强度。",
       });
     }
   }
 
-  // 5) 单月新高
+  // 6) 单月新高
   const month = today.slice(0, 7);
   const monthKm = runKm(dated.filter((r) => (r.date || "").startsWith(month)));
   const best = new Map<string, number>();

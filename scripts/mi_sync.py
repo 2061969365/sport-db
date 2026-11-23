@@ -105,6 +105,8 @@ def main() -> int:
     ap.add_argument("--state-path", default=os.environ.get("MI_STATE_PATH", DEFAULT_PATH))
     ap.add_argument("--keep-json", action="store_true", help="保留导出的 mi_fitness.json")
     ap.add_argument("--details", action="store_true", help="同时拉取每场运动的秒级明细")
+    ap.add_argument("--allow-token-write-fail", action="store_true",
+                    help="passToken 写回私有仓失败时仍继续（默认致命，退出码 4）")
     a = ap.parse_args()
 
     token = os.environ.get("MI_SYNC_PAT") or os.environ.get("GITHUB_TOKEN") or ""
@@ -161,13 +163,24 @@ def main() -> int:
             new_creds = {}
         if new_creds.get("user_id") and new_creds.get("pass_token"):
             new_creds.setdefault("region", creds.get("region", "cn"))
+            # 本地/临时 token 文件先落盘：即使私有仓写回失败，至少本机还有新 token。
+            creds_file.write_text(json.dumps(new_creds), encoding="utf-8")
+            persisted = True
             if a.creds:
                 print("[mi-sync] passToken 已轮换，写回本地凭证文件")
             elif push_creds(a.state_repo, a.state_path, token, new_creds, sha,
                             f"更新小米 passToken {datetime.now(BJ):%Y-%m-%d}"):
                 print("[mi-sync] passToken 已轮换，已写回私有仓")
+            else:
+                print("[mi-sync] 致命：passToken 写回私有仓失败——新 token 只存在本地/临时文件，"
+                      "下次同步可能直接失效；请重试或重新 seed 凭证。", file=sys.stderr)
+                if not a.allow_token_write_fail:
+                    return 4
+                print("[mi-sync] 已指定 --allow-token-write-fail，继续（新 token 可能丢失）",
+                      file=sys.stderr)
+                persisted = False
             env_file = os.environ.get("GITHUB_ENV")
-            if env_file:
+            if persisted and env_file:
                 with open(env_file, "a", encoding="utf-8") as f:
                     f.write("MI_TOKEN_CHANGED=1\n")
         else:

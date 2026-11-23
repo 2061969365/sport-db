@@ -10,6 +10,7 @@ function run(date, km, hr = 150, type = "outdoor_running") {
   return {
     id: `x-${date}-${km}`, date, type, category: type,
     distance_m: String(Math.round(km * 1000)), duration_s: "1800",
+    avg_pace_s: String(Math.round(1800 / km)),
     avg_hr: String(hr), source: "mi_backup", _year: date.slice(0, 4),
   };
 }

@@ -39,6 +39,7 @@ export interface Env {
    * 哪天网关修好了，设成 "on" 就恢复原生流式。
    */
   MODEL_STREAMING?: string;
+  MODEL_CONTEXT_WINDOW?: string;
   /** 429/限流时依次尝试的备用模型（逗号分隔）。 */
   MODEL_FALLBACKS?: string;
   /** 图片轮的模型（主模型不收大图，默认换 mimo）。 */

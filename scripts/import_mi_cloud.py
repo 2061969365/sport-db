@@ -85,14 +85,43 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def read_header(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        try:
+            return next(csv.reader(f))
+        except StopIteration:
+            return []
+
+
 def write_csv(path: Path, cols: list[str], rows: list[dict]) -> None:
+    """写 CSV：现有表头 ∪ 传入 cols ∪ 行里出现的 key，保留未知列。
+
+    原有列顺序不变，新列追加在后；全空行不写（否则会多出空行）。
+    """
+    if not rows:
+        return
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for c in list(read_header(path)) + list(cols):
+        if c and c not in seen:
+            fieldnames.append(c)
+            seen.add(c)
+    for r in rows:
+        for k in r:
+            if k and k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({c: r.get(c, "") for c in cols})
+            if not any(v not in ("", None) for v in r.values()):
+                continue
+            w.writerow({c: r.get(c, "") for c in fieldnames})
     tmp.replace(path)
 
 
@@ -159,20 +188,50 @@ def merge_workouts(rows: list[dict], clouds: list[dict], rep: dict) -> list[dict
             continue
         idx.setdefault(key, []).append(i)
     used: set[int] = set()
+    # 上一次导入追加的行 id 是确定的：先认领同 id 行，保证重复执行不重复追加。
+    id_idx: dict[str, int] = {}
+    for i, r in enumerate(rows):
+        rid = str(r.get("id") or "")
+        if rid:
+            id_idx[rid] = i
 
     for c in clouds:
-        try:
-            d = int(float(c["distance_m"]))
-        except ValueError:
-            d = 0
-        hit = None
-        for delta in (0, -1, 1, -2, 2, -3, 3):  # ±30m
-            for cand in idx.get((c["date"], c["type"], d // 10 + delta), []):
-                if cand not in used:
-                    hit = cand
-                    break
-            if hit is not None:
-                break
+        own = id_idx.get(str(c.get("id") or ""))
+        if own is not None and own not in used:
+            hit = own
+        else:
+            hit = None
+            try:
+                d = int(float(c["distance_m"]))
+            except (KeyError, TypeError, ValueError):
+                d = 0
+            # 先收齐同一天/同类型/±30m 的未占用候选，再做开始时间约束。
+            cands: list[int] = []
+            for delta in (0, -1, 1, -2, 2, -3, 3):  # ±30m
+                for cand in idx.get((c["date"], c["type"], d // 10 + delta), []):
+                    if cand not in used and cand not in cands:
+                        cands.append(cand)
+            try:
+                cstart = int(float(c.get("start_utc") or 0))
+            except (TypeError, ValueError):
+                cstart = 0
+            timed: list[int] = []
+            if cstart:
+                for cand in cands:
+                    try:
+                        ostart = int(float(rows[cand].get("start_utc") or 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(ostart - cstart) <= 600:
+                        timed.append(cand)
+            if len(timed) == 1:
+                hit = timed[0]
+            elif len(timed) > 1:
+                # 有多个开始时间都落在 10 分钟内，无法唯一匹配：宁可新增，不硬合并。
+                hit = None
+            elif len(cands) == 1:
+                # 没有时间相近的，退回原有 ±30m 规则；只有一个候选才算唯一。
+                hit = cands[0]
         if hit is None:
             rows.append(c)
             rep["added"] += 1
@@ -257,12 +316,58 @@ def _noon(date: str) -> int:
     return int(datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=BJ).timestamp()) + 12 * 3600
 
 
+def _epoch_any(v) -> int:
+    """把 epoch 数字或 ISO 字符串转成整数秒；解析不了返回 0。"""
+    if isinstance(v, (int, float)):
+        return int(v)
+    if not isinstance(v, str):
+        return 0
+    s = v.strip()
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        pass
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+SLEEP_STAGES = ("sleep_deep_duration", "sleep_light_duration",
+                "sleep_rem_duration", "sleep_awake_duration")
+
+
+def _sleep_minutes(v: dict, duration_min: float) -> dict:
+    """把四个睡眠阶段换算成分钟。
+
+    云端字段名义上是秒，但真实导出里已经是分钟（deep+light+rem ≈ duration）。
+    用「阶段总和 vs 总时长」判断量纲，两种都能吃：明显偏大按秒除以 60。
+    """
+    raw = {k: _f(v.get(k)) for k in SLEEP_STAGES}
+    stage_sum = sum(raw.values())
+    scale = 1.0
+    if stage_sum > 0:
+        if duration_min > 0 and stage_sum > duration_min * 1.5:
+            scale = 1 / 60
+        elif duration_min <= 0 and stage_sum > 1440:  # 无总时长时按 24h 上限判断
+            scale = 1 / 60
+    return {
+        "deep": raw[SLEEP_STAGES[0]] * scale,
+        "light": raw[SLEEP_STAGES[1]] * scale,
+        "rem": raw[SLEEP_STAGES[2]] * scale,
+        "awake": raw[SLEEP_STAGES[3]] * scale,
+    }
+
+
 def aggregate_daily(data: dict) -> list[dict]:
     """把云端原始采样聚合成按天的 daily_report 行。
 
-    导出里 steps/calories/heart_rate/stress/weight 是逐分钟/逐条采样，
+    导出里 steps/calories/heart_rate/stress/weight/sleep/spo2 是逐分钟/逐条采样，
     直接入库会几万行；这里按北京时间自然日汇总成一天一行。
-    睡眠不在这里合成（用 sleep_daily_reports，字段更全）。
+    睡眠按「醒来日期」聚合成一条 key=sleep（含 segment_details），
+    spo2 聚合成 avg/min/max。
     """
     # 同一天有多个来源（App 聚合 hlth.gen*、手表 515700350、手动 xiaomiwear_app），
     # 分钟级采样互相重叠，直接相加会翻倍。按来源分开累计，最后每天只取一个来源。
@@ -271,6 +376,8 @@ def aggregate_daily(data: dict) -> list[dict]:
     hrs: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     stress: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     weight: dict[str, tuple[int, float, float]] = {}
+    sleep: dict[str, dict[str, dict]] = defaultdict(dict)
+    spo2: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 
     def pick(by_sid: dict, metric: str = ""):
         """优先 App 聚合源，其次取量最大的来源（避免多源相加）。"""
@@ -278,6 +385,12 @@ def aggregate_daily(data: dict) -> list[dict]:
             if sid.startswith("hlth.gen"):
                 return v
         return max(by_sid.values(), key=lambda v: (v.get(metric, 0) if metric else v))
+
+    def pick_list(by_sid: dict[str, list[float]]) -> list[float]:
+        for sid, arr in by_sid.items():
+            if sid.startswith("hlth.gen"):
+                return arr
+        return max(by_sid.values(), key=len)
 
     for s in data.get("steps") or []:
         t = int(s.get("time") or 0)
@@ -321,6 +434,58 @@ def aggregate_daily(data: dict) -> list[dict]:
         d = date_bj(t)
         if d not in weight or t > weight[d][0]:
             weight[d] = (t, w, _f(v.get("bmi")))
+    for s in data.get("sleep") or []:
+        v = _val(s)
+        nap = v.get("is_nap")
+        if nap in (True, 1, "1", "true", "True"):
+            continue
+        bedtime = _epoch_any(v.get("bedtime") or v.get("device_bedtime"))
+        wake = _epoch_any(v.get("device_wake_up_time") or v.get("wake_up_time")
+                          or s.get("time"))
+        if bedtime <= 0 or wake <= bedtime:
+            continue
+        span_min = (wake - bedtime) / 60
+        dur_raw = _f(v.get("duration"))
+        if dur_raw <= 0:
+            dur_min = span_min
+        elif span_min > 0 and dur_raw > span_min * 1.5:
+            dur_min = dur_raw / 60  # duration 字段是秒
+        elif dur_raw > 1440:
+            dur_min = dur_raw / 60
+        else:
+            dur_min = dur_raw
+        duration = round(dur_min)
+        if duration < 60:
+            continue
+        stages = _sleep_minutes(v, duration)
+        d = date_bj(wake)
+        sid = str(s.get("sid") or "")
+        agg = sleep[d].setdefault(sid, {
+            "segments": {}, "duration": 0.0, "deep": 0.0, "light": 0.0,
+            "rem": 0.0, "awake": 0.0, "score": None,
+        })
+        seg_key = (bedtime, wake)
+        if seg_key in agg["segments"]:
+            continue  # 同一 bedtime+wake_up_time 只留一条
+        agg["segments"][seg_key] = {
+            "bedtime": bedtime, "wake_up_time": wake, "duration": int(duration),
+        }
+        agg["duration"] += duration
+        for k in ("deep", "light", "rem", "awake"):
+            agg[k] += stages[k]
+        try:
+            score = int(round(float(v.get("sleep_score"))))
+        except (TypeError, ValueError):
+            score = None
+        if score is not None and score > 0:
+            agg["score"] = max(agg["score"] or 0, score)
+    for s in data.get("spo2") or []:
+        t = int(s.get("time") or 0)
+        if t < 1_000_000_000:
+            continue
+        val = _f(_val(s).get("spo2"))
+        if val > 0:
+            spo2[date_bj(t)][str(s.get("sid") or "")].append(val)
 
     out: list[dict] = []
 
@@ -362,6 +527,33 @@ def aggregate_daily(data: dict) -> list[dict]:
         if bmi:
             val["bmi"] = round(bmi, 1)
         add(d, "weight", t, val)
+    for d, bysid in sleep.items():
+        agg = pick(bysid, "duration")
+        segs = [agg["segments"][k] for k in sorted(agg["segments"])]
+        total = agg["duration"]
+        if not segs or total <= 0:
+            continue
+        val = {
+            "segment_details": segs,
+            "duration": int(round(total)),
+            "total_duration": int(round(total)),  # build_db.py 读这个键
+            "deep": int(round(agg["deep"])),
+            "light": int(round(agg["light"])),
+            "rem": int(round(agg["rem"])),
+            "awake": int(round(agg["awake"])),
+        }
+        if agg.get("score"):
+            val["sleep_score"] = int(agg["score"])
+        add(d, "sleep", _noon(d), val)
+    for d, bysid in spo2.items():
+        arr = pick_list(bysid)
+        if not arr:
+            continue
+        add(d, "spo2", _noon(d), {
+            "avg_spo2": int(round(sum(arr) / len(arr))),
+            "min_spo2": int(round(min(arr))),
+            "max_spo2": int(round(max(arr))),
+        })
     return out
 
 
@@ -418,10 +610,28 @@ def aggregate_series(rows: list[dict], hr: dict, sp: dict) -> list[dict]:
     return out
 
 
-def merge_series(existing: list[dict], new: list[dict]) -> list[dict]:
-    """同一场运动整段替换，其余保留。"""
-    ids = {r["workout_id"] for r in new}
-    rows = [r for r in existing if r.get("workout_id") not in ids] + new
+def merge_series(existing: list[dict], new: list[dict], rebuild: bool = False) -> list[dict]:
+    """按 (workout_id, minute) 合并；新值为空时保留旧值。
+
+    rebuild=True 时恢复旧的整段替换语义（--rebuild-series）。
+    """
+    if rebuild:
+        ids = {r["workout_id"] for r in new}
+        rows = [r for r in existing if r.get("workout_id") not in ids] + new
+    else:
+        by_key: dict[tuple[str, str], dict] = {}
+        order: list[tuple[str, str]] = []
+        for r in list(existing) + list(new):
+            k = (str(r.get("workout_id") or ""), str(r.get("minute") or ""))
+            if k not in by_key:
+                by_key[k] = dict(r)
+                order.append(k)
+                continue
+            old = by_key[k]
+            for f in ("date", "t_beijing", "hr", "cadence"):
+                if r.get(f) not in ("", None):
+                    old[f] = r[f]
+        rows = [by_key[k] for k in order]
     rows.sort(key=lambda r: (r.get("date", ""), int(float(r.get("minute") or 0))))
     return rows
 
@@ -474,6 +684,8 @@ def main() -> int:
     ap.add_argument("--src", default=str(DEFAULT_SRC))
     ap.add_argument("--out", default=str(REPO_ROOT / "data"))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--rebuild-series", action="store_true",
+                    help="整段替换该年 series（默认按 workout_id+minute 合并，保留旧值）")
     a = ap.parse_args()
 
     src = Path(a.src)
@@ -523,7 +735,7 @@ def main() -> int:
         series = aggregate_series(rows, hr_idx, sp_idx)
         if series:
             sp_path = out / "series" / f"{year}.csv"
-            merged = merge_series(read_csv(sp_path), series)
+            merged = merge_series(read_csv(sp_path), series, rebuild=a.rebuild_series)
             if not a.dry_run:
                 write_csv(sp_path, SERIES_COLS, merged)
             print(f"[mi-cloud] series {year}: 本次 {len(series)} 行 -> {len(merged)} 行（{sp_path.name}）")

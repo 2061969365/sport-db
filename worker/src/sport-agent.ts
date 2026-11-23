@@ -180,6 +180,8 @@ export class SportDbAgent extends Think<Env> {
 
   /** 运行时模型配置（来自仓里 config/model.json，30 秒缓存）。用 /model 命令可改。 */
   private cfgCache?: { cfg: ModelCfg; at: number };
+  /** 补录已提交、但还没确认入库的 review 文件；等 onChatResponse 成功后再删。 */
+  private pendingReviewDeletes: string[] = [];
 
   /** 取当前生效的模型配置（TTL 内直接用缓存，避免每轮都读 GitHub）。 */
   private async currentCfg(force = false): Promise<ModelCfg> {
@@ -244,8 +246,9 @@ export class SportDbAgent extends Think<Env> {
           ],
         }] as never, { idempotencyKey: `retry-${r.path}` }).then(() => true).catch(() => false);
         if (ok) {
-          const sha = (await ghGetFile(env, r.path).catch(() => null))?.sha || "";
-          if (sha) await ghDeleteFile(env, r.path, sha, `bot: 补录已重新提交 ${r.path}`).catch(() => null);
+          // 提交成功 ≠ 入库成功：turn 是异步的，失败会走 onChatError。
+          // 先记下来，等 onChatResponse 确认成功再删，避免网关抖动时静默丢图。
+          this.pendingReviewDeletes.push(r.path);
         }
         continue;
       }
@@ -311,15 +314,6 @@ export class SportDbAgent extends Think<Env> {
           // 否则模型只看到一段链接文本（会说"看不到"）。见 imageparts.ts。
           const inj = injectImageParts(body);
           if (inj.injected) body = inj.body;
-          // 主模型（deepseek-v4.1-flash-free）不收大图，图片轮必须换视觉模型，
-          // 否则网关回 400 "the request is invalid"。实测 mimo / nemotron 都能读。
-          if (body && countImageParts(body) > 0) {
-            try {
-              const bb = JSON.parse(body) as Record<string, unknown>;
-              bb.model = env.IMAGE_MODEL || "mimo-v2.6-flash-free";
-              body = JSON.stringify(bb);
-            } catch { /* 原样发 */ }
-          }
           console.log("[model-req]", targetUrl.replace(/^https:\/\/[^/]+/, ""),
             JSON.stringify({
               keys: b ? Object.keys(b).join(",") : "-",
@@ -336,7 +330,12 @@ export class SportDbAgent extends Think<Env> {
               effort: b?.reasoning_effort, stream: b?.stream, synth: synthSse,
             }));
         } catch { /* 记录失败无所谓 */ }
-        const resp = await fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body });
+        const timeout = AbortSignal.timeout(90_000);
+        const anySig = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+        const signal = init?.signal
+          ? (anySig ? anySig([init.signal, timeout]) : init.signal)
+          : timeout;
+        const resp = await fetch(targetUrl, { ...init, headers: h, body: body ?? init?.body, signal });
         if (resp.status >= 400) {
           console.log("[model-res]", resp.status, targetUrl.replace(/^https:\/\/[^/]+/, ""),
             `imgs=${(JSON.stringify(JSON.parse(body || "{}").messages || []).match(/image_url/g) || []).length}`);
@@ -372,7 +371,11 @@ export class SportDbAgent extends Think<Env> {
       const fallbackModels = String(env.MODEL_FALLBACKS || "mimo-v2.6-flash-free")
         .split(",").map((x) => x.trim()).filter(Boolean)
         .filter((m) => m !== cfg.model);
-      const models = [cfg.model, ...fallbackModels];
+      // 图片轮必须用视觉模型：在轮换层决定，send() 不再偷偷改模型，
+      // 否则 429 换模型/400 重试/备用网关三条兜底都会被同一个模型覆盖掉。
+      const hasImg = countImageParts(sendBody) > 0 || !!sendBody && sendBody.includes("@@IMG@@");
+      const primary = hasImg ? (env.IMAGE_MODEL || "mimo-v2.6-flash-free") : cfg.model;
+      const models = [...new Set([primary, ...fallbackModels])];
       let freeLimit = false;
       let retryAfterSec = 0;
       const errText = () => String((lastErr as Error)?.message || "");
@@ -429,7 +432,10 @@ export class SportDbAgent extends Think<Env> {
             }
             return r;
           } catch (e) {
-            lastErr = e;
+            const name = (e as Error)?.name || "";
+            lastErr = name === "TimeoutError" || name === "AbortError"
+              ? new Error("网关超时（90s）")
+              : e;
             if (attempt === 0) { await backoff(attempt); continue; }
             if (mi < models.length - 1) { await sleep(1200); continue outer; }
             break outer;
@@ -441,19 +447,29 @@ export class SportDbAgent extends Think<Env> {
       // 注意：必须用 sendBody（已把 stream 关掉的那个），并且同样走合成 SSE，
       // 否则备用网关也会踩同一个"流式断流"的坑。
       if (fallbackArmed() && sendBody) {
-        try {
-          const altUrl = `${String(env.VISION_ENDPOINT_ALT).replace(/\/chat\/completions\/?$/, "")}/chat/completions`;
-          const parsed = JSON.parse(sendBody) as Record<string, unknown>;
-          parsed.model = env.VISION_MODEL_ALT;
-          const h: Record<string, string> = {};
-          if (env.ALT_API_KEY) h.authorization = `Bearer ${env.ALT_API_KEY}`;
-          console.error("[model-fallback]", String(lastErr).slice(0, 120));
-          const r = await send(altUrl, JSON.stringify(parsed), h);
-          if (!synthSse) return r;
-          const made = await synthesize(r);
-          if (made) return made;
-        } catch (e) {
-          lastErr = e;
+        if (hasImg) {
+          // 备用网关（zen）没有保证可用的视觉模型，别把 mimo 的名字硬塞过去。
+          lastErr = new Error("图片轮备用网关不可用（未配置视觉模型）");
+        } else {
+          try {
+            const altUrl = `${String(env.VISION_ENDPOINT_ALT).replace(/\/chat\/completions\/?$/, "")}/chat/completions`;
+            const parsed = JSON.parse(sendBody) as Record<string, unknown>;
+            parsed.model = env.VISION_MODEL_ALT;
+            const h: Record<string, string> = {};
+            if (env.ALT_API_KEY) h.authorization = `Bearer ${env.ALT_API_KEY}`;
+            console.error("[model-fallback]", String(lastErr).slice(0, 120));
+            const r = await send(altUrl, JSON.stringify(parsed), h);
+            if (!r.ok) {
+              lastErr = new Error(`备用网关 ${r.status}`);
+            } else if (!synthSse) {
+              return r;
+            } else {
+              const made = await synthesize(r);
+              if (made) return made;
+            }
+          } catch (e) {
+            lastErr = e;
+          }
         }
       }
       if (freeLimit) {
@@ -522,7 +538,7 @@ export class SportDbAgent extends Think<Env> {
 
     if (cmd.action === "list") {
       const cur = await this.currentCfg();
-      const r = await listGatewayModels(cur);
+      const r = await listGatewayModels(cur, this.env.VISION_API_KEY);
       if (!r.ok) return `列模型失败：${r.error}`;
       return `网关上的免费模型（共 ${r.models.length} 个）：\n` + r.models.map((m) => `· ${m}`).join("\n")
         + `\n\n换成某个：/model <模型名>`;
@@ -530,7 +546,7 @@ export class SportDbAgent extends Think<Env> {
 
     if (cmd.action === "test") {
       const cur = await this.currentCfg(true);
-      const r = await probeCfg(cur, probeImg);
+      const r = await probeCfg(cur, probeImg, this.env.VISION_API_KEY, this.env.IMAGE_MODEL);
       return `体检（${cur.model}）：\n` + r.lines.join("\n") + (r.ok ? "\n\n结论：可用。" : "\n\n结论：有问题，别切过去。");
     }
 
@@ -563,7 +579,7 @@ export class SportDbAgent extends Think<Env> {
       const ep = normalizeEndpoint(cmd.endpoint);
       if (!ep) return "失败：网关地址不合法。例：/model url https://panel.forluseword.kdns.fr/v1";
       const cur = await this.currentCfg(true);
-      const probe = await probeCfg({ ...cur, endpoint: ep }, probeImg);
+      const probe = await probeCfg({ ...cur, endpoint: ep }, probeImg, this.env.VISION_API_KEY, this.env.IMAGE_MODEL);
       if (!probe.ok) {
         return `没换：新网关没通过体检，换了会不可用。\n${probe.lines.join("\n")}`;
       }
@@ -575,7 +591,7 @@ export class SportDbAgent extends Think<Env> {
     const model = cmd.model.trim();
     if (!validModelId(model)) return `失败：模型名不合法（${model}）。`;
     const cur = await this.currentCfg(true);
-    const probe = await probeCfg({ ...cur, model }, probeImg);
+    const probe = await probeCfg({ ...cur, model }, probeImg, this.env.VISION_API_KEY, this.env.IMAGE_MODEL);
     if (!probe.ok) {
       return `没换：模型「${model}」没通过体检，换了它会答不上来。\n${probe.lines.join("\n")}\n\n`
         + `可用清单：/model list`;
@@ -603,15 +619,28 @@ export class SportDbAgent extends Think<Env> {
   }
 
   configureSession(session: ThinkSession) {
-    // 上下文满了走压缩，不直接报错：32 万 token（400k 窗口的 80%）触发，
-    // 太早压没用；中间压成摘要，最近 ~2 万 token 原文保留；失败打日志跳过，不挡对话。
+    // 上下文满了走压缩，不直接报错；阈值跟配置窗口走（80%），不再写死 320k。
+    const window = this.cfgCache?.cfg.contextWindow || 400_000;
     session.onCompaction(createCompactFunction({
       summarize: (prompt) => summarizeText(this.env, prompt, this.cfgCache?.cfg),
     }));
     session.onCompactionError((e) => {
       console.error("[compaction-fail]", e instanceof Error ? e.message : String(e));
+      // 压缩失败兜底：保留最近 40 条，别让会话永久卡在「上下文太长」。
+      void (async () => {
+        try {
+          const msgs = (await this.getMessages()) as { role?: string }[];
+          if (msgs.length <= 40) return;
+          const keep = msgs.slice(-40);
+          await this.clearMessages();
+          await this.addMessages(keep as never[]);
+          console.warn("[compaction-fallback] 保留最近 40 条消息");
+        } catch (e2) {
+          console.error("[compaction-fallback-fail]", e2 instanceof Error ? e2.message : String(e2));
+        }
+      })();
     });
-    session.compactAfter(320_000);
+    session.compactAfter(Math.floor(window * 0.8));
     return session;
   }
 
@@ -909,7 +938,13 @@ export class SportDbAgent extends Think<Env> {
       const sql: SqlTag = (s, ...a) =>
         (self.sql(s as TemplateStringsArray, ...(a as (string | number | boolean | null)[])) as unknown as Array<Record<string, unknown>>);
       const all = await loadWorkouts(this.env, sql);
-      let signals = analyzeSignals(all);
+      // 教练备注/处方：决定「跑量骤降」是受伤恢复还是单纯偷懒，避免劝错。
+      let coaching = "";
+      try {
+        coaching = String(await repoProfileProvider(this.env, NOTES_PATH, sql, NOTES_SEED).get() || "");
+      } catch { /* 没备注就算了 */ }
+      const crossTraining = /全改骑|暂停跑|停跑|只骑|不跑/.test(coaching);
+      let signals = analyzeSignals(all, Date.now(), { coaching, crossTraining });
 
       // 计划漏练也算信号：读最近的计划，把"该练没打卡"并进来
       try {
@@ -928,6 +963,7 @@ export class SportDbAgent extends Think<Env> {
       const top = signals[0];
       const snapshot = buildSnapshot(all);
       const extraBits: string[] = [];
+      if (coaching) extraBits.push(`他的教练备注/处方：${coaching.replace(/\s+/g, " ").slice(0, 400)}`);
       try {
         const prof = await repoProfileProvider(this.env, PROFILE_PATH, sql, PROFILE_SEED).get();
         if (prof) extraBits.push(`他的画像：${String(prof).replace(/\s+/g, " ").slice(0, 400)}`);
@@ -973,7 +1009,7 @@ export class SportDbAgent extends Think<Env> {
    * 尤其是失败的那一轮：onChatResponse 不会触发，图片就永久卡在历史里，
    * 导致后面「一直说模型不可用」。所以成功和失败两条路径都要清。
    */
-  private async stripImageParts(): Promise<void> {
+  private async stripImageParts(ok = false): Promise<void> {
     try {
       const msgs = (await this.getMessages()) as { id?: string; parts?: { type?: string }[] }[];
       let changed = 0;
@@ -982,8 +1018,11 @@ export class SportDbAgent extends Think<Env> {
         if (!Array.isArray(parts)) continue;
         const hasMarker = JSON.stringify(parts).includes("@@IMG@@");
         if (!parts.some((p) => p?.type === "file") && !hasMarker) continue;
+        const note = ok
+          ? "[用户发来一张运动截图：原图已存档，识别与入库已完成]"
+          : "[用户发来一张运动截图：原图已存档，但这轮未确认入库；需要时让用户重发或查 review]";
         const next = scrubMarker(parts.map((p) => (p?.type === "file"
-          ? { type: "text", text: "[用户发来一张运动截图：原图已存档，识别与入库已完成]" }
+          ? { type: "text", text: note }
           : p)));
         await this.addMessages([{ ...m, parts: next } as never], { mode: "upsert" } as never);
         changed++;
@@ -1211,32 +1250,13 @@ export class SportDbAgent extends Think<Env> {
    * 重启后 hook 可能被重放（recovered），用 requestId 去重避免重复推送。
    */
   async onChatResponse(result: { message?: unknown; requestId?: string; status?: string; error?: string }): Promise<void> {
-    await this.stripImageParts().catch(() => null);
-    // 空回复兜底：模型偶尔回一条没有任何文本的消息（工具调完就结束）。
-    // 用户以前只会看到"这次没处理成功"，其实什么都没发生。
-    try {
-      const parts = (result?.message as { parts?: { type?: string; text?: string }[] })?.parts;
-      const hasText = Array.isArray(parts)
-        && parts.some((p) => p?.type === "text" && String(p.text || "").trim().length > 0);
-      if (result?.status === "completed" && !hasText) {
-        console.warn("[empty-reply] completed without text");
-        const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
-          { channel?: string; chat_id?: string }[];
-        const channel = tv[0]?.channel || "";
-        const chatId = tv[0]?.chat_id || "";
-        const body = "这次没生成出内容（模型返回了空回复）。再发一次就好，你的数据没受影响。";
-        if (channel === "tg" && chatId) await tgSend(this.env, chatId, body).catch(() => null);
-        else if (channel === "feishu" && chatId) await feishuSend(this.env, chatId, body).catch(() => null);
-        this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
-        this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${body}, ${Date.now()})`;
-      }
-    } catch { /* 兜底失败不影响主流程 */ }
+    const completed = result?.status === "completed";
+    await this.stripImageParts(completed).catch(() => null);
     try {
       const reqId = String(result?.requestId || "") || `t${Date.now()}`;
       this.sql`CREATE TABLE IF NOT EXISTS notified (id TEXT PRIMARY KEY, at INTEGER)`;
       const seen = this.sql`SELECT id FROM notified WHERE id = ${reqId}` as { id: string }[];
       if (seen.length) return;
-      this.sql`INSERT OR REPLACE INTO notified(id, at) VALUES (${reqId}, ${Date.now()})`;
       this.sql`DELETE FROM notified WHERE at < ${Date.now() - 3 * 864e5}`;
 
       const tv = this.sql`SELECT channel, chat_id FROM reply_target WHERE slot = 'current'` as
@@ -1244,8 +1264,23 @@ export class SportDbAgent extends Think<Env> {
       const channel = tv[0]?.channel || "";
       const chatId = tv[0]?.chat_id || "";
 
+      // 空回复兜底：放在 requestId 去重之后，hook 重放时不会重复提示。
+      const parts = (result?.message as { parts?: { type?: string; text?: string }[] })?.parts;
+      const hasText = Array.isArray(parts)
+        && parts.some((p) => p?.type === "text" && String(p.text || "").trim().length > 0);
+      if (completed && !hasText) {
+        console.warn("[empty-reply] completed without text");
+        const body = "这次没生成出内容（模型返回了空回复）。再发一次就好，你的数据没受影响。";
+        if (channel === "tg" && chatId) await tgSend(this.env, chatId, body).catch(() => null);
+        else if (channel === "feishu" && chatId) await feishuSend(this.env, chatId, body).catch(() => null);
+        this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
+        this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${body}, ${Date.now()})`;
+        this.sql`INSERT OR REPLACE INTO notified(id, at) VALUES (${reqId}, ${Date.now()})`;
+        return;
+      }
+
       let text = finalReplyText(result).trim();
-      const ok = result?.status === "completed" && !!text;
+      const ok = completed && !!text;
       this.bumpMetrics(ok ? { turns: 1 } : { turns: 1, errors: 1 });
       if (!ok) {
         text = result?.status === "aborted"
@@ -1253,14 +1288,29 @@ export class SportDbAgent extends Think<Env> {
           : `这次没处理成功（${String(result?.error || result?.status || "未知原因").slice(0, 160)}），换个问法或稍后再试。`;
       }
       if (!text) return;
+      let sent = false;
       if (channel === "tg" && chatId) {
-        await tgSend(this.env, chatId, text);
+        sent = await tgSend(this.env, chatId, text).catch(() => false);
       } else if (channel === "feishu" && chatId) {
         await feishuSend(this.env, chatId, text);
+        sent = true;
       } else {
         this.sql`CREATE TABLE IF NOT EXISTS pwa_reply (slot TEXT PRIMARY KEY, text TEXT, at INTEGER)`;
         this.sql`INSERT OR REPLACE INTO pwa_reply(slot, text, at) VALUES ('latest', ${text}, ${Date.now()})`;
+        sent = true;
       }
+      // 发送成功才记账；失败不写，留给下一次重放。
+      if (sent) this.sql`INSERT OR REPLACE INTO notified(id, at) VALUES (${reqId}, ${Date.now()})`;
+
+      // 补录的 review 文件：只有确认成功才删，失败留着下次再试。
+      if (completed && this.pendingReviewDeletes.length) {
+        const paths = this.pendingReviewDeletes.splice(0);
+        for (const p of paths) {
+          const sha = (await ghGetFile(this.env, p).catch(() => null))?.sha || "";
+          if (sha) await ghDeleteFile(this.env, p, sha, `bot: 补录已入库 ${p}`).catch(() => null);
+        }
+      }
+
       // 对话备份（私有仓才写；节流 5 分钟，失败不影响回复）
       try {
         await this.maybeExportChat();
@@ -1651,7 +1701,14 @@ export class SportDbAgent extends Think<Env> {
         inputSchema: z.object({}),
         execute: async () => {
           const all = await loadWorkouts(env, sql);
-          const signals = analyzeSignals(all);
+          let coaching = "";
+          try {
+            coaching = String(await repoProfileProvider(env, NOTES_PATH, sql, NOTES_SEED).get() || "");
+          } catch { /* 没备注就算了 */ }
+          const signals = analyzeSignals(all, Date.now(), {
+            coaching,
+            crossTraining: /全改骑|暂停跑|停跑|只骑|不跑/.test(coaching),
+          });
           if (!signals.length) return "自查结果：没有异常信号（训练连贯、跑量心率都正常）。不用编问题出来。";
           return "自查发现以下信号（按重要度排序）：\n"
             + signals.map((s) => `- [${s.weight}] ${s.key}\n  ${s.text}`).join("\n");

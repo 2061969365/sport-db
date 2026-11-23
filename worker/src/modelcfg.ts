@@ -23,6 +23,8 @@ export interface ModelCfg {
   model: string;
   /** 是否走原生流式（默认 false：网关流式坏了，走非流式+合成 SSE） */
   streaming: boolean;
+  /** 上下文窗口 token 数；压缩阈值取 80%（默认 400k） */
+  contextWindow?: number;
 }
 
 /** wrangler.toml 里的默认值。 */
@@ -31,6 +33,7 @@ export function defaultCfg(env: Env): ModelCfg {
     endpoint: env.VISION_ENDPOINT,
     model: env.VISION_MODEL || "mimo-v2.6-flash-free",
     streaming: String(env.MODEL_STREAMING || "off").toLowerCase() === "on",
+    contextWindow: Number(env.MODEL_CONTEXT_WINDOW || 400_000) || 400_000,
   };
 }
 
@@ -47,7 +50,12 @@ function normalize(raw: unknown, fallback: ModelCfg): ModelCfg | null {
   const endpoint = String(o.endpoint || "").trim() || fallback.endpoint;
   const model = String(o.model || "").trim() || fallback.model;
   if (!/^https?:\/\//.test(endpoint)) return null;
-  return { endpoint, model, streaming: o.streaming === undefined ? fallback.streaming : !!o.streaming };
+  const cw = Number(o.contextWindow);
+  return {
+    endpoint, model,
+    streaming: o.streaming === undefined ? fallback.streaming : !!o.streaming,
+    contextWindow: Number.isFinite(cw) && cw >= 32_000 ? cw : fallback.contextWindow,
+  };
 }
 
 /** 读配置：仓里有就用仓里的，否则用 wrangler.toml 的默认值。 */
@@ -198,12 +206,14 @@ export function parseModelCommand(text: string): ModelCmd {
   return { action: "set-model", model: parts[1] };
 }
 
-/** 列网关可用模型（免 Key，直接 GET /v1/models）。 */
-export async function listGatewayModels(cfg: ModelCfg): Promise<{ ok: boolean; models: string[]; error?: string }> {
+/** 列网关可用模型（用真实 key，和线上对话走同一套鉴权）。 */
+export async function listGatewayModels(
+  cfg: ModelCfg, apiKey = "1",
+): Promise<{ ok: boolean; models: string[]; error?: string }> {
   const base = cfg.endpoint.replace(/\/chat\/completions\/?$/, "");
   try {
     const r = await fetch(`${base}/models`, {
-      headers: { "User-Agent": UA_BROWSER, Authorization: "Bearer 1" },
+      headers: { "User-Agent": UA_BROWSER, Authorization: `Bearer ${apiKey}` },
     });
     if (!r.ok) return { ok: false, models: [], error: `HTTP ${r.status}` };
     const j = (await r.json()) as { data?: { id?: string }[]; models?: { id?: string }[] };
@@ -220,30 +230,33 @@ export interface ProbeResult {
   lines: string[];
 }
 
-/** 三项体检：对话 / 工具调用 / 读图（读图需要一张可访问的图）。 */
-export async function probeCfg(cfg: ModelCfg, imgUrl?: string): Promise<ProbeResult> {
+/** 三项体检：对话 / 工具调用 / 读图（读图需要一张可访问的图）。
+ *  apiKey 用线上真实 key；imageModel 用于读图体检（主模型不收图）。 */
+export async function probeCfg(
+  cfg: ModelCfg, imgUrl?: string, apiKey = "1", imageModel?: string,
+): Promise<ProbeResult> {
   const lines: string[] = [];
   let ok = true;
 
   // 统一走流式：本网关对非流式请求更容易回 429/530，体检也必须按真实用法发。
-  const postText = async (body: Record<string, unknown>) => {
+  const postText = async (body: Record<string, unknown>, model?: string) => {
     const r = await fetch(cfg.endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "User-Agent": UA_BROWSER,
         Accept: "text/event-stream",
-        Authorization: "Bearer 1",
+        Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ model: cfg.model, stream: true, ...body }),
+      body: JSON.stringify({ model: model || cfg.model, stream: true, ...body }),
     });
     const text = await r.text();
     if (!r.ok) throw new Error(`HTTP ${r.status} ${text.slice(0, 100)}`);
     return text;
   };
 
-  const post = async (body: Record<string, unknown>) => {
-    const text = await postText(body);
+  const post = async (body: Record<string, unknown>, model?: string) => {
+    const text = await postText(body, model);
     // 流式回包：收成纯文本后伪装成非流式结构，下游判断逻辑不用改
     const content = sseText(text);
     let toolCalls: unknown[] = [];
@@ -300,7 +313,7 @@ export async function probeCfg(cfg: ModelCfg, imgUrl?: string): Promise<ProbeRes
     try {
       const j = await post({ messages: [{ role: "user", content: [
         { type: "text", text: "这张运动截图的距离是多少？只回 JSON {\"distance_km\":..}" },
-        { type: "image_url", image_url: { url: imgUrl } }] }] });
+        { type: "image_url", image_url: { url: imgUrl } }] }] }, imageModel);
       const c = (j.choices?.[0]?.message?.content || "");
       if (/distance|km|\d/.test(c)) lines.push(`✅ 读图正常（${c.replace(/\s+/g, " ").slice(0, 40)}）`);
       else { lines.push("⚠️ 读图回复可疑（收图可能不准）"); }

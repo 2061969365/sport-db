@@ -77,7 +77,8 @@ test("快照：设备日报有就报，没有就不提（不许编）", () => {
   const rows = [row("2026-11-02", 5, 300, 150)];
   const withDaily = buildSnapshot(rows, NOW, {
     sleepDate: "2026-11-02", sleepMin: 440, sleepScore: 82,
-    sleep7AvgMin: 410, rhrLast: 69, rhr7Avg: 71,
+    sleep7AvgMin: 410, sleepDays7: 5, rhrLast: 69, rhr7Avg: 71,
+    rhrDate: "2026-11-02",
   });
   assert.match(withDaily, /睡 7小时20分/);
   assert.match(withDaily, /评分 82/);

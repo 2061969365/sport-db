@@ -62,15 +62,33 @@ export function tgApi(env: Env, method: string, payload: unknown) {
   });
 }
 
-export async function tgSend(env: Env, chatId: number | string, text: string): Promise<void> {
+export async function tgSend(env: Env, chatId: number | string, text: string): Promise<boolean> {
   // 长回复按行切成多条发，不再 clip 掉后半段（分析/计划类回答经常超过 3500 字）。
-  // Telegram 侧失败不抛：异步路径里抛了也没人接，只会丢日志。
+  // 429/5xx 退避重试 3 次（429 读 retry_after）；最终失败返回 false，让上层可重放。
+  let allOk = true;
   for (const piece of splitForTg(text)) {
-    const r = await tgApi(env, "sendMessage", { chat_id: chatId, text: piece }).catch(() => null);
-    if (r && !r.ok) {
-      console.error(`[tgSend-fail chat=${chatId}]`, r.status, (await r.text().catch(() => "")).slice(0, 200));
+    let sent = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await tgApi(env, "sendMessage", { chat_id: chatId, text: piece }).catch(() => null);
+      if (r && r.ok) { sent = true; break; }
+      if (!r) {
+        await new Promise((x) => setTimeout(x, 800 * (attempt + 1)));
+        continue;
+      }
+      const body = await r.text().catch(() => "");
+      console.error(`[tgSend-fail chat=${chatId}]`, r.status, body.slice(0, 200));
+      if (r.status !== 429 && r.status < 500) break;
+      let wait = 800 * (attempt + 1);
+      try {
+        const j = JSON.parse(body) as { parameters?: { retry_after?: number } };
+        const ra = Number(j?.parameters?.retry_after);
+        if (ra > 0) wait = Math.min(10_000, ra * 1000);
+      } catch { /* 非 JSON 就按退避 */ }
+      await new Promise((x) => setTimeout(x, wait));
     }
+    if (!sent) allOk = false;
   }
+  return allOk;
 }
 
 /** 「正在输入」指示（Telegram 侧有效约 5 秒）：长 turn 每步刷新一次，别让用户以为死了。 */
@@ -78,20 +96,29 @@ export async function tgTyping(env: Env, chatId: number | string): Promise<void>
   await tgApi(env, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => null);
 }
 
-/** 长回复按行切成多条（体检报告可能超过单条上限）。 */
+/** 长回复按行切成多条（体检报告可能超过单条上限）；超长单行按码点硬切。 */
 export function splitForTg(text: string, per = 3500): string[] {
-  if (text.length <= per) return [text];
+  if (Array.from(text).length <= per) return [text];
   const out: string[] = [];
   let buf = "";
-  for (const line of text.split("\n")) {
-    if ((buf + line).length + 1 > per) {
-      if (buf) out.push(buf);
+  const pushBuf = () => { if (buf) { out.push(buf); buf = ""; } };
+  for (const rawLine of text.split("\n")) {
+    let line = rawLine;
+    // 单行本身超过上限：先整行硬切，别把 4000 字的段落整段塞给 Telegram。
+    while (Array.from(line).length > per) {
+      pushBuf();
+      const units = Array.from(line);
+      out.push(units.slice(0, per).join(""));
+      line = units.slice(per).join("");
+    }
+    if (Array.from(buf + line).length + 1 > per) {
+      pushBuf();
       buf = line;
     } else {
       buf = buf ? `${buf}\n${line}` : line;
     }
   }
-  if (buf) out.push(buf);
+  pushBuf();
   return out;
 }
 
