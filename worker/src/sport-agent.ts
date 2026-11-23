@@ -182,6 +182,8 @@ export class SportDbAgent extends Think<Env> {
   private cfgCache?: { cfg: ModelCfg; at: number };
   /** 补录已提交、但还没确认入库的 review 文件；等 onChatResponse 成功后再删。 */
   private pendingReviewDeletes: string[] = [];
+  /** 流式空闲看门狗：工具执行也算间隙，给 2 分钟，避免长工具被误判卡死。 */
+  override chatStreamStallTimeoutMs = 120_000;
 
   /** 取当前生效的模型配置（TTL 内直接用缓存，避免每轮都读 GitHub）。 */
   private async currentCfg(force = false): Promise<ModelCfg> {
