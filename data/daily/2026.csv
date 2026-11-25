@@ -3150,5 +3150,5 @@ date,tag,key,time_utc,time_beijing,uid_hash,sid_hash,update_utc,value_json
 2026-11-24,daily_report,calories,1795492800,2026-11-24 12:00:00 +08:00,,610037c4,,"{""calories"":540}"
 2026-11-24,daily_report,heart_rate,1795492800,2026-11-24 12:00:00 +08:00,,610037c4,,"{""avg_hr"":120,""min_hr"":69,""max_hr"":182}"
 2026-11-24,daily_report,steps,1795492800,2026-11-24 12:00:00 +08:00,,610037c4,,"{""steps"":11544,""distance"":6856,""calories"":539.8}"
-2026-11-25,daily_report,calories,1795579200,2026-11-25 12:00:00 +08:00,,610037c4,,"{""calories"":2}"
-2026-11-25,daily_report,steps,1795579200,2026-11-25 12:00:00 +08:00,,610037c4,,"{""steps"":39,""distance"":22,""calories"":1.6}"
+2026-11-25,daily_report,calories,1795579200,2026-11-25 12:00:00 +08:00,,610037c4,,"{""calories"":56}"
+2026-11-25,daily_report,steps,1795579200,2026-11-25 12:00:00 +08:00,,610037c4,,"{""steps"":1412,""distance"":833,""calories"":56.5}"
